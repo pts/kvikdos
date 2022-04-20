@@ -279,7 +279,7 @@ int main(int argc, char **argv) {
      case KVM_EXIT_HLT:
       if ((unsigned)sregs.cs.selector == 0x40 && (unsigned)((unsigned)regs.rip - 1) < 0x100) {  /* hlt caused by int through our magic interrupt table. */
         const unsigned char int_num = ((unsigned)regs.rip - 1) & 0xff;
-        const unsigned short *csip_ptr = (const unsigned short*)((char*)mem + ((unsigned)sregs.ss.selector << 4) + ((unsigned)regs.rsp & 0xffff));
+        const unsigned short *csip_ptr = (const unsigned short*)((char*)mem + ((unsigned)sregs.ss.selector << 4) + (*(unsigned short*)&regs.rsp));
         const unsigned short int_ip = csip_ptr[0], int_cs = csip_ptr[1];  /* Return address. */  /* !! Security: check bounds, also check that rsp <= 0xfffe. */
         const unsigned char ah = ((unsigned)regs.rax >> 8) & 0xff;
         if (DEBUG) fprintf(stderr, "debug: int 0x%02x ah:%02x cs:%04x ip:%04x\n", int_num, ah, int_cs, int_ip);
@@ -315,7 +315,7 @@ int main(int argc, char **argv) {
               *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
             } else {
               int got;
-              const char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + ((unsigned)regs.rdx & 0xffff);  /* !! Security: check bounds. */
+              const char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
               const int size = (int)(unsigned short)regs.rcx;
               if (fd == 3) fd = 2;  /* Emulate STDAUX with stderr. */
               else if (fd == 4) fd = 0;  /* Emulate STDPRN with stdout. */
@@ -335,7 +335,7 @@ int main(int argc, char **argv) {
               goto error_on_21;
             } else {
               int got;
-              char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + ((unsigned)regs.rdx & 0xffff);  /* !! Security: check bounds. */
+              char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
               const int size = (int)(unsigned short)regs.rcx;
               if (fd == 3) fd = 2;  /* Emulate STDAUX with stderr. */
               else if (fd == 4) fd = 0;  /* Emulate STDPRN with stdout. */
@@ -380,7 +380,7 @@ int main(int argc, char **argv) {
               goto error_on_21;
             }
             /* Current directory is \ (\ stripped from both sides). */
-            *((char*)mem + ((unsigned)sregs.ds.selector << 4) + ((unsigned)regs.rdx & 0xffff)) = '\0';  /* !! Security: check bounds, should be 64 bytes supplied by the caller. */
+            *((char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx)) = '\0';  /* !! Security: check bounds, should be 64 bytes supplied by the caller. */
           } else {
             goto fatal_int;
           }
