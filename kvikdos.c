@@ -92,13 +92,13 @@ static void load_dos_executable_program(const char *filename, void *mem) {
   close(img_fd);
 }
 
-static void dump_regs(struct kvm_regs *regs, struct kvm_sregs *sregs) {
+static void dump_regs(const char *prefix, struct kvm_regs *regs, struct kvm_sregs *sregs) {
 #define R16(name) ((unsigned)regs->r##name & 0xffff)
 #define S16(name) ((unsigned)sregs->name.selector & 0xffff)
-  if (!DEBUG) return;
-  fprintf(stderr, "DEBUG: regs: ax:%04x bx:%04x cx:%04x dx:%04x si:%04x di:%04x sp:%04x bp:%04x ip:%04x flags:%08x cs:%04x ds:%04x es:%04x fs:%04x gs:%04x ss:%04x\n",
-         R16(ax), R16(bx), R16(cx), R16(dx), R16(si), R16(di), R16(sp), R16(bp), R16(ip), R16(flags),
-         S16(cs), S16(ds), S16(es), S16(fs), S16(gs), S16(ss));
+  fprintf(stderr, "%s: regs: ax:%04x bx:%04x cx:%04x dx:%04x si:%04x di:%04x sp:%04x bp:%04x ip:%04x flags:%08x cs:%04x ds:%04x es:%04x fs:%04x gs:%04x ss:%04x\n",
+          prefix,
+          R16(ax), R16(bx), R16(cx), R16(dx), R16(si), R16(di), R16(sp), R16(bp), R16(ip), R16(flags),
+          S16(cs), S16(ds), S16(es), S16(fs), S16(gs), S16(ss));
   fflush(stdout);
 }
 
@@ -236,7 +236,7 @@ int main(int argc, char **argv) {
   regs.rflags = 1 << 1;  /* Reserved bit. */
   regs.rip = 0x100;  /* DOS .com entry point. */
 
-  if (DEBUG) dump_regs(&regs, &sregs);
+  if (DEBUG) dump_regs("debug", &regs, &sregs);
 
  set_sregs_regs_and_continue:
   if (ioctl(vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
@@ -263,11 +263,11 @@ int main(int argc, char **argv) {
       perror("fatal: KVM_GET_REGS");
       exit(252);
     }
-    if (DEBUG) dump_regs(&regs, &sregs);
+    if (DEBUG) dump_regs("debug", &regs, &sregs);
 
     switch (run->exit_reason) {
      case KVM_EXIT_IO:
-      if (DEBUG) fprintf(stderr, "DEBUG: IO port: port=0x%02x data=%04x size=%d direction=%d\n", run->io.port,
+      if (DEBUG) fprintf(stderr, "debug: IO port: port=0x%02x data=%04x size=%d direction=%d\n", run->io.port,
 	     *(int *)((char *)(run) + run->io.data_offset),
 	     run->io.size, run->io.direction);
       sleep(1);
@@ -281,7 +281,7 @@ int main(int argc, char **argv) {
         const unsigned short *csip_ptr = (const unsigned short*)((char*)mem + ((unsigned)sregs.ss.selector << 4) + ((unsigned)regs.rsp & 0xffff));
         const unsigned short int_ip = csip_ptr[0], int_cs = csip_ptr[1];  /* Return address. */  /* !! Security: check bounds, also check that rsp <= 0xfffe. */
         const unsigned char ah = ((unsigned)regs.rax >> 8) & 0xff;
-        if (DEBUG) fprintf(stderr, "DEBUG: int 0x%02x ah:%02x cs:%04x ip:%04x\n", int_num, ah, int_cs, int_ip);
+        if (DEBUG) fprintf(stderr, "debug: int 0x%02x ah:%02x cs:%04x ip:%04x\n", int_num, ah, int_cs, int_ip);
         fflush(stdout);
         (void)ah;
         if (int_num == 0x29) {
@@ -358,16 +358,18 @@ int main(int argc, char **argv) {
               }
             }
             (void)!write(1, p + dx0, dx - dx0);
+          } else {
+            goto fatal;
           }
         } else if (int_num == 0x10) {
           if (ah == 0x0e) {  /* Teletype output. */
             const char c = regs.rax;
             (void)!write(1, &c, 1);
           } else {
-            goto exit;
+            goto fatal;
           }
         } else {
-          goto exit;
+          goto fatal;
         }
         /* Return from the interrupt. */
         SET_SEGMENT_REG(cs, int_cs);
@@ -375,20 +377,20 @@ int main(int argc, char **argv) {
         *(unsigned*)&regs.rsp += 6;  /* pop ip, pop cs, pop flags. */
         goto set_sregs_regs_and_continue;
       } else {
-        fprintf(stderr, "fatal: hlt\n");
-        goto exit;
+        fprintf(stderr, "fatal: unexpected hlt\n");
+        goto fatal;
       }
      case KVM_EXIT_MMIO:
-      fprintf(stderr, "fatal: mmio phys_addr=%08x value=%08x%08x size=%d is_write=%d\n", (unsigned)run->mmio.phys_addr, ((unsigned*)run->mmio.data)[1], ((unsigned*)run->mmio.data)[0], run->mmio.len, run->mmio.is_write);
+      fprintf(stderr, "fatal: KVM memory access denied phys_addr=%08x value=%08x%08x size=%d is_write=%d\n", (unsigned)run->mmio.phys_addr, ((unsigned*)run->mmio.data)[1], ((unsigned*)run->mmio.data)[0], run->mmio.len, run->mmio.is_write);
       /*break;*/  /* Just continue at following cs:ip. */
-      goto exit;
+      goto fatal;
      default:
-      fprintf(stderr, "fatal: KVM exit_reason: %d\n", run->exit_reason);
-      goto exit;
+      fprintf(stderr, "fatal: unexpected KVM exit: reason=%d\n", run->exit_reason);
+      goto fatal;
     }
   }
-exit:
+ fatal:
+  dump_regs("fatal", &regs, &sregs);
   close(kvm_fd);
-  fprintf(stderr, "fatal: unexpected exit from KVM\n");
   return 252;
 }
