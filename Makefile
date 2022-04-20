@@ -1,4 +1,6 @@
 .PHONY: all clean run
+.SUFFIXES:
+MAKEFLAGS += -r
 
 ALL = kvikdos guest.com slowp.com
 
