@@ -353,22 +353,24 @@ int main(int argc, char **argv) {
               if (p[dx] == '$') break;
               ++dx;
               if (dx == 0) {
-                fprintf(stderr, "fatal: !! offset overflow in print\n");  /* TODO(pts): Implement it. */
+                fprintf(stderr, "fatal: !! offset overflow in print\n");  /* TODO(pts): Implement it.  */
                 exit(252);
               }
             }
             (void)!write(1, p + dx0, dx - dx0);
           } else {
-            goto fatal;
+            goto fatal_int;
           }
         } else if (int_num == 0x10) {
           if (ah == 0x0e) {  /* Teletype output. */
             const char c = regs.rax;
             (void)!write(1, &c, 1);
           } else {
-            goto fatal;
+            goto fatal_int;
           }
         } else {
+         fatal_int:
+          fprintf(stderr, "fatal: unsupported int 0x%02x ah:%02x cs:%04x ip:%04x\n", int_num, ah, int_cs, int_ip);
           goto fatal;
         }
         /* Return from the interrupt. */
