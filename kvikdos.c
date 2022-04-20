@@ -11,8 +11,10 @@
 #include <unistd.h>
 
 #define MEM_SIZE (2 << 20)  /* In bytes. 2 MiB. */
-#define BASE_PARA 0x100
-#define CODE_LOAD_OFS (BASE_PARA << 4)
+#define BASE_PARA 0x500
+#define CODE_LOAD_OFS (BASE_PARA << 4)  /* Also the stack grows down from here. */
+/*#define GUEST_MEM_MODULE_START 0x1000*/
+#define GUEST_MEM_MODULE_START 0x0
 
 static void load_guest(const char *filename, void *mem) {
   char *p;
@@ -40,9 +42,8 @@ static void load_guest(const char *filename, void *mem) {
 static void dump_regs(struct kvm_regs *regs, struct kvm_sregs *sregs) {
 #define R16(name) ((unsigned)regs->r##name & 0xffff)
 #define S16(name) ((unsigned)sregs->name.selector & 0xffff)
-#define R_SP (R16(sp) + 6)  /* !! This is some bug elsewhere in host.c. */
   printf("regs: ax:%04x bx:%04x cx:%04x dx:%04x si:%04x di:%04x sp:%04x bp:%04x ip:%04x flags:%08x cs:%04x ds:%04x es:%04x fs:%04x gs:%04x ss:%04x\n",
-         R16(ax), R16(bx), R16(cx), R16(dx), R16(si), R16(di), R_SP, R16(bp), R16(ip), R16(flags),
+         R16(ax), R16(bx), R16(cx), R16(dx), R16(si), R16(di), R16(sp), R16(bp), R16(ip), R16(flags),
          S16(cs), S16(ds), S16(es), S16(fs), S16(gs), S16(ss));
   fflush(stdout);
 }
@@ -74,23 +75,27 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  if ((mem = mmap(NULL, MEM_SIZE, PROT_READ | PROT_WRITE,
+  if ((mem = mmap(NULL, MEM_SIZE - GUEST_MEM_MODULE_START, PROT_READ | PROT_WRITE,
 		  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)) ==
       NULL) {
     fprintf(stderr, "mmap failed: %d\n", errno);
     return 1;
   }
-  load_guest(argv[1], mem);
 
   memset(&region, 0, sizeof(region));
   region.slot = 0;
-  region.guest_phys_addr = 0;
-  region.memory_size = MEM_SIZE;
+  region.guest_phys_addr = GUEST_MEM_MODULE_START;  /* Must be a multiple of the page size (0x1000), otherwise KVM_SET_USER_MEMORY_REGION returns EINVAL. */
+  region.memory_size = MEM_SIZE - GUEST_MEM_MODULE_START;
   region.userspace_addr = (uintptr_t)mem;
+  /*region.flags = KVM_MEM_READONLY;*/  /* Not needed, default. */
   if (ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-    fprintf(stderr, "ioctl KVM_SET_USER_MEMORY_REGION failed: %d\n", errno);
+    perror("ioctl KVM_SET_USER_MEMORY_REGION");
     return 1;
   }
+  /* Any read/write outside these regions will trigger a KVM_EXIT_MMIO. */
+
+  mem = (char*)mem - GUEST_MEM_MODULE_START;
+  load_guest(argv[1], mem);
 
   if ((vcpu_fd = ioctl(vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
     fprintf(stderr, "can not create vcpu: %d\n", errno);
@@ -117,6 +122,12 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  /* Fill magic interrupt table. */
+  { unsigned u;
+    for (u = 0; u < 0x100; ++u) { ((unsigned*)mem)[u] = 0x400000 | u; }
+    memset((char*)mem + 0x400, 0xf4, 256);  /* 256 hlt instructions, one for each int. */
+  }
+
 /* We have to set both selector and base, otherwise it won't work. A `mov
  * ds, ax' instruction in the 16-bit guest will set both.
  */
@@ -135,6 +146,9 @@ int main(int argc, char *argv[]) {
   regs.rflags = 1 << 1;  /* Reserved bit. */
   regs.rip = 0;
 
+  dump_regs(&regs, &sregs);
+
+ set_sregs_regs_and_continue:
   if (ioctl(vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
     perror("KVM_SET_SREGS");
     return 1;
@@ -144,7 +158,7 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  dump_regs(&regs, &sregs);
+  /* !! Trap it if it tries to enter protected mode (cr0 |= 1). Is this possible? */
   for (;;) {
     int ret = ioctl(vcpu_fd, KVM_RUN, 0);
     if (ret < 0) {
@@ -173,8 +187,22 @@ int main(int argc, char *argv[]) {
       printf("shutdown\n");
       goto exit;
      case KVM_EXIT_HLT:
-      printf("hlt\n");
-      goto exit;
+      if ((unsigned)sregs.cs.selector == 0x40 && (unsigned)((unsigned)regs.rip - 1) < 0x100) {  /* hlt cause by int through our magic interrupt table */
+        const unsigned char int_num = ((unsigned)regs.rip - 1) & 0xff;
+        const unsigned short *csip_ptr = (const unsigned short*)((char*)mem + ((unsigned)sregs.ss.selector << 4) + ((unsigned)regs.rsp & 0xffff));
+        const unsigned short int_ip = csip_ptr[0], int_cs = csip_ptr[1];  /* Return address. */  /* !! Security: check bounds, also check that rsp <= 0xfffe. */
+        printf("int 0x%02x cs:%04x ip:%04x\n", int_num, int_cs, int_ip);
+        /* Return from the interrupt. */
+        SET_SEGMENT_REG(cs, int_cs);
+        regs.rip = int_ip;
+        goto set_sregs_regs_and_continue;
+      } else {
+        printf("hlt\n");
+        goto exit;
+      }
+     case KVM_EXIT_MMIO:
+      printf("mmio phys_addr=%08x value=%08x%08x size=%d is_write=%d\n", (unsigned)run->mmio.phys_addr, ((unsigned*)run->mmio.data)[1], ((unsigned*)run->mmio.data)[0], run->mmio.len, run->mmio.is_write);
+      break;  /* Just continue at cs:ip. */
      default:
       printf("exit_reason: %d\n", run->exit_reason);
       fflush(stdout);
