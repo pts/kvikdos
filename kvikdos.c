@@ -393,6 +393,10 @@ int main(int argc, char **argv) {
   }
  fatal:
   dump_regs("fatal", &regs, &sregs);
+#if 0  /* The Linux kernel does this at process exit. */
+  close(vcpu_fd);
+  close(vm_fd);
   close(kvm_fd);
+#endif
   return 252;
 }
