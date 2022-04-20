@@ -15,8 +15,12 @@
  * ``para'' means paragraph of 16 bytes.
  */
 #define BASE_PARA 0x100
-/* Must be a multiple of the Linux page size (0x1000), minimum value is 0x500 (after magic interrupt table). Must be at most BASE_PARA << 4. Can be 0. */
-#define GUEST_MEM_MODULE_START 0
+/* Must be a multiple of the Linux page size (0x1000), minimum value is
+ * 0x500 (after magic interrupt table). Must be at most BASE_PARA << 4. Can
+ * be 0. By setting it to nonzero (0x1000), we effectively make the magic
+ * interrupt table read-only.
+ */
+#define GUEST_MEM_MODULE_START 0x1000
 
 #ifndef DEBUG
 #define DEBUG 0
@@ -100,7 +104,7 @@ int main(int argc, char **argv) {
     exit(252);
   }
 
-  if ((mem = mmap(NULL, MEM_SIZE - GUEST_MEM_MODULE_START, PROT_READ | PROT_WRITE,
+  if ((mem = mmap(NULL, MEM_SIZE, PROT_READ | PROT_WRITE,
 		  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)) ==
       NULL) {
     fprintf(stderr, "mmap failed: %d\n", errno);
@@ -111,15 +115,26 @@ int main(int argc, char **argv) {
   region.slot = 0;
   region.guest_phys_addr = GUEST_MEM_MODULE_START;  /* Must be a multiple of the Linux page size (0x1000), otherwise KVM_SET_USER_MEMORY_REGION returns EINVAL. */
   region.memory_size = MEM_SIZE - GUEST_MEM_MODULE_START;
-  region.userspace_addr = (uintptr_t)mem;
-  /*region.flags = KVM_MEM_READONLY;*/  /* Not needed, default. */
+  region.userspace_addr = (uintptr_t)mem + GUEST_MEM_MODULE_START;
+  /*region.flags = KVM_MEM_READONLY;*/  /* Not needed, read-write is default. */
   if (ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
     perror("ioctl KVM_SET_USER_MEMORY_REGION");
     exit(252);
   }
+  if (GUEST_MEM_MODULE_START != 0) {
+    memset(&region, 0, sizeof(region));
+    region.slot = 1;
+    region.guest_phys_addr = 0;
+    region.memory_size = 0x1000;  /* Magic interrupt table: 0x500 bytes, rounded up to page boundary. */
+    region.userspace_addr = (uintptr_t)mem;
+    region.flags = KVM_MEM_READONLY;
+    if (ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+      perror("ioctl KVM_SET_USER_MEMORY_REGION");
+      exit(252);
+    }
+  }
   /* Any read/write outside these regions will trigger a KVM_EXIT_MMIO. */
 
-  mem = (char*)mem - GUEST_MEM_MODULE_START;
   load_guest(argv[1], mem);
 
   if ((vcpu_fd = ioctl(vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
