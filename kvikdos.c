@@ -37,6 +37,16 @@ static void load_guest(const char *filename, void *mem) {
   close(img_fd);
 }
 
+static void dump_regs(struct kvm_regs *regs, struct kvm_sregs *sregs) {
+#define R16(name) ((unsigned)regs->r##name & 0xffff)
+#define S16(name) ((unsigned)sregs->name.selector & 0xffff)
+#define R_SP (R16(sp) + 6)  /* We add 6 bytes because of KVM overhead. */
+  printf("regs: ax:%04x bx:%04x cx:%04x dx:%04x si:%04x di:%04x sp:%04x bp:%04x ip:%04x flags:%08x cs:%04x ds:%04x es:%04x fs:%04x gs:%04x ss:%04x\n",
+         R16(ax), R16(bx), R16(cx), R16(dx), R16(si), R16(di), R_SP, R16(bp), R16(ip), R16(flags),
+         S16(cs), S16(ds), S16(es), S16(fs), S16(gs), S16(ss));
+  fflush(stdout);
+}
+
 int main(int argc, char *argv[]) {
   int kvm_fd;
   int vm_fd;
@@ -98,12 +108,18 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  if (ioctl(vcpu_fd, KVM_GET_REGS, &regs) < 0) {
+    perror("KVM_GET_REGS");
+    return 1;
+  }
   if (ioctl(vcpu_fd, KVM_GET_SREGS, &(sregs)) < 0) {
     perror("KVM_GET_SREGS");
     return 1;
   }
 
-/* We have to set both selector and base, otherwise it won't work. */
+/* We have to set both selector and base, otherwise it won't work. A `mov
+ * ds, ax' instruction in the 16-bit guest will set both.
+ */
 #define SET_SEGMENT_REG(name, para_value) do { sregs.name.base = (sregs.name.selector = para_value) << 4; } while(0)
   SET_SEGMENT_REG(cs, BASE_PARA);
   SET_SEGMENT_REG(ds, BASE_PARA);
@@ -117,7 +133,7 @@ int main(int argc, char *argv[]) {
 
   /* EFLAGS https://en.wikipedia.org/wiki/FLAGS_register */
   regs.rflags = 1 << 1;  /* Reserved bit. */
-  regs.rip = CODE_LOAD_OFS;
+  regs.rip = 0;
 
   if (ioctl(vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
     perror("KVM_SET_SREGS");
@@ -128,6 +144,7 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  dump_regs(&regs, &sregs);
   for (;;) {
     int ret = ioctl(vcpu_fd, KVM_RUN, 0);
     if (ret < 0) {
@@ -142,26 +159,23 @@ int main(int argc, char *argv[]) {
       perror("KVM_GET_REGS");
       return 1;
     }
-
-#define R16(name) ((unsigned)regs.r##name & 0xffff)
-#define S16(name) ((unsigned)sregs.name.selector & 0xffff)
-#define R_SP (R16(sp) + 6)  /* We add 6 bytes because of KVM overhead. */
-    printf("regs: ax:%04x bx:%04x cx:%04x dx:%04x si:%04x di:%04x sp:%04x bp:%04x ip:%04x flags:%08x cs:%04x ds:%04x es:%04x fs:%04x gs:%04x ss:%04x\n",
-           R16(ax), R16(bx), R16(cx), R16(dx), R16(si), R16(di), R_SP, R16(bp), R16(ip), R16(flags),
-           S16(cs), S16(ds), S16(es), S16(fs), S16(gs), S16(ss));
-    fflush(stdout);
+    dump_regs(&regs, &sregs);
 
     switch (run->exit_reason) {
-    case KVM_EXIT_IO:
+     case KVM_EXIT_IO:
       printf("IO port: port=0x%02x data=%04x size=%d direction=%d\n", run->io.port,
 	     *(int *)((char *)(run) + run->io.data_offset),
 	     run->io.size, run->io.direction);
       fflush(stdout);
       sleep(1);
       break;
-    case KVM_EXIT_SHUTDOWN:
+     case KVM_EXIT_SHUTDOWN:  /* How do we trigger it? */
+      printf("shutdown\n");
       goto exit;
-    default:
+     case KVM_EXIT_HLT:
+      printf("hlt\n");
+      goto exit;
+     default:
       printf("exit_reason: %d\n", run->exit_reason);
       fflush(stdout);
       goto exit;
