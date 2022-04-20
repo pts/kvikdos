@@ -267,7 +267,7 @@ int main(int argc, char **argv) {
               /* https://stanislavs.org/helppc/dos_error_codes.html */
               *(unsigned short*)&regs.rax = 6;  /* Invalid handle. */
              error_on_21:
-              *(unsigned short*)regs.rflags |= 1 << 0;  /* CF=1. */
+              *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
             } else {
               int got;
               const char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + ((unsigned)regs.rdx & 0xffff);  /* !! Security: check bounds. */
