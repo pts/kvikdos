@@ -1,0 +1,7 @@
+*~
+*.o
+*.com
+*.exe
+/host
+/host32
+/host64
