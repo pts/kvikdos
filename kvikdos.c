@@ -139,19 +139,19 @@ int main(int argc, char **argv) {
   }
 
   if ((kvm_fd = open("/dev/kvm", O_RDWR)) < 0) {
-    perror("failed to open /dev/kvm");
+    perror("fatal: failed to open /dev/kvm");
     exit(252);
   }
 
   if ((vm_fd = ioctl(kvm_fd, KVM_CREATE_VM, 0)) < 0) {
-    perror("failed to create KVM vm");
+    perror("fatal: failed to create KVM vm");
     exit(252);
   }
 
   if ((mem = mmap(NULL, MEM_SIZE, PROT_READ | PROT_WRITE,
 		  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)) ==
       NULL) {
-    perror("mmap");
+    perror("fatal: mmap");
     exit(252);
   }
 
@@ -162,7 +162,7 @@ int main(int argc, char **argv) {
   region.userspace_addr = (uintptr_t)mem + GUEST_MEM_MODULE_START;
   /*region.flags = KVM_MEM_READONLY;*/  /* Not needed, read-write is default. */
   if (ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-    perror("ioctl KVM_SET_USER_MEMORY_REGION");
+    perror("fatal: ioctl KVM_SET_USER_MEMORY_REGION");
     exit(252);
   }
   if (GUEST_MEM_MODULE_START != 0) {
@@ -173,7 +173,7 @@ int main(int argc, char **argv) {
     region.userspace_addr = (uintptr_t)mem;
     region.flags = KVM_MEM_READONLY;
     if (ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-      perror("ioctl KVM_SET_USER_MEMORY_REGION");
+      perror("fatal: ioctl KVM_SET_USER_MEMORY_REGION");
       exit(252);
     }
   }
@@ -182,27 +182,27 @@ int main(int argc, char **argv) {
   load_dos_executable_program(argv[1], mem);
 
   if ((vcpu_fd = ioctl(vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
-    perror("can not create KVM vcpu");
+    perror("fatal: can not create KVM vcpu");
     exit(252);
   }
   kvm_run_mmap_size = ioctl(kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
   if (kvm_run_mmap_size < 0) {
-    perror("ioctl KVM_GET_VCPU_MMAP_SIZE");
+    perror("fatal: ioctl KVM_GET_VCPU_MMAP_SIZE");
     exit(252);
   }
   run = (struct kvm_run *)mmap(
       NULL, kvm_run_mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, vcpu_fd, 0);
   if (run == NULL) {
-    perror("mmap kvm_run: %d\n");
+    perror("fatal: mmap kvm_run: %d\n");
     exit(252);
   }
 
   if (ioctl(vcpu_fd, KVM_GET_REGS, &regs) < 0) {
-    perror("KVM_GET_REGS");
+    perror("fatal: KVM_GET_REGS");
     exit(252);
   }
   if (ioctl(vcpu_fd, KVM_GET_SREGS, &(sregs)) < 0) {
-    perror("KVM_GET_SREGS");
+    perror("fatal: KVM_GET_SREGS");
     exit(252);
   }
 
@@ -240,11 +240,11 @@ int main(int argc, char **argv) {
 
  set_sregs_regs_and_continue:
   if (ioctl(vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
-    perror("KVM_SET_SREGS");
+    perror("fatal: KVM_SET_SREGS");
     exit(252);
   }
   if (ioctl(vcpu_fd, KVM_SET_REGS, &regs) < 0) {
-    perror("KVM_SET_REGS\n");
+    perror("fatal: KVM_SET_REGS\n");
     exit(252);
   }
 
@@ -256,11 +256,11 @@ int main(int argc, char **argv) {
       exit(252);
     }
     if (ioctl(vcpu_fd, KVM_GET_REGS, &regs) < 0) {
-      perror("KVM_GET_REGS");
+      perror("fatal: KVM_GET_REGS");
       exit(252);
     }
     if (ioctl(vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
-      perror("KVM_GET_REGS");
+      perror("fatal: KVM_GET_REGS");
       exit(252);
     }
     if (DEBUG) dump_regs(&regs, &sregs);
