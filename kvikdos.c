@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -358,6 +359,28 @@ int main(int argc, char **argv) {
               }
             }
             (void)!write(1, p + dx0, dx - dx0);
+          } else if (ah == 0x2c) {  /* Get time. */
+            time_t ts = time(0);
+            struct tm *tm = localtime(&ts);
+            const unsigned char hundredths = 0;  /* TODO(pts): Use gettimeofday(2) to get it. */
+            *(unsigned short*)&regs.rcx = tm->tm_hour << 8 | tm->tm_min;
+            *(unsigned short*)&regs.rdx = tm->tm_sec << 8 | hundredths;
+          } else if (ah == 0x2a) {  /* Get date. */
+            time_t ts = time(0);
+            struct tm *tm = localtime(&ts);
+            *(unsigned char*)&regs.rax = tm->tm_wday;
+            *(unsigned short*)&regs.rcx = tm->tm_year + 1900;
+            *(unsigned short*)&regs.rdx = (tm->tm_mon + 1) << 8 | tm->tm_mday;
+          } else if (ah == 0x19) {  /* Get current drive. */
+            *(unsigned char*)&regs.rax = 'C' - 'A';
+          } else if (ah == 0x47) {  /* Get current directory. */
+            /* Input: DL: 0 = current drive, 1: A: */
+            if (*(unsigned char*)&regs.rdx != 0) {
+              *(unsigned short*)&regs.rax = 0xf;  /* Invalid drive specified. */
+              goto error_on_21;
+            }
+            /* Current directory is \ (\ stripped from both sides). */
+            *((char*)mem + ((unsigned)sregs.ds.selector << 4) + ((unsigned)regs.rdx & 0xffff)) = '\0';  /* !! Security: check bounds, should be 64 bytes supplied by the caller. */
           } else {
             goto fatal_int;
           }
