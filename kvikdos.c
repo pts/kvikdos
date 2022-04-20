@@ -9,6 +9,7 @@
 #include <time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define MEM_SIZE (2 << 20)  /* In bytes. 2 MiB. */
@@ -120,10 +121,41 @@ static void copy_args_to_dos_args(char *p, char **args) {
   *p = --size;
 }
 
+static int ensure_fd_is_at_least(int fd, int min_fd) {
+  if (fd + 0U < min_fd + 0U) {
+    int fd2 = dup(fd);
+    if (fd2 < 0) { perror("dup"); exit(252); }
+    if (fd2 + 0U < min_fd + 0U) fd2 = ensure_fd_is_at_least(fd2, min_fd);
+    close(fd);  /* !! TODO(pts): Keep /dev/null open, for faster operation of many open() + close() calls. */
+    fd = fd2;
+  }
+  return fd;
+}
+
+/* le is Linux errno. */
+static unsigned short get_dos_error_code(int le) {
+  /* https://stanislavs.org/helppc/dos_error_codes.html */
+  return le == ENOENT ? 2  /* File not found. */
+       : le == EACCES ? 5  /* Access denied. */
+       : le == EBADF ? 6  /* Invalid handle. */
+       : 0x1f;  /* General failure. */
+}
+
+struct kvm_fds {
+  int kvm_fd, vm_fd, vcpu_fd;
+};
+
+static int get_linux_handle(unsigned short handle, const struct kvm_fds *kvm_fds) {
+  return handle < 5 ? (
+               handle == 3 ? 2  /* Emulate STDAUX with stderr. */
+             : handle == 4 ? 1  /* Emulate STDPRN with stdout. */
+             : handle)
+       : (handle == kvm_fds->kvm_fd || handle == kvm_fds->vm_fd || handle == kvm_fds->vcpu_fd) ? -1  /* Disallow these handles from DOS for security. */
+       : handle;
+}
+
 int main(int argc, char **argv) {
-  int kvm_fd;
-  int vm_fd;
-  int vcpu_fd;
+  struct kvm_fds kvm_fds;
   void *mem;
   char *psp;
   struct kvm_userspace_memory_region region;
@@ -139,18 +171,18 @@ int main(int argc, char **argv) {
     exit(252);
   }
 
-  if ((kvm_fd = open("/dev/kvm", O_RDWR)) < 0) {
+  if ((kvm_fds.kvm_fd = open("/dev/kvm", O_RDWR)) < 0) {
     perror("fatal: failed to open /dev/kvm");
     exit(252);
   }
 
-  if ((vm_fd = ioctl(kvm_fd, KVM_CREATE_VM, 0)) < 0) {
+  if ((kvm_fds.vm_fd = ioctl(kvm_fds.kvm_fd, KVM_CREATE_VM, 0)) < 0) {
     perror("fatal: failed to create KVM vm");
     exit(252);
   }
 
   if ((mem = mmap(NULL, MEM_SIZE, PROT_READ | PROT_WRITE,
-		  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)) ==
+                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)) ==
       NULL) {
     perror("fatal: mmap");
     exit(252);
@@ -162,7 +194,7 @@ int main(int argc, char **argv) {
   region.memory_size = DOS_MEM_LIMIT - GUEST_MEM_MODULE_START;
   region.userspace_addr = (uintptr_t)mem + GUEST_MEM_MODULE_START;
   /*region.flags = KVM_MEM_READONLY;*/  /* Not needed, read-write is default. */
-  if (ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+  if (ioctl(kvm_fds.vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
     perror("fatal: ioctl KVM_SET_USER_MEMORY_REGION");
     exit(252);
   }
@@ -173,7 +205,7 @@ int main(int argc, char **argv) {
     region.memory_size = 0x1000;  /* Magic interrupt table: 0x500 bytes, rounded up to page boundary. */
     region.userspace_addr = (uintptr_t)mem;
     region.flags = KVM_MEM_READONLY;
-    if (ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+    if (ioctl(kvm_fds.vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
       perror("fatal: ioctl KVM_SET_USER_MEMORY_REGION");
       exit(252);
     }
@@ -182,27 +214,27 @@ int main(int argc, char **argv) {
 
   load_dos_executable_program(argv[1], mem);
 
-  if ((vcpu_fd = ioctl(vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
+  if ((kvm_fds.vcpu_fd = ioctl(kvm_fds.vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
     perror("fatal: can not create KVM vcpu");
     exit(252);
   }
-  kvm_run_mmap_size = ioctl(kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
+  kvm_run_mmap_size = ioctl(kvm_fds.kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
   if (kvm_run_mmap_size < 0) {
     perror("fatal: ioctl KVM_GET_VCPU_MMAP_SIZE");
     exit(252);
   }
   run = (struct kvm_run *)mmap(
-      NULL, kvm_run_mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, vcpu_fd, 0);
+      NULL, kvm_run_mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, kvm_fds.vcpu_fd, 0);
   if (run == NULL) {
     perror("fatal: mmap kvm_run: %d\n");
     exit(252);
   }
 
-  if (ioctl(vcpu_fd, KVM_GET_REGS, &regs) < 0) {
+  if (ioctl(kvm_fds.vcpu_fd, KVM_GET_REGS, &regs) < 0) {
     perror("fatal: KVM_GET_REGS");
     exit(252);
   }
-  if (ioctl(vcpu_fd, KVM_GET_SREGS, &(sregs)) < 0) {
+  if (ioctl(kvm_fds.vcpu_fd, KVM_GET_SREGS, &(sregs)) < 0) {
     perror("fatal: KVM_GET_SREGS");
     exit(252);
   }
@@ -239,28 +271,30 @@ int main(int argc, char **argv) {
 
   if (DEBUG) dump_regs("debug", &regs, &sregs);
 
+  /* !! Security: close all filehandles except for 0, 1, 2 and kvm_fds, so that read and write from DOS won't be able to touch them. */
+
  set_sregs_regs_and_continue:
-  if (ioctl(vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
+  if (ioctl(kvm_fds.vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
     perror("fatal: KVM_SET_SREGS");
     exit(252);
   }
-  if (ioctl(vcpu_fd, KVM_SET_REGS, &regs) < 0) {
+  if (ioctl(kvm_fds.vcpu_fd, KVM_SET_REGS, &regs) < 0) {
     perror("fatal: KVM_SET_REGS\n");
     exit(252);
   }
 
   /* !! Trap it if it tries to enter protected mode (cr0 |= 1). Is this possible? */
   for (;;) {
-    int ret = ioctl(vcpu_fd, KVM_RUN, 0);
+    int ret = ioctl(kvm_fds.vcpu_fd, KVM_RUN, 0);
     if (ret < 0) {
       fprintf(stderr, "KVM_RUN failed");
       exit(252);
     }
-    if (ioctl(vcpu_fd, KVM_GET_REGS, &regs) < 0) {
+    if (ioctl(kvm_fds.vcpu_fd, KVM_GET_REGS, &regs) < 0) {
       perror("fatal: KVM_GET_REGS");
       exit(252);
     }
-    if (ioctl(vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
+    if (ioctl(kvm_fds.vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
       perror("fatal: KVM_GET_REGS");
       exit(252);
     }
@@ -268,9 +302,7 @@ int main(int argc, char **argv) {
 
     switch (run->exit_reason) {
      case KVM_EXIT_IO:
-      if (DEBUG) fprintf(stderr, "debug: IO port: port=0x%02x data=%04x size=%d direction=%d\n", run->io.port,
-	     *(int *)((char *)(run) + run->io.data_offset),
-	     run->io.size, run->io.direction);
+      if (DEBUG) fprintf(stderr, "debug: IO port: port=0x%02x data=%04x size=%d direction=%d\n", run->io.port, *(int *)((char *)(run) + run->io.data_offset), run->io.size, run->io.direction);
       sleep(1);
       break;  /* Continue as if the in/out hasn't happened. */
      case KVM_EXIT_SHUTDOWN:  /* How do we trigger it? */
@@ -279,18 +311,20 @@ int main(int argc, char **argv) {
      case KVM_EXIT_HLT:
       if ((unsigned)sregs.cs.selector == 0x40 && (unsigned)((unsigned)regs.rip - 1) < 0x100) {  /* hlt caused by int through our magic interrupt table. */
         const unsigned char int_num = ((unsigned)regs.rip - 1) & 0xff;
-        const unsigned short *csip_ptr = (const unsigned short*)((char*)mem + ((unsigned)sregs.ss.selector << 4) + (*(unsigned short*)&regs.rsp));
+        const unsigned short *csip_ptr = (const unsigned short*)((char*)mem + ((unsigned)sregs.ss.selector << 4) + (*(unsigned short*)&regs.rsp));  /* !! What if rsp wraps around 64 KiB boundary? Test it. Also calculate int_cs again. */
         const unsigned short int_ip = csip_ptr[0], int_cs = csip_ptr[1];  /* Return address. */  /* !! Security: check bounds, also check that rsp <= 0xfffe. */
         const unsigned char ah = ((unsigned)regs.rax >> 8) & 0xff;
         if (DEBUG) fprintf(stderr, "debug: int 0x%02x ah:%02x cs:%04x ip:%04x\n", int_num, ah, int_cs, int_ip);
         fflush(stdout);
         (void)ah;
+        /* Documentation about DOS and BIOS int calls: https://stanislavs.org/helppc/idx_interrupt.html */
         if (int_num == 0x29) {
           const char c = regs.rax;
           (void)!write(1, &c, 1);
         } else if (int_num == 0x20) {
           exit(0);  /* EXIT_SUCCESS. */
         } else if (int_num == 0x21) {
+          /* !! Should we set CF=0 by default? What does MS-DOS do? */
           if (ah == 0x4c) {
             exit((unsigned)regs.rax & 0xff);
           } else if (ah == 0x06 && (unsigned char)regs.rdx != 0xff) {  /* Direct console I/O, output. */
@@ -307,19 +341,16 @@ int main(int argc, char **argv) {
             *(unsigned short*)&regs.rbx = 0xff00;  /* MS-DOS with high 8 bits of OEM serial number in BL. */
             *(unsigned short*)&regs.rcx = 0;  /* Low 16 bits of OEM serial number in CX. */
           } else if (ah == 0x40) {  /* Write using handle. */
-            unsigned fd = (unsigned short)regs.rbx;
-            if (fd > 4) {  /* Handle too large. */
-              /* https://stanislavs.org/helppc/dos_error_codes.html */
+            const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
+            if (fd < 0) {
+             error_invalid_handle:
               *(unsigned short*)&regs.rax = 6;  /* Invalid handle. */
              error_on_21:
               *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
             } else {
-              int got;
               const char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
-              const int size = (int)(unsigned short)regs.rcx;
-              if (fd == 3) fd = 2;  /* Emulate STDAUX with stderr. */
-              else if (fd == 4) fd = 0;  /* Emulate STDPRN with stdout. */
-              got = write(fd, p, size);
+              const int size = (int)*(unsigned short*)&regs.rcx;
+              const int got = write(fd, p, size);
               if (got < 0) {
                 *(unsigned short*)&regs.rax = 0x1d;  /* Write fault. */
                 goto error_on_21;
@@ -328,18 +359,13 @@ int main(int argc, char **argv) {
               *(unsigned short*)&regs.rax = got;
             }
           } else if (ah == 0x3f) {  /* Read using handle. */
-            unsigned fd = (unsigned short)regs.rbx;
-            if (fd > 4) {  /* Handle too large. */
-              /* https://stanislavs.org/helppc/dos_error_codes.html */
-              *(unsigned short*)&regs.rax = 6;  /* Invalid handle. */
-              goto error_on_21;
+            const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
+            if (fd < 0) {
+              goto error_invalid_handle;
             } else {
-              int got;
               char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
-              const int size = (int)(unsigned short)regs.rcx;
-              if (fd == 3) fd = 2;  /* Emulate STDAUX with stderr. */
-              else if (fd == 4) fd = 0;  /* Emulate STDPRN with stdout. */
-              got = read(fd, p, size);
+              const int size = (int)*(unsigned short*)&regs.rcx;
+              const int got = read(fd, p, size);
               if (got < 0) {
                 *(unsigned short*)&regs.rax = 0x1e;  /* Read fault. */
                 goto error_on_21;
@@ -348,7 +374,7 @@ int main(int argc, char **argv) {
               *(unsigned short*)&regs.rax = got;
             }
           } else if (ah == 0x09) {  /* Print string. */
-            unsigned short dx = (unsigned short)regs.rdx, dx0 = dx;
+            unsigned short dx = *(unsigned short*)&regs.rdx, dx0 = dx;
             const char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4);
             for (;;) {
               if (p[dx] == '$') break;
@@ -381,6 +407,61 @@ int main(int argc, char **argv) {
             }
             /* Current directory is \ (\ stripped from both sides). */
             *((char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx)) = '\0';  /* !! Security: check bounds, should be 64 bytes supplied by the caller. */
+          } else if (ah == 0x3d || ah == 0x3c) {  /* Open to handle. Create to handle. */
+            const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            const int flags = (ah == 0x3c) ? O_RDWR | O_CREAT | O_TRUNC :
+                *(unsigned char*)&regs.rax & 3;  /* O_RDONLY == 0, O_WRONLY == 1, O_RDWR == 2 same in DOS and Linux. */
+            /* For create, CX contains attributes (read-only, hidden, system, archive), we just ignore it.
+             * https://stanislavs.org/helppc/file_attributes.html
+             */
+            int fd = open(p, flags, 0644);
+            if (fd < 0) { error_from_linux:
+              *(unsigned short*)&regs.rax = get_dos_error_code(errno);
+              goto error_on_21;
+            }
+            if (fd < 5) fd = ensure_fd_is_at_least(fd, 5);  /* Skip the first 5 DOS standard handles. */
+            if ((fd + 0U) >> 16) {
+              *(unsigned short*)&regs.rax = 4;  /* Too many open files. */
+              goto error_on_21;
+            }
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            *(unsigned short*)&regs.rax = fd;
+          } else if (ah == 0x57) {  /* Get/set file date and time using handle. */
+            const unsigned char al = *(unsigned char*)&regs.rax;
+            if (al < 2 ) {
+              const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
+              if (fd < 0) goto error_invalid_handle;
+              if (al == 0) {  /* Get. */
+                struct stat st;
+                struct tm *tm;
+                if (fstat(fd, &st) != 0) goto error_from_linux;
+                tm = localtime(&st.st_mtime);
+                *(unsigned short*)&regs.rcx = tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11;
+                *(unsigned short*)&regs.rdx = tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 1980) << 9;
+              } else if (al == 0) {  /* Set. */
+                /* !! Implement this with utime(2). */
+                fprintf(stderr, "fatal: unimplemented: set file date and time: fd=%d cx:%04x dx:%04x\n", fd, *(unsigned short*)&regs.rcx, *(unsigned short*)&regs.rdx);
+                goto fatal;
+              }
+            } else {
+              *(unsigned short*)&regs.rax = 0x57;  /* Invalid parameter. */
+              goto error_on_21;
+            }
+          } else if (ah == 0x3e) {  /* Close using handle. */
+            const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
+            if (fd < 0) goto error_invalid_handle;  /* Not strictly needed, close(...) would check. */
+            if (close(fd) != 0) goto error_from_linux;
+          } else if (ah == 0x41) {  /* Delete file. */
+            const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            int fd = unlink(p);
+            if (fd < 0) goto error_from_linux;
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x56) {  /* Rename file. */
+            const char * const p_old = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            const char * const p_new = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rdi);  /* !! Security: check bounds. */
+            int fd = rename(p_old, p_new);
+            if (fd < 0) goto error_from_linux;
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else {
             goto fatal_int;
           }
@@ -399,7 +480,7 @@ int main(int argc, char **argv) {
         /* Return from the interrupt. */
         SET_SEGMENT_REG(cs, int_cs);
         regs.rip = int_ip;
-        *(unsigned*)&regs.rsp += 6;  /* pop ip, pop cs, pop flags. */
+        *(unsigned short*)&regs.rsp += 6;  /* pop ip, pop cs, pop flags. */
         goto set_sregs_regs_and_continue;
       } else {
         fprintf(stderr, "fatal: unexpected hlt\n");
@@ -417,9 +498,9 @@ int main(int argc, char **argv) {
  fatal:
   dump_regs("fatal", &regs, &sregs);
 #if 0  /* The Linux kernel does this at process exit. */
-  close(vcpu_fd);
-  close(vm_fd);
-  close(kvm_fd);
+  close(kvm_fds.vcpu_fd);
+  close(kvm_fds.vm_fd);
+  close(kvm_fds.kvm_fd);
 #endif
   return 252;
 }
