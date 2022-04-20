@@ -30,7 +30,7 @@ static void load_guest(const char *filename, void *mem) {
   char *p;
   const int img_fd = open(filename, O_RDONLY);
   if (img_fd < 0) {
-    fprintf(stderr, "fatal: can not open binary file: %d\n", errno);
+    fprintf(stderr, "fatal: can not open DOS executable program: %s: %s\n", filename, strerror(errno));
     exit(252);
   }
   p = (char *)mem + (BASE_PARA << 4) + 0x100;  /* !! Security: check bounds (of mem). */
@@ -95,19 +95,19 @@ int main(int argc, char **argv) {
   }
 
   if ((kvm_fd = open("/dev/kvm", O_RDWR)) < 0) {
-    fprintf(stderr, "failed to open /dev/kvm: %d\n", errno);
+    perror("failed to open /dev/kvm");
     exit(252);
   }
 
   if ((vm_fd = ioctl(kvm_fd, KVM_CREATE_VM, 0)) < 0) {
-    fprintf(stderr, "failed to create vm: %d\n", errno);
+    perror("failed to create KVM vm");
     exit(252);
   }
 
   if ((mem = mmap(NULL, MEM_SIZE, PROT_READ | PROT_WRITE,
 		  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)) ==
       NULL) {
-    fprintf(stderr, "mmap failed: %d\n", errno);
+    perror("mmap");
     exit(252);
   }
 
@@ -138,18 +138,18 @@ int main(int argc, char **argv) {
   load_guest(argv[1], mem);
 
   if ((vcpu_fd = ioctl(vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
-    fprintf(stderr, "can not create vcpu: %d\n", errno);
+    perror("can not create KVM vcpu");
     exit(252);
   }
   kvm_run_mmap_size = ioctl(kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
   if (kvm_run_mmap_size < 0) {
-    fprintf(stderr, "ioctl KVM_GET_VCPU_MMAP_SIZE: %d\n", errno);
+    perror("ioctl KVM_GET_VCPU_MMAP_SIZE");
     exit(252);
   }
   run = (struct kvm_run *)mmap(
       NULL, kvm_run_mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, vcpu_fd, 0);
   if (run == NULL) {
-    fprintf(stderr, "mmap kvm_run: %d\n", errno);
+    perror("mmap kvm_run: %d\n");
     exit(252);
   }
 
