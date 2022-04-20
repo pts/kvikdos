@@ -40,7 +40,7 @@ static void load_guest(const char *filename, void *mem) {
 static void dump_regs(struct kvm_regs *regs, struct kvm_sregs *sregs) {
 #define R16(name) ((unsigned)regs->r##name & 0xffff)
 #define S16(name) ((unsigned)sregs->name.selector & 0xffff)
-#define R_SP (R16(sp) + 6)  /* We add 6 bytes because of KVM overhead. */
+#define R_SP (R16(sp) + 6)  /* !! This is some bug elsewhere in host.c. */
   printf("regs: ax:%04x bx:%04x cx:%04x dx:%04x si:%04x di:%04x sp:%04x bp:%04x ip:%04x flags:%08x cs:%04x ds:%04x es:%04x fs:%04x gs:%04x ss:%04x\n",
          R16(ax), R16(bx), R16(cx), R16(dx), R16(si), R16(di), R_SP, R16(bp), R16(ip), R16(flags),
          S16(cs), S16(ds), S16(es), S16(fs), S16(gs), S16(ss));
