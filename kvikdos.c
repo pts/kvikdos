@@ -93,12 +93,12 @@ static void load_dos_executable_program(const char *filename, void *mem) {
 }
 
 static void dump_regs(const char *prefix, struct kvm_regs *regs, struct kvm_sregs *sregs) {
-#define R16(name) ((unsigned)regs->r##name & 0xffff)
-#define S16(name) ((unsigned)sregs->name.selector & 0xffff)
-  fprintf(stderr, "%s: regs: ax:%04x bx:%04x cx:%04x dx:%04x si:%04x di:%04x sp:%04x bp:%04x ip:%04x flags:%08x cs:%04x ds:%04x es:%04x fs:%04x gs:%04x ss:%04x\n",
-          prefix,
-          R16(ax), R16(bx), R16(cx), R16(dx), R16(si), R16(di), R16(sp), R16(bp), R16(ip), R16(flags),
-          S16(cs), S16(ds), S16(es), S16(fs), S16(gs), S16(ss));
+#define R16(name) (*(unsigned short*)&regs->r##name)
+#define S16(name) (*(unsigned short*)&sregs->name.selector)
+  fprintf(stderr, "%s: regs: cs:%04x ip:%04x ax:%04x bx:%04x cx:%04x dx:%04x si:%04x di:%04x sp:%04x bp:%04x flags:%08x ds:%04x es:%04x fs:%04x gs:%04x ss:%04x\n",
+          prefix, S16(cs), R16(ip),
+          R16(ax), R16(bx), R16(cx), R16(dx), R16(si), R16(di), R16(sp), R16(bp), *(unsigned*)&regs->rflags,
+          S16(ds), S16(es), S16(fs), S16(gs), S16(ss));
   fflush(stdout);
 }
 
