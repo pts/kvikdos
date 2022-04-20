@@ -22,28 +22,72 @@
  */
 #define GUEST_MEM_MODULE_START 0x1000
 
+#define DOS_MEM_LIMIT 0xa0000  /* 640 KiB should be enough for everyone :-). */
+
+#define MAX_DOS_COM_SIZE 0xfee0  /* size + 0x100 bytes of PSP + 0x20 bytes of stack <= 0x10000 bytes. */
+
 #ifndef DEBUG
 #define DEBUG 0
 #endif
 
-static void load_guest(const char *filename, void *mem) {
+char is_same_ascii_nocase(const char *a, const char *b, unsigned size) {
+  while (size-- != 0) {
+    const unsigned char pa = *a++;
+    const unsigned char pb = *b++;
+    if (!(pa == pb || ((pa | 32) - 'a' + 0U <= 'z' - 'a' + 0U && (pa ^ 32) == pb))) return 0;
+  }
+  return 1;
+}
+
+static void load_dos_executable_program(const char *filename, void *mem) {
   char *p;
+  int r, r2;
   const int img_fd = open(filename, O_RDONLY);
   if (img_fd < 0) {
     fprintf(stderr, "fatal: can not open DOS executable program: %s: %s\n", filename, strerror(errno));
     exit(252);
   }
   p = (char *)mem + (BASE_PARA << 4) + 0x100;  /* !! Security: check bounds (of mem). */
-  for (;;) {
-    const int r = read(img_fd, p, 8192);
-    if (r <= 0) {
-      if (r < 0) {
-        perror("read");
-        exit(252);
-      }
-      break;
+  r = read(img_fd, p, 28);
+  if (r < 0) { read_error:
+    perror("fatal: error reading DOS executable program");
+    exit(252);
+  }
+  if (r == 0) {
+    fprintf(stderr, "fatal: empty DOS executable program");
+    exit(252);
+  }
+  if (r >= 2 && ('M' | 'Z' << 8) == *(unsigned short*)p) {
+    if (r < 28) {
+      fprintf(stderr, "fatal: DOS .exe program too short: %s\n", filename);
+      exit(252);
     }
-    p += r;
+    fprintf(stderr, "fatal: DOS .exe programs not supported: %s\n", filename);
+    exit(252);  /* !! add support */
+  }
+  if (r >= 6 && is_same_ascii_nocase(p, "@echo ", 6)) {
+    fprintf(stderr, "fatal: DOS .bat batch files not supported: %s\n", filename);
+    exit(252);  /* !! add support */
+  }
+  if (r >= 4 && 0 == memcmp(p, "\x7f""ELF", 4)) {  /* Typically Linux native executable. */
+    fprintf(stderr, "fatal: ELF executable programs not supported: %s\n", filename);
+    exit(252);  /* TODO(pts): Run them natively, without setting up KVM. */
+  }
+  if (r >= 3 && ('#' | '!' << 8) == *(unsigned short*)p && (p[2] == ' ' || p[2] == '/')) {
+    /* Unix script #! shebang detected. */
+    fprintf(stderr, "fatal: Unix scripts not supported: %s\n", filename);
+    exit(252);  /* TODO(pts): Run them natively, without setting up KVM. */
+  }
+
+  /* Load DOS .com program. */
+  if (r == 28) {
+    r2 = read(img_fd, p + r, MAX_DOS_COM_SIZE + 1 - r);
+    if (r2 < 0) goto read_error;
+    r += r2;
+    if (r > MAX_DOS_COM_SIZE) {
+      fprintf(stderr, "fatal: DOS executable program too long: %s\n", filename);
+      exit(252);
+    }
   }
   close(img_fd);
 }
@@ -90,7 +134,7 @@ int main(int argc, char **argv) {
 
   (void)argc;
   if (!argv[0] || !argv[1]) {
-    fprintf(stderr, "Usage: %s <guest-image> [<dos-arg> ...]\n", argv[0]);
+    fprintf(stderr, "Usage: %s <dos-com-or-exe-file> [<dos-arg> ...]\n", argv[0]);
     exit(252);
   }
 
@@ -114,7 +158,7 @@ int main(int argc, char **argv) {
   memset(&region, 0, sizeof(region));
   region.slot = 0;
   region.guest_phys_addr = GUEST_MEM_MODULE_START;  /* Must be a multiple of the Linux page size (0x1000), otherwise KVM_SET_USER_MEMORY_REGION returns EINVAL. */
-  region.memory_size = MEM_SIZE - GUEST_MEM_MODULE_START;
+  region.memory_size = DOS_MEM_LIMIT - GUEST_MEM_MODULE_START;
   region.userspace_addr = (uintptr_t)mem + GUEST_MEM_MODULE_START;
   /*region.flags = KVM_MEM_READONLY;*/  /* Not needed, read-write is default. */
   if (ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
@@ -135,7 +179,7 @@ int main(int argc, char **argv) {
   }
   /* Any read/write outside these regions will trigger a KVM_EXIT_MMIO. */
 
-  load_guest(argv[1], mem);
+  load_dos_executable_program(argv[1], mem);
 
   if ((vcpu_fd = ioctl(vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
     perror("can not create KVM vcpu");
@@ -169,7 +213,7 @@ int main(int argc, char **argv) {
   }
 
 /* We have to set both selector and base, otherwise it won't work. A `mov
- * ds, ax' instruction in the 16-bit guest will set both.
+ * ds, ax' instruction in the 16-bit KVM guest will set both.
  */
 #define SET_SEGMENT_REG(name, para_value) do { sregs.name.base = (sregs.name.selector = para_value) << 4; } while(0)
   SET_SEGMENT_REG(cs, BASE_PARA);
