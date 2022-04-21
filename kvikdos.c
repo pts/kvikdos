@@ -104,7 +104,7 @@ static void load_dos_executable_program(int img_fd, const char *filename, void *
   }
 }
 
-static void dump_regs(const char *prefix, struct kvm_regs *regs, struct kvm_sregs *sregs) {
+static void dump_regs(const char *prefix, const struct kvm_regs *regs, const struct kvm_sregs *sregs) {
 #define R16(name) (*(unsigned short*)&regs->r##name)
 #define S16(name) (*(unsigned short*)&sregs->name.selector)
   fprintf(stderr, "%s: regs: cs:%04x ip:%04x ax:%04x bx:%04x cx:%04x dx:%04x si:%04x di:%04x sp:%04x bp:%04x flags:%08x ds:%04x es:%04x fs:%04x gs:%04x ss:%04x\n",
