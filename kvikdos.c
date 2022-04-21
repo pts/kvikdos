@@ -164,7 +164,7 @@ int main(int argc, char **argv) {
   void *mem;
   char *psp;
   struct kvm_userspace_memory_region region;
-  int kvm_run_mmap_size;
+  int kvm_run_mmap_size, api_version;
   struct kvm_run *run;
   struct kvm_regs regs;
   struct kvm_sregs sregs;
@@ -179,6 +179,15 @@ int main(int argc, char **argv) {
   if ((kvm_fds.kvm_fd = open("/dev/kvm", O_RDWR)) < 0) {
     perror("fatal: failed to open /dev/kvm");
     exit(252);
+  }
+
+  if ((api_version = ioctl(kvm_fds.kvm_fd, KVM_GET_API_VERSION, 0)) < 0) {
+    perror("fatal: failed to create KVM vm");
+    exit(252);
+  }
+  if (api_version != KVM_API_VERSION) {
+    fprintf(stderr, "fatal: KVM API version mismatch: kernel=%d user=%d\n",
+            api_version, KVM_API_VERSION);
   }
 
   if ((kvm_fds.vm_fd = ioctl(kvm_fds.kvm_fd, KVM_CREATE_VM, 0)) < 0) {
