@@ -37,6 +37,8 @@
 #define DEBUG 0
 #endif
 
+#define PROGRAM_HEADER_SIZE 28  /* Large enough for .exe header (28 bytes). */
+
 char is_same_ascii_nocase(const char *a, const char *b, unsigned size) {
   while (size-- != 0) {
     const unsigned char pa = *a++;
@@ -46,18 +48,12 @@ char is_same_ascii_nocase(const char *a, const char *b, unsigned size) {
   return 1;
 }
 
-static void load_dos_executable_program(const char *filename, void *mem) {
-  char *p;
-  int r, r2;
-  const int img_fd = open(filename, O_RDONLY);
-  if (img_fd < 0) {
-    fprintf(stderr, "fatal: can not open DOS executable program: %s: %s\n", filename, strerror(errno));
-    exit(252);
-  }
-  p = (char *)mem + (BASE_PARA << 4) + 0x100;  /* !! Security: check bounds (of mem). */
-  r = read(img_fd, p, 28);
-  if (r < 0) { read_error:
-    perror("fatal: error reading DOS executable program");
+/* Returns the total number of header bytes read from img_fd. */
+static int detect_dos_executable_program(int img_fd, const char *filename, char *p) {
+  int r;
+  r = read(img_fd, p, PROGRAM_HEADER_SIZE);
+  if (r < 0) {
+    perror("fatal: error reading DOS executable program header");
     exit(252);
   }
   if (r == 0) {
@@ -65,38 +61,47 @@ static void load_dos_executable_program(const char *filename, void *mem) {
     exit(252);
   }
   if (r >= 2 && (('M' | 'Z' << 8) == *(unsigned short*)p || ('M' << 8 | 'Z') == *(unsigned short*)p)) {
-    if (r < 28) {
+    if (r < PROGRAM_HEADER_SIZE) {
       fprintf(stderr, "fatal: DOS .exe program too short: %s\n", filename);
       exit(252);
     }
-    fprintf(stderr, "fatal: DOS .exe programs not supported: %s\n", filename);
-    exit(252);  /* !! add support */
-  }
-  if (r >= 6 && is_same_ascii_nocase(p, "@echo ", 6)) {
+  } else if (r >= 6 && is_same_ascii_nocase(p, "@echo ", 6)) {
     fprintf(stderr, "fatal: DOS .bat batch files not supported: %s\n", filename);
     exit(252);  /* !! add support */
-  }
-  if (r >= 4 && 0 == memcmp(p, "\x7f""ELF", 4)) {  /* Typically Linux native executable. */
+  } else if (r >= 4 && 0 == memcmp(p, "\x7f""ELF", 4)) {  /* Typically Linux native executable. */
     fprintf(stderr, "fatal: ELF executable programs not supported: %s\n", filename);
     exit(252);  /* TODO(pts): Run them natively, without setting up KVM. */
-  }
-  if (r >= 3 && ('#' | '!' << 8) == *(unsigned short*)p && (p[2] == ' ' || p[2] == '/')) {
+  } else if (r >= 3 && ('#' | '!' << 8) == *(unsigned short*)p && (p[2] == ' ' || p[2] == '/')) {
     /* Unix script #! shebang detected. */
     fprintf(stderr, "fatal: Unix scripts not supported: %s\n", filename);
     exit(252);  /* TODO(pts): Run them natively, without setting up KVM. */
-  }
+  }  /* Otheerwise it's a DOS .com program. */
+  return r;
+}
 
-  /* Load DOS .com program. */
-  if (r == 28) {
-    r2 = read(img_fd, p + r, MAX_DOS_COM_SIZE + 1 - r);
-    if (r2 < 0) goto read_error;
-    r += r2;
+/* r is the total number of header bytes alreday read from img_fd by
+ * detect_dos_executable_program.
+ */
+static void load_dos_executable_program(int img_fd, const char *filename, void *mem, const char *header, int header_size) {
+  if (header_size >= PROGRAM_HEADER_SIZE && (('M' | 'Z' << 8) == *(unsigned short*)header || ('M' << 8 | 'Z') == *(unsigned short*)header)) {
+    fprintf(stderr, "fatal: DOS .exe programs not supported: %s\n", filename);
+    exit(252);  /* !! add support */
+  } else {
+    /* Load DOS .com program. */
+    char * const p = (char *)mem + (BASE_PARA << 4) + 0x100;  /* !! Security: check bounds (of mem). */
+    int r;
+    memcpy(p, header, header_size);
+    r = read(img_fd, p + header_size, MAX_DOS_COM_SIZE + 1 - header_size);
+    if (r < 0) { /*read_error:*/
+      perror("fatal: error reading DOS executable program");
+      exit(252);
+    }
+    r += header_size;
     if (r > MAX_DOS_COM_SIZE) {
       fprintf(stderr, "fatal: DOS executable program too long: %s\n", filename);
       exit(252);
     }
   }
-  close(img_fd);
 }
 
 static void dump_regs(const char *prefix, struct kvm_regs *regs, struct kvm_sregs *sregs) {
@@ -164,17 +169,27 @@ int main(int argc, char **argv) {
   void *mem;
   char *psp;
   struct kvm_userspace_memory_region region;
-  int kvm_run_mmap_size, api_version;
+  int kvm_run_mmap_size, api_version, img_fd;
   struct kvm_run *run;
   struct kvm_regs regs;
   struct kvm_sregs sregs;
   unsigned sp;
+  const char *filename;
+  char header[PROGRAM_HEADER_SIZE];
+  unsigned header_size;
 
   (void)argc;
   if (!argv[0] || !argv[1]) {
     fprintf(stderr, "Usage: %s <dos-com-or-exe-file> [<dos-arg> ...]\n", argv[0]);
     exit(252);
   }
+
+  img_fd = open(filename = argv[1], O_RDONLY);
+  if (img_fd < 0) {
+    fprintf(stderr, "fatal: can not open DOS executable program: %s: %s\n", filename, strerror(errno));
+    exit(252);
+  }
+  header_size = detect_dos_executable_program(img_fd, filename, header);
 
   if ((kvm_fds.kvm_fd = open("/dev/kvm", O_RDWR)) < 0) {
     perror("fatal: failed to open /dev/kvm");
@@ -231,7 +246,8 @@ int main(int argc, char **argv) {
     memset((char*)mem + 0x400, 0xf4, 256);  /* 256 hlt instructions, one for each int. */
   }
 
-  load_dos_executable_program(argv[1], mem);
+  load_dos_executable_program(img_fd, filename, mem, header, header_size);
+  close(img_fd);
 
   if ((kvm_fds.vcpu_fd = ioctl(kvm_fds.vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
     perror("fatal: can not create KVM vcpu");
