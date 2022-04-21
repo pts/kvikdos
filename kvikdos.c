@@ -461,6 +461,9 @@ int main(int argc, char **argv) {
           } else if (ah == 0x06 && (unsigned char)regs.rdx != 0xff) {  /* Direct console I/O, output. */
             const char c = (unsigned char)regs.rdx;
             (void)!write(1, &c, 1);
+          } else if (ah == 0x02) {  /* Display output. */
+            const char c = (unsigned char)regs.rdx;
+            (void)!write(1, &c, 1);
           } else if (ah == 0x04) {  /* Output to STDAUX. */
             const char c = (unsigned char)regs.rdx;
             (void)!write(2, &c, 1);  /* Emulate STDAUX with stderr. */
