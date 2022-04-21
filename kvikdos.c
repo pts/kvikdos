@@ -224,7 +224,12 @@ int main(int argc, char **argv) {
       exit(252);
     }
   }
-  /* Any read/write outside these regions will trigger a KVM_EXIT_MMIO. */
+  /* Any read/write outside the regions above will trigger a KVM_EXIT_MMIO. */
+  /* Fill magic interrupt table. */
+  { unsigned u;
+    for (u = 0; u < 0x100; ++u) { ((unsigned*)mem)[u] = 0x400000 | u; }
+    memset((char*)mem + 0x400, 0xf4, 256);  /* 256 hlt instructions, one for each int. */
+  }
 
   load_dos_executable_program(argv[1], mem);
 
@@ -251,12 +256,6 @@ int main(int argc, char **argv) {
   if (ioctl(kvm_fds.vcpu_fd, KVM_GET_SREGS, &(sregs)) < 0) {
     perror("fatal: KVM_GET_SREGS");
     exit(252);
-  }
-
-  /* Fill magic interrupt table. */
-  { unsigned u;
-    for (u = 0; u < 0x100; ++u) { ((unsigned*)mem)[u] = 0x400000 | u; }
-    memset((char*)mem + 0x400, 0xf4, 256);  /* 256 hlt instructions, one for each int. */
   }
 
 /* We have to set both selector and base, otherwise it won't work. A `mov
