@@ -241,6 +241,36 @@ static int get_linux_handle(unsigned short handle, const struct kvm_fds *kvm_fds
        : handle;
 }
 
+static char fnbuf[128], fnbuf2[128];
+
+static const char *get_linux_filename_r(const char *p, char *out_buf) {
+  const char *q, *p_end = p + 126;  /* DOS supports even less, DOSBox supports 80. */
+  char *out_p;
+  for (q = p; q != p_end && *q != '\0'; ++q) {}
+  if (*q != '\0') {
+    fprintf(stderr, "fatal: DOS filename too long\n");  /* !! Report error 0x3 (Path not found) or 0x44 (Network name limit exceeded). */
+    exit(252);
+  }
+  if (p[1] == ':') {
+    if ((p[0] & ~32) == 'C') {
+      p += 2;  /* Convert drive-relative to absolute. */
+    } else {
+      fprintf(stderr, "fatal: DOS filename on wrong drive: 0x%02x\n", (unsigned char)p[0]);  /* !! Report error 0x3 (Path not found) */
+      exit(252);
+    }
+  }
+  for (; *p == '\\'; ++p) {}  /* Convert relative to absolute. */
+  for (out_p = out_buf; *p != '\0';) {
+    const char c = *p++;
+    *out_p++ = (c == '\\') ? '/'  /* Convert '\\' to '/'. */
+             : (c - 'a' + 0U <= 'z' - 'a' + 0U) ? c & ~32 : c;  /* Convert to uppercase. */
+  }
+  *out_p = '\0';
+  return out_buf;
+}
+
+#define get_linux_filename(p) get_linux_filename_r((p), fnbuf)
+
 int main(int argc, char **argv) {
   struct kvm_fds kvm_fds;
   void *mem;
@@ -515,7 +545,7 @@ int main(int argc, char **argv) {
             /* For create, CX contains attributes (read-only, hidden, system, archive), we just ignore it.
              * https://stanislavs.org/helppc/file_attributes.html
              */
-            int fd = open(p, flags, 0644);
+            int fd = open(get_linux_filename(p), flags, 0644);
             if (fd < 0) { error_from_linux:
               *(unsigned short*)&regs.rax = get_dos_error_code(errno);
               goto error_on_21;
@@ -554,13 +584,13 @@ int main(int argc, char **argv) {
             if (close(fd) != 0) goto error_from_linux;
           } else if (ah == 0x41) {  /* Delete file. */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
-            int fd = unlink(p);
+            int fd = unlink(get_linux_filename(p));
             if (fd < 0) goto error_from_linux;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x56) {  /* Rename file. */
             const char * const p_old = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             const char * const p_new = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rdi);  /* !! Security: check bounds. */
-            int fd = rename(p_old, p_new);
+            int fd = rename(get_linux_filename(p_old), get_linux_filename_r(p_new, fnbuf2));
             if (fd < 0) goto error_from_linux;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x25) {  /* Set interrupt vector. */
