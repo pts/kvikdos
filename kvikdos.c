@@ -17,7 +17,10 @@
 #  include <linux/kvm.h>
 #endif
 
+#if 0  /* We don't use ROM and BIOS area and then XMS above DOS_MEM_LIMIT, we just map DOS_MEM_LIMIT. */
 #define MEM_SIZE (2 << 20)  /* In bytes. 2 MiB. */
+#endif
+
 /* Minimum value is 0x50, after the magic interrupt table (first 0x500 bytes of DOS memory).
  * ``para'' means paragraph of 16 bytes.
  */
@@ -283,7 +286,7 @@ int main(int argc, char **argv) {
     exit(252);
   }
 
-  if ((mem = mmap(NULL, MEM_SIZE, PROT_READ | PROT_WRITE,
+  if ((mem = mmap(NULL, DOS_MEM_LIMIT, PROT_READ | PROT_WRITE,
                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)) ==
       NULL) {
     perror("fatal: mmap");
