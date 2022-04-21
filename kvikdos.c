@@ -86,8 +86,61 @@ static int detect_dos_executable_program(int img_fd, const char *filename, char 
 static char *load_dos_executable_program(int img_fd, const char *filename, void *mem, const char *header, int header_size, struct kvm_regs *regs, struct kvm_sregs *sregs) {
   char *psp;
   if (header_size >= PROGRAM_HEADER_SIZE && (('M' | 'Z' << 8) == *(unsigned short*)header || ('M' << 8 | 'Z') == *(unsigned short*)header)) {
-    fprintf(stderr, "fatal: DOS .exe programs not supported: %s\n", filename);
-    exit(252);  /* !! add support */
+    const unsigned short * const exehdr = (const unsigned short*)header;
+    const unsigned exesize = exehdr[1] ? ((exehdr[2] - 1) << 9) + exehdr[1] : exehdr[2] << 9;
+    const unsigned headsize = exehdr[4] << 4;
+    unsigned memsize = exehdr[5] << 4;
+    const unsigned image_size = exesize - headsize;
+    char * const image_addr = (char*)mem + (BASE_PARA << 4) + 0x100;
+    const unsigned image_para = BASE_PARA + 0x10;
+    unsigned reloc_count = exehdr[3];
+    if (exehdr[5] == 0 && exehdr[6] == 0) {  /* min_memory == max_memory == 0. */
+      fprintf(stderr, "fatal: loading DOS .exe to upper part of memory not supported: %s\n", filename);
+      exit(252);
+    }
+    if (exesize <= headsize) {
+      fprintf(stderr, "fatal: DOS .exe image smaller than header: %s\n", filename);
+      exit(252);
+    }
+    if (memsize < image_size) memsize = image_size;  /* Some .exe files have it. */
+    if ((BASE_PARA << 4) + 0x100 + memsize > DOS_MEM_LIMIT) {
+      fprintf(stderr, "fatal: DOS .exe uses too much conventional memory: %s\n", filename);
+      exit(252);
+    }
+    if ((unsigned)lseek(img_fd, headsize, SEEK_SET) != headsize) {
+      fprintf(stderr, "fatal: error seeking to image in DOS .exe: %s\n", filename);
+      exit(252);
+    }
+    if ((unsigned)read(img_fd, image_addr, image_size) != image_size) {
+      fprintf(stderr, "fatal: error reading image in DOS .exe: %s\n", filename);
+      exit(252);
+    }
+    if (reloc_count) {  /* Process relocations. */
+      unsigned short reloc[1024]; /* 2048 bytes on the stack. */
+      if ((unsigned)lseek(img_fd, exehdr[12], SEEK_SET) != exehdr[12]) {
+        fprintf(stderr, "fatal: error seeking to image relocations: %s\n", filename);
+        exit(252);
+      }
+      while (reloc_count != 0) {
+        const unsigned to_read = reloc_count > (sizeof(reloc) >> 2) ? sizeof(reloc) : reloc_count << 2;
+        const unsigned got = read(img_fd, reloc, to_read);
+        unsigned short *r, *rend;
+        if (got != to_read) {
+          fprintf(stderr, "fatal: error reading relocations in DOS .exe: %s\n", filename);
+          exit(252);
+        }
+        reloc_count -= got >> 2;
+        for (r = reloc, rend = r + (got >> 1); r != rend; r += 2) {
+          *(unsigned short*)(image_addr + (r[1] << 4) + r[0]) += image_para;
+        }
+      }
+    }
+    psp = image_addr - 0x100;
+    sregs->ds.selector = sregs->es.selector = image_para - 0x10; /* DS and ES point to PSP. */
+    *(unsigned*)&regs->rip = exehdr[10];  /* DOS .exe entry point. */
+    sregs->cs.selector = exehdr[11] + image_para;
+    *(unsigned*)&regs->rsp = exehdr[8];
+    sregs->ss.selector = exehdr[7] + image_para;
   } else {
     /* Load DOS .com program. */
     char * const p = (char *)mem + (BASE_PARA << 4) + 0x100;  /* !! Security: check bounds (of mem). */
@@ -104,13 +157,14 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
       fprintf(stderr, "fatal: DOS executable program too long: %s\n", filename);
       exit(252);
     }
+    /* No need to check for DOS_MEM_LIMIT, because (BASE_PARA << 4) + 0x100 + MAX_DOS_COM_SIZE + 0x10 < DOS_MEM_LIMIT. */
     sregs->cs.selector = sregs->ds.selector = sregs->es.selector = sregs->ss.selector = BASE_PARA;
     psp = (char*)mem + (BASE_PARA << 4);  /* Program Segment Prefix. */
     *(unsigned*)&regs->rsp = sp = 0xfffe;
     *(short*)(psp + sp) = 0;  /* Push a 0 byte. */
     *(short*)(psp) = 0x20cd;  /* `int 0x20' opcode. */
     /*memset(psp, 0, 0x100);*/  /* Not needed, mmap MAP_ANONYMOUS has done it. */
-    *(unsigned short*)(psp + 2) = 0xa000;  /* Top of memory = 0xa0000 */
+    *(unsigned short*)(psp + 2) = DOS_MEM_LIMIT >> 4;  /* Top of memory. */
     /* !! Fill more elements of the PSP for DOS .com and .EXE. */
     *(unsigned*)&regs->rip = 0x100;  /* DOS .com entry point. */
   }
