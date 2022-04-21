@@ -80,15 +80,18 @@ static int detect_dos_executable_program(int img_fd, const char *filename, char 
 }
 
 /* r is the total number of header bytes alreday read from img_fd by
- * detect_dos_executable_program.
+ * detect_dos_executable_program. Returns the psp (Program Segment Prefix)
+ * address.
  */
-static void load_dos_executable_program(int img_fd, const char *filename, void *mem, const char *header, int header_size) {
+static char *load_dos_executable_program(int img_fd, const char *filename, void *mem, const char *header, int header_size, struct kvm_regs *regs, struct kvm_sregs *sregs) {
+  char *psp;
   if (header_size >= PROGRAM_HEADER_SIZE && (('M' | 'Z' << 8) == *(unsigned short*)header || ('M' << 8 | 'Z') == *(unsigned short*)header)) {
     fprintf(stderr, "fatal: DOS .exe programs not supported: %s\n", filename);
     exit(252);  /* !! add support */
   } else {
     /* Load DOS .com program. */
     char * const p = (char *)mem + (BASE_PARA << 4) + 0x100;  /* !! Security: check bounds (of mem). */
+    unsigned sp;
     int r;
     memcpy(p, header, header_size);
     r = read(img_fd, p + header_size, MAX_DOS_COM_SIZE + 1 - header_size);
@@ -101,7 +104,17 @@ static void load_dos_executable_program(int img_fd, const char *filename, void *
       fprintf(stderr, "fatal: DOS executable program too long: %s\n", filename);
       exit(252);
     }
+    sregs->cs.selector = sregs->ds.selector = sregs->es.selector = sregs->ss.selector = BASE_PARA;
+    psp = (char*)mem + (BASE_PARA << 4);  /* Program Segment Prefix. */
+    *(unsigned*)&regs->rsp = sp = 0xfffe;
+    *(short*)(psp + sp) = 0;  /* Push a 0 byte. */
+    *(short*)(psp) = 0x20cd;  /* `int 0x20' opcode. */
+    /*memset(psp, 0, 0x100);*/  /* Not needed, mmap MAP_ANONYMOUS has done it. */
+    *(unsigned short*)(psp + 2) = 0xa000;  /* Top of memory = 0xa0000 */
+    /* !! Fill more elements of the PSP for DOS .com and .EXE. */
+    *(unsigned*)&regs->rip = 0x100;  /* DOS .com entry point. */
   }
+  return psp;
 }
 
 static void dump_regs(const char *prefix, const struct kvm_regs *regs, const struct kvm_sregs *sregs) {
@@ -167,13 +180,11 @@ static int get_linux_handle(unsigned short handle, const struct kvm_fds *kvm_fds
 int main(int argc, char **argv) {
   struct kvm_fds kvm_fds;
   void *mem;
-  char *psp;
   struct kvm_userspace_memory_region region;
   int kvm_run_mmap_size, api_version, img_fd;
   struct kvm_run *run;
   struct kvm_regs regs;
   struct kvm_sregs sregs;
-  unsigned sp;
   const char *filename;
   char header[PROGRAM_HEADER_SIZE];
   unsigned header_size;
@@ -245,9 +256,9 @@ int main(int argc, char **argv) {
     for (u = 0; u < 0x100; ++u) { ((unsigned*)mem)[u] = 0x400000 | u; }
     memset((char*)mem + 0x400, 0xf4, 256);  /* 256 hlt instructions, one for each int. */
   }
-
-  load_dos_executable_program(img_fd, filename, mem, header, header_size);
-  close(img_fd);
+  /* !! Initialize BIOS data area until 0x534, move magic interrupt table later.
+   * https://stanislavs.org/helppc/bios_data_area.html
+   */
 
   if ((kvm_fds.vcpu_fd = ioctl(kvm_fds.vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
     perror("fatal: can not create KVM vcpu");
@@ -264,7 +275,6 @@ int main(int argc, char **argv) {
     perror("fatal: mmap kvm_run: %d\n");
     exit(252);
   }
-
   if (ioctl(kvm_fds.vcpu_fd, KVM_GET_REGS, &regs) < 0) {
     perror("fatal: KVM_GET_REGS");
     exit(252);
@@ -273,30 +283,25 @@ int main(int argc, char **argv) {
     perror("fatal: KVM_GET_SREGS");
     exit(252);
   }
+  sregs.fs.selector = sregs.gs.selector = 0x50;  /* Random value after magic interrupt table. */
+  /* EFLAGS https://en.wikipedia.org/wiki/FLAGS_register */
+  regs.rflags = 1 << 1;  /* Reserved bit. */
+
+  { char *psp = load_dos_executable_program(img_fd, filename, mem, header, header_size, &regs, &sregs);
+    copy_args_to_dos_args(psp + 0x80, argv + 2);
+  }
+  close(img_fd);
 
 /* We have to set both selector and base, otherwise it won't work. A `mov
  * ds, ax' instruction in the 16-bit KVM guest will set both.
  */
-#define SET_SEGMENT_REG(name, para_value) do { sregs.name.base = (sregs.name.selector = para_value) << 4; } while(0)
-  SET_SEGMENT_REG(cs, BASE_PARA);
-  SET_SEGMENT_REG(ds, BASE_PARA);
-  SET_SEGMENT_REG(es, BASE_PARA);
-  SET_SEGMENT_REG(fs, BASE_PARA);
-  SET_SEGMENT_REG(gs, BASE_PARA);
-
-  SET_SEGMENT_REG(ss, BASE_PARA);
-  regs.rsp = sp = 0xfffe;
-  psp = (char*)mem + (BASE_PARA << 4);  /* Program Segment Prefix. */
-  *(short*)(psp + sp) = 0;  /* Push a 0 byte. */
-  *(short*)(psp) = 0x20cd;  /* `int 0x20' opcode. */
-  *(unsigned short*)(psp + 2) = 0xa000;  /* Top of memory = 0xa0000 */
-  psp[0x80] = 0;  /* Empty command-line arguments. */
-  copy_args_to_dos_args(psp + 0x80, argv + 2);
-  /* !! Fill more elements of the PSP for DOS .com. */
-
-  /* EFLAGS https://en.wikipedia.org/wiki/FLAGS_register */
-  regs.rflags = 1 << 1;  /* Reserved bit. */
-  regs.rip = 0x100;  /* DOS .com entry point. */
+#define FIX_SREG(name) do { sregs.name.base = sregs.name.selector << 4; } while(0)
+  FIX_SREG(cs);
+  FIX_SREG(ds);
+  FIX_SREG(es);
+  FIX_SREG(ss);
+  FIX_SREG(fs);
+  FIX_SREG(gs);
 
   if (DEBUG) dump_regs("debug", &regs, &sregs);
 
@@ -507,7 +512,7 @@ int main(int argc, char **argv) {
           goto fatal;
         }
         /* Return from the interrupt. */
-        SET_SEGMENT_REG(cs, int_cs);
+        sregs.cs.base = (sregs.cs.selector = int_cs) << 4;
         regs.rip = int_ip;
         *(unsigned short*)&regs.rsp += 6;  /* pop ip, pop cs, pop flags. */
         goto set_sregs_regs_and_continue;
