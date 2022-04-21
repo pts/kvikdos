@@ -7,6 +7,8 @@ ALL = kvikdos guest.com slowp.com
 CFLAGS = -ansi -pedantic -s -O2 -W -Wall -Wextra -fno-strict-aliasing $(XCFLAGS)
 XCFLAGS =  # To be overridden from the command-line.
 
+SRCDEPS = kvikdos.c mini_kvm.h
+
 all: $(ALL)
 
 clean:
@@ -18,14 +20,14 @@ run: kvikdos guest.com
 %.com: %.nasm
 	nasm -O0 -f bin -o $@ $<
 
-kvikdos: kvikdos.c
+kvikdos: $(SRCDEPS)
 	gcc $(CFLAGS) -o $@ $<
 
-kvikdos32: kvikdos.c
+kvikdos32: $(SRCDEPS)
 	gcc -m32 -fno-pic -march=i686 -mtune=generic $(CFLAGS) -o $@ $<
 
-kvikdos64: kvikdos.c
+kvikdos64: $(SRCDEPS)
 	gcc -m64 -march=k8 -mtune=generic $(CFLAGS) -o $@ $<
 
-kvikdos.static: kvikdos.c
+kvikdos.static: $(SRCDEPS)
 	xstatic gcc -m32 -fno-pic -D_FILE_OFFSET_BITS=64 -DUSE_MINI_KVM -march=i686 -mtune=generic $(CFLAGS) -o $@ $<
