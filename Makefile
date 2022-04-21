@@ -9,7 +9,7 @@ CFLAGS = -ansi -pedantic -s -O2 -W -Wall -Wextra -fno-strict-aliasing
 all: $(ALL)
 
 clean:
-	rm -f $(ALL) kvikdos32 kvikdos64
+	rm -f $(ALL) kvikdos32 kvikdos64 kvikdos.static
 
 run: kvikdos guest.com
 	./kvikdos guest.com hello world
@@ -25,3 +25,6 @@ kvikdos32: kvikdos.c
 
 kvikdos64: kvikdos.c
 	gcc -m64 -march=k8 -mtune=generic $(CFLAGS) -o $@ $<
+
+kvikdos.static: kvikdos.c
+	xstatic gcc -m32 -fno-pic -D_FILE_OFFSET_BITS=64 -DUSE_MINI_KVM -march=i686 -mtune=generic $(CFLAGS) -o $@ $<
