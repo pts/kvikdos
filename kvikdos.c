@@ -25,6 +25,12 @@
  * ``para'' means paragraph of 16 bytes.
  */
 #define BASE_PARA 0x100
+
+/* Environment starts at this paragraph. */
+#define ENV_PARA 0x50
+/* How long the environment can be. */
+#define ENV_LIMIT (BASE_PARA << 4)
+
 /* Must be a multiple of the Linux page size (0x1000), minimum value is
  * 0x500 (after magic interrupt table). Must be at most BASE_PARA << 4. Can
  * be 0. By setting it to nonzero (0x1000), we effectively make the magic
@@ -177,6 +183,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
   *(unsigned short*)(psp + 2) = DOS_MEM_LIMIT >> 4;  /* Top of memory. */
   /* https://stanislavs.org/helppc/program_segment_prefix.html */
   psp[5] = (char)0xf4;  /* hlt instruction; this is machine code to jump to the CP/M dispatcher. */
+  *(unsigned short*)(psp + 0x2c) = ENV_PARA;
   /* !! Fill more elements of the PSP for DOS .com and .EXE. */
   return psp;
 }
@@ -271,6 +278,29 @@ static const char *get_linux_filename_r(const char *p, char *out_buf) {
 
 #define get_linux_filename(p) get_linux_filename_r((p), fnbuf)
 
+/* `var' usually looks like `PATH=C:\value'. Everything before the '=' is converted to lowercase. */
+static char *add_env(char *env, char *env_end, const char *var, char do_check) {
+  if (do_check && *var == '=') {
+    fprintf(stderr, "fatal: DOS environment variable has empty name\n");
+    exit(252);
+  }
+  for (;;) {
+    const char c = *var++;
+    if (env == env_end) {
+      fprintf(stderr, "fatal: DOS environment too long\n");
+      exit(252);
+    }
+    if (c == '=') do_check = 0;  /*in_name = 0;*/
+    *env++ = (c - 'a' + 0U <= 'z' - 'a' + 0U && do_check) ? c & ~32 : c;  /* Convert name to uppercase. */
+    if (c == '\0') break;
+  }
+  if (do_check) {
+    fprintf(stderr, "fatal: DOS environment variable has missing value\n");
+    exit(252);
+  }
+  return env;
+}
+
 int main(int argc, char **argv) {
   struct kvm_fds kvm_fds;
   void *mem;
@@ -283,14 +313,51 @@ int main(int argc, char **argv) {
   char header[PROGRAM_HEADER_SIZE];
   unsigned header_size;
   char had_get_int0;
+  char **envp, **envp0;
+  char *prog_dos_pathname = "C:\\PROG.COM";
 
   (void)argc;
-  if (!argv[0] || !argv[1]) {
-    fprintf(stderr, "Usage: %s <dos-com-or-exe-file> [<dos-arg> ...]\n", argv[0]);
+  if (!argv[0] || !argv[1] || 0 == strcmp(argv[1], "--help")) {
+    fprintf(stderr, "Usage: %s [<flag> ...] <dos-com-or-exe-file> [<dos-arg> ...]\n"
+                    "Flags:\n"
+                    "--env=<NAME>=<value>: Adds environment variable.\n"
+                    "--prog=<dos-pathname>: Sets DOS pathname of program.\n",
+                    argv[0]);
     exit(252);
   }
+  envp = envp0 = ++argv;
+  while (argv[0]) {
+    char *arg = *argv++;
+    if (arg[0] != '-' || arg[1] == '\0') {
+      --argv; break;
+    } else if (arg[1] == '-' && arg[2] == '\0') {
+      break;
+    } else if (0 == strcmp(arg, "--env")) {
+      if (!argv[0]) { missing_argument:
+        fprintf(stderr, "fatal: missing argument for flag: %s\n", arg);
+        exit(1);
+      }
+      *envp++ = *argv++;  /* Reuse the argv array. */
+    } else if (0 == strncmp(arg, "--env=", 6)) {
+      *envp++ = arg + 6;  /* Reuse the argv array. */
+    } else if (0 == strcmp(arg, "--prog")) {
+      if (!argv[0]) goto missing_argument;
+      prog_dos_pathname = *argv++;
+    } else if (0 == strncmp(arg, "--prog=", 7)) {
+      prog_dos_pathname = arg + 7;
+    } else {
+      fprintf(stderr, "fatal: unknown command-line flag: %s\n", arg);
+      exit(1);
+    }
+  }
+  /* Now: argv contains remaining (non-flag) arguments. */
+  if (!argv[0]) {
+    fprintf(stderr, "fatal: missing <dos-com-or-exe-file> program filename\n");
+    exit(1);
+  }
+  filename = *argv++;
 
-  img_fd = open(filename = argv[1], O_RDONLY);
+  img_fd = open(filename, O_RDONLY);
   if (img_fd < 0) {
     fprintf(stderr, "fatal: can not open DOS executable program: %s: %s\n", filename, strerror(errno));
     exit(252);
@@ -383,9 +450,26 @@ int main(int argc, char **argv) {
   regs.rflags = 1 << 1;  /* Reserved bit. */
 
   { char *psp = load_dos_executable_program(img_fd, filename, mem, header, header_size, &regs, &sregs);
-    copy_args_to_dos_args(psp + 0x80, argv + 2);
+    copy_args_to_dos_args(psp + 0x80, argv);
   }
   close(img_fd);
+
+  { char *env = (char*)mem + (ENV_PARA << 4);
+    char * const env_end = (char*)mem + ENV_LIMIT;
+#if 0
+    env = add_env(env, env_end, "PATH=D:\\foo;C:\\bar", 1);
+    env = add_env(env, env_end, "heLLo=World!", 1);
+#endif
+    while (envp0 != envp) {
+      /* No attempt is made to deduplicate environment variables by name.
+       * The user should supply unique names.
+       */
+      env = add_env(env, env_end, *envp0++, 1);
+    }
+    env = add_env(env, env_end, "", 0);  /* Empty var marks end of env. */
+    env = add_env(env, env_end, ".", 0);  /* Just skip 2 bytes, DOSBox also does it. */
+    env = add_env(env, env_end, prog_dos_pathname, 0);  /* Full program pathname. */
+  }
 
 /* We have to set both selector and base, otherwise it won't work. A `mov
  * ds, ax' instruction in the 16-bit KVM guest will set both.
