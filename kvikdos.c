@@ -64,7 +64,7 @@ static void load_dos_executable_program(const char *filename, void *mem) {
     fprintf(stderr, "fatal: empty DOS executable program");
     exit(252);
   }
-  if (r >= 2 && ('M' | 'Z' << 8) == *(unsigned short*)p) {
+  if (r >= 2 && (('M' | 'Z' << 8) == *(unsigned short*)p || ('M' << 8 | 'Z') == *(unsigned short*)p)) {
     if (r < 28) {
       fprintf(stderr, "fatal: DOS .exe program too short: %s\n", filename);
       exit(252);
