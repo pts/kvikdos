@@ -315,6 +315,8 @@ int main(int argc, char **argv) {
   char had_get_int0;
   char **envp, **envp0;
   char *prog_dos_pathname = "C:\\PROG.COM";
+  unsigned tick_count;
+  unsigned char sphinx_cmm_flags;
 
   (void)argc;
   if (!argv[0] || !argv[1] || 0 == strcmp(argv[1], "--help")) {
@@ -483,6 +485,8 @@ int main(int argc, char **argv) {
   FIX_SREG(gs);
 
   had_get_int0 = 0;
+  tick_count = 0;
+  sphinx_cmm_flags = 0;
 
   if (DEBUG) dump_regs("debug", &regs, &sregs);
 
@@ -538,7 +542,7 @@ int main(int argc, char **argv) {
           (void)!write(1, &c, 1);
         } else if (int_num == 0x20) {
           exit(0);  /* EXIT_SUCCESS. */
-        } else if (int_num == 0x21) {
+        } else if (int_num == 0x21) {  /* DOS file and memory sevices. */
           /* !! Should we set CF=0 by default? What does MS-DOS do? */
           if (ah == 0x4c) {
             exit((unsigned)regs.rax & 0xff);
@@ -683,7 +687,7 @@ int main(int argc, char **argv) {
           } else if (ah == 0x25) {  /* Set interrupt vector. */
             /* !! Implement this. */
             const unsigned char set_int_num = (unsigned char)regs.rax;
-            const unsigned short dx = (*(unsigned short*)&regs.rdx);
+            const unsigned short dx = *(unsigned short*)&regs.rdx;
             const unsigned short ds = (unsigned)sregs.ds.selector;
             const unsigned value = ds << 16 | dx;
             unsigned *p = (unsigned*)mem + set_int_num;
@@ -744,13 +748,68 @@ int main(int argc, char **argv) {
               fprintf(stderr, "fatal: unsupported DOS ioctl call: 0x%02x\n", al);
               goto fatal;
             }
+          } else if (ah == 0x4a) {  /* Modify allocated memory blocks. */
+            const unsigned short bx = *(unsigned short*)&regs.rbx;
+            const unsigned short es = (unsigned)sregs.es.selector;
+            if (es != BASE_PARA) {
+              fprintf(stderr, "fatal: unsupported block resize: old_para=0x%04x new_size=0x%04x\n", es, bx);
+              goto fatal;
+            }
+            if (bx > (DOS_MEM_LIMIT >> 4) - BASE_PARA) {
+              *(unsigned short*)&regs.rax = 8;  /* Insufficient memory. */
+              *(unsigned short*)&regs.rbx = (DOS_MEM_LIMIT >> 4) - BASE_PARA;
+              goto error_on_21;
+            }
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x43) {  /* Get/set file attributes. */
+            const unsigned char al = (unsigned char)regs.rax;
+            const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            const char *fn;
+            if (al > 1) goto error_invalid_parameter;
+            fn = get_linux_filename(p);
+            if (al == 0) {  /* Get. */
+              struct stat st;
+              if (stat(fn, &st) != 0) goto error_from_linux;
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+              *(unsigned short*)&regs.rax = (st.st_mode & 0200) ? 0 : 1;  /* Indicate DOS read-only flag if owner doesn't have write permissions on Linux. */
+            } else {  /* Set. */
+              fprintf(stderr, "fatal: unimplemented: set file attributes: attr=0x%04x filename=%s\n", *(unsigned short*)&regs.rcx, fn);
+              goto fatal;
+            }
           } else {
             goto fatal_int;
           }
-        } else if (int_num == 0x10) {
+        } else if (int_num == 0x10) {  /* Video output. */
           if (ah == 0x0e) {  /* Teletype output. */
             const char c = regs.rax;
             (void)!write(1, &c, 1);
+          } else if (ah == 0x0f) {  /* Get video state. https://stanislavs.org/helppc/int_10-f.html */
+            sphinx_cmm_flags |= 1;
+            *(unsigned short*)&regs.rax = 80 << 8 | 3;  /* 80x25. */
+            ((unsigned char*)&regs.rbx)[1] = 0;  /* BH := page (0). */
+          } else if (ah == 0x08) {  /* Read character and attribute at cursor. */
+            *(unsigned short*)&regs.rax = 0;  /* AH == attribute, AL == character. */
+          } else if (ah == 0x12) {  /* Video subsystem configuration. https://stanislavs.org/helppc/int_10-12.html */
+            const unsigned char bl = (unsigned char)regs.rbx;
+            if (bl == 0x10) {  /* Get video configuration information. */
+              sphinx_cmm_flags |= 2;
+              *(unsigned short*)&regs.rbx = 1 << 8 | 0;  /* Mono, 64 KiB EGA memory. */
+              *(unsigned short*)&regs.rcx = 0;  /* Feature bits and switch settings. */
+            } else {
+              fprintf(stderr, "fatal: unsupported subcall for video subsystem configuration: 0x%02x\n", bl);
+              goto fatal;
+            }
+            *(unsigned short*)&regs.rax = 80 << 8 | 3;  /* 80x25. */
+            ((unsigned char*)&regs.rbx)[1] = 0;  /* BH := page (0). */
+          } else {
+            goto fatal_int;
+          }
+        } else if (int_num == 0x1a) {  /* Timer. */
+          if (ah == 0x00) {  /* Read system clock counter. */
+            ++tick_count;  /* We don't emulate a real clock, we just increment the tick counter whenever queried. */
+            *(unsigned char*)&regs.rax = 0;  /* No midnight yet. */
+            *(unsigned short*)&regs.rcx = tick_count >> 16;
+            *(unsigned short*)&regs.rdx = tick_count;
           } else {
             goto fatal_int;
           }
@@ -769,7 +828,12 @@ int main(int argc, char **argv) {
         goto fatal;
       }
      case KVM_EXIT_MMIO:
-      fprintf(stderr, "fatal: KVM memory access denied phys_addr=%08x value=%08x%08x size=%d is_write=%d\n", (unsigned)run->mmio.phys_addr, ((unsigned*)run->mmio.data)[1], ((unsigned*)run->mmio.data)[0], run->mmio.len, run->mmio.is_write);
+      if ((unsigned)run->mmio.phys_addr == 0xfffea && run->mmio.len == 1 && !run->mmio.is_write && (sphinx_cmm_flags & 3) == 3) {
+        /* SPHiNX C-- 1.04 compiler does this, just ignore. */
+        break;
+      } else {
+        fprintf(stderr, "fatal: KVM memory access denied phys_addr=%08x value=%08x%08x size=%d is_write=%d\n", (unsigned)run->mmio.phys_addr, ((unsigned*)run->mmio.data)[1], ((unsigned*)run->mmio.data)[0], run->mmio.len, run->mmio.is_write);
+      }
       /*break;*/  /* Just continue at following cs:ip. */
       goto fatal;
      case KVM_EXIT_INTERNAL_ERROR:
