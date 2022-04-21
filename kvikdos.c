@@ -29,6 +29,9 @@
  */
 #define GUEST_MEM_MODULE_START 0x1000
 
+/* Points to 0x40:int_num, pointer encoded as cs:ip. */
+#define MAGIC_INT_VALUE(int_num) (0x400000U | (unsigned)int_num)
+
 #define DOS_MEM_LIMIT 0xa0000  /* 640 KiB should be enough for everyone :-). */
 
 #define MAX_DOS_COM_SIZE 0xfee0  /* size + 0x100 bytes of PSP + 0x20 bytes of stack <= 0x10000 bytes. */
@@ -246,6 +249,7 @@ int main(int argc, char **argv) {
   const char *filename;
   char header[PROGRAM_HEADER_SIZE];
   unsigned header_size;
+  char had_get_int0;
 
   (void)argc;
   if (!argv[0] || !argv[1]) {
@@ -311,7 +315,7 @@ int main(int argc, char **argv) {
   /* Any read/write outside the regions above will trigger a KVM_EXIT_MMIO. */
   /* Fill magic interrupt table. */
   { unsigned u;
-    for (u = 0; u < 0x100; ++u) { ((unsigned*)mem)[u] = 0x400000 | u; }
+    for (u = 0; u < 0x100; ++u) { ((unsigned*)mem)[u] = MAGIC_INT_VALUE(u); }
     memset((char*)mem + 0x400, 0xf4, 256);  /* 256 hlt instructions, one for each int. */
   }
   /* !! Initialize BIOS data area until 0x534, move magic interrupt table later.
@@ -360,6 +364,8 @@ int main(int argc, char **argv) {
   FIX_SREG(ss);
   FIX_SREG(fs);
   FIX_SREG(gs);
+
+  had_get_int0 = 0;
 
   if (DEBUG) dump_regs("debug", &regs, &sregs);
 
@@ -519,7 +525,7 @@ int main(int argc, char **argv) {
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             *(unsigned short*)&regs.rax = fd;
           } else if (ah == 0x57) {  /* Get/set file date and time using handle. */
-            const unsigned char al = *(unsigned char*)&regs.rax;
+            const unsigned char al = (unsigned char)regs.rax;
             if (al < 2 ) {
               const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
               if (fd < 0) goto error_invalid_handle;
@@ -559,12 +565,30 @@ int main(int argc, char **argv) {
             const unsigned char set_int_num = (unsigned char)regs.rax;
             const unsigned short dx = (*(unsigned short*)&regs.rdx);
             const unsigned short ds = (unsigned)sregs.ds.selector;
-            if (set_int_num == 0x23) {  /* Application Ctrl-<Break> handler. */
+            const unsigned value = ds << 16 | dx;
+            unsigned *p = (unsigned*)mem + set_int_num;
+            if (set_int_num == 0x23 ||  /* Application Ctrl-<Break> handler. */
+                value == *p ||  /* Unchanged. */
+                value == MAGIC_INT_VALUE(set_int_num) ||  /* Set back to original. */
+                (had_get_int0 && (set_int_num == 0x00 || set_int_num == 0x24 || set_int_num == 0x3f))  /* Turbo Pascal 7.0. 0x24 is the critical error handler. */) {
               /* We will never send Ctrl-<Break>. */
-              ((unsigned*)mem)[0x23] = ds << 16 | dx;
+              *p = value;
             } else {
               fprintf(stderr, "fatal: unsupported set interrupt vector int:%02x to cs:%04x ip:%04x\n",
                       set_int_num, ds, dx);
+              goto fatal;
+            }
+          } else if (ah == 0x35) {  /* Get interrupt vector. */
+            /* !! Implement this. */
+            const unsigned char get_int_num = (unsigned char)regs.rax;
+            if (get_int_num == 0) had_get_int0 = 1;  /* Turbo Pascal 7.0 programs start with this. */
+            if (had_get_int0) {
+              const unsigned short *pp = (const unsigned short*)((char*)mem + (get_int_num << 2));
+              if (DEBUG) fprintf(stderr, "debug: get interrupt vector int:%02x is cs:%04x ip:%04x\n", get_int_num, pp[1], pp[0]);
+              (*(unsigned short*)&regs.rbx) = pp[0];
+              sregs.es.selector = pp[1];
+            } else {
+              fprintf(stderr, "fatal: unsupported get interrupt vector int:%02x\n", get_int_num);
               goto fatal;
             }
           } else if (ah == 0x0b) {  /* Check input status. */
@@ -586,6 +610,19 @@ int main(int argc, char **argv) {
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
               *(unsigned short*)&regs.rdx = (unsigned)got >> 16;
               *(unsigned short*)&regs.rax = got;
+            }
+          } else if (ah == 0x44) {  /* I/O control (ioctl). */
+            const unsigned char al = (unsigned char)regs.rax;
+            if (al == 0) {  /* Get device information. */
+              const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
+              struct stat st;
+              if (fd < 0) goto error_invalid_handle;
+              if (fstat(fd, &st) != 0) goto error_from_linux;
+              *(unsigned short*)&regs.rdx = 1 << 5  /* binary */ | (S_ISCHR(st.st_mode) ? 1 : 0) << 7  /* character device */;
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            } else {
+              fprintf(stderr, "fatal: unsupported DOS ioctl call: 0x%02x\n", al);
+              goto fatal;
             }
           } else {
             goto fatal_int;
