@@ -241,3 +241,4 @@ __extension__ struct kvm_run {
 #define KVM_EXIT_HLT              5
 #define KVM_EXIT_MMIO             6
 #define KVM_EXIT_SHUTDOWN         8   
+#define KVM_EXIT_INTERNAL_ERROR   17

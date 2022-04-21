@@ -504,6 +504,15 @@ int main(int argc, char **argv) {
       fprintf(stderr, "fatal: KVM memory access denied phys_addr=%08x value=%08x%08x size=%d is_write=%d\n", (unsigned)run->mmio.phys_addr, ((unsigned*)run->mmio.data)[1], ((unsigned*)run->mmio.data)[0], run->mmio.len, run->mmio.is_write);
       /*break;*/  /* Just continue at following cs:ip. */
       goto fatal;
+     case KVM_EXIT_INTERNAL_ERROR:
+      fprintf(stderr, "fatal: KVM internal error suberror=%d\n", (unsigned)run->internal.suberror);
+      /* We get this for an int call if we don't map
+       * (KVM_SET_USER_MEMORY_REGION) or initialize the interrupt table
+       * properly. However, we can't continue the emulation, because KVM_RUN
+       * will return the same error again. !! Can we fix it?
+       */
+      /* if (run->internal.suberror == KVM_INTERNAL_ERROR_DELIVERY_EV && p[0] == (char)0xcd) { */
+      goto fatal;
      default:
       fprintf(stderr, "fatal: unexpected KVM exit: reason=%d\n", run->exit_reason);
       goto fatal;
