@@ -1,7 +1,6 @@
 #define _GNU_SOURCE 1  /* For MAP_ANONYMOUS. */
 #include <errno.h>
 #include <fcntl.h>
-#include <linux/kvm.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +10,12 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#ifdef USE_MINI_KVM  /* For systems with a broken linux/kvm.h. */
+#  include "mini_kvm.h"
+#else
+#  include <linux/kvm.h>
+#endif
 
 #define MEM_SIZE (2 << 20)  /* In bytes. 2 MiB. */
 /* Minimum value is 0x50, after the magic interrupt table (first 0x500 bytes of DOS memory).
