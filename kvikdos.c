@@ -163,11 +163,15 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     *(unsigned*)&regs->rsp = sp = 0xfffe;
     *(short*)(psp + sp) = 0;  /* Push a 0 byte. */
     *(short*)(psp) = 0x20cd;  /* `int 0x20' opcode. */
+    *(unsigned short*)(psp + 6) = MAX_DOS_COM_SIZE + 0x100;  /* .COM bytes available in segment (CP/M). Dosbox doesn't initialize it. */
     /*memset(psp, 0, 0x100);*/  /* Not needed, mmap MAP_ANONYMOUS has done it. */
-    *(unsigned short*)(psp + 2) = DOS_MEM_LIMIT >> 4;  /* Top of memory. */
-    /* !! Fill more elements of the PSP for DOS .com and .EXE. */
     *(unsigned*)&regs->rip = 0x100;  /* DOS .com entry point. */
   }
+  /* https://stanislavs.org/helppc/program_segment_prefix.html */
+  *(unsigned short*)(psp + 2) = DOS_MEM_LIMIT >> 4;  /* Top of memory. */
+  /* https://stanislavs.org/helppc/program_segment_prefix.html */
+  psp[5] = (char)0xf4;  /* hlt instruction; this is machine code to jump to the CP/M dispatcher. */
+  /* !! Fill more elements of the PSP for DOS .com and .EXE. */
   return psp;
 }
 
@@ -531,7 +535,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "fatal: unimplemented: set file date and time: fd=%d cx:%04x dx:%04x\n", fd, *(unsigned short*)&regs.rcx, *(unsigned short*)&regs.rdx);
                 goto fatal;
               }
-            } else {
+            } else { error_invalid_parameter:
               *(unsigned short*)&regs.rax = 0x57;  /* Invalid parameter. */
               goto error_on_21;
             }
@@ -550,6 +554,39 @@ int main(int argc, char **argv) {
             int fd = rename(p_old, p_new);
             if (fd < 0) goto error_from_linux;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x25) {  /* Set interrupt vector. */
+            /* !! Implement this. */
+            const unsigned char set_int_num = (unsigned char)regs.rax;
+            const unsigned short dx = (*(unsigned short*)&regs.rdx);
+            const unsigned short ds = (unsigned)sregs.ds.selector;
+            if (set_int_num == 0x23) {  /* Application Ctrl-<Break> handler. */
+              /* We will never send Ctrl-<Break>. */
+              ((unsigned*)mem)[0x23] = ds << 16 | dx;
+            } else {
+              fprintf(stderr, "fatal: unsupported set interrupt vector int:%02x to cs:%04x ip:%04x\n",
+                      set_int_num, ds, dx);
+              goto fatal;
+            }
+          } else if (ah == 0x0b) {  /* Check input status. */
+            *(unsigned char*)&regs.rax = 0;  /* No input ready. 0xff would be input. */
+            /* If we detect Ctrl-<Break>, we should run `int 0x23'. */
+          } else if (ah == 0x42) {  /* Seek using handle. */
+            const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
+            if (fd < 0) goto error_invalid_handle;
+            {
+              const unsigned whence = *(unsigned char*)&regs.rax;  /* SEEK_SET == 0, SEEK_CUR == 1, SEEK_END == 2, same in DOS and Linux. */
+              const int offset = *(unsigned short*)&regs.rcx << 16 | *(unsigned short*)&regs.rdx;  /* It's important that this is signed, because we may want to pass -1 to lseek() even on 64-bit systems. */
+              int got;
+              if (whence > 2) goto error_invalid_parameter;
+              got = lseek(fd, offset, whence);
+              if (got < 0) {
+                *(unsigned short*)&regs.rax = 0x19;  /* Seek error. (Is this the relevant code?) */
+                goto error_on_21;
+              }
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+              *(unsigned short*)&regs.rdx = (unsigned)got >> 16;
+              *(unsigned short*)&regs.rax = got;
+            }
           } else {
             goto fatal_int;
           }
