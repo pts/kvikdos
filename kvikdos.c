@@ -159,8 +159,8 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     const unsigned short * const exehdr = (const unsigned short*)header;
     const unsigned exesize = exehdr[1] ? ((exehdr[2] - 1) << 9) + exehdr[1] : exehdr[2] << 9;
     const unsigned headsize = (unsigned)exehdr[4] << 4;
-    unsigned memsize = (unsigned)exehdr[5] << 4;  /* Minimum size. */
     const unsigned image_size = exesize - headsize;
+    unsigned memsize = ((unsigned)exehdr[5] << 4) + image_size;  /* Minimum size of .bss in exehdr[5]. */
     char * const image_addr = (char*)mem + (BASE_PARA << 4) + 0x100;
     const unsigned image_para = BASE_PARA + 0x10;
     unsigned reloc_count = exehdr[3];
@@ -173,10 +173,9 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
       fprintf(stderr, "fatal: DOS .exe image smaller than header: %s\n", filename);
       exit(252);
     }
-    if (memsize < image_size) memsize = image_size;  /* Some .exe files have it. */
     if (stack_end > memsize) {  /* Some .exe files have it. */
-      memsize = stack_end;
-      /*fprintf(stderr, "fatal: DOS .exe stack pointer after end of program memory: %s\n", filename);*/
+      fprintf(stderr, "fatal: DOS .exe stack pointer after end of program memory: %s\n", filename);
+      exit(252);
     }
     if ((BASE_PARA << 4) + 0x100 + memsize > DOS_MEM_LIMIT) {
       fprintf(stderr, "fatal: DOS .exe uses too much conventional memory: %s\n", filename);
