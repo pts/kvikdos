@@ -229,7 +229,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
       const unsigned exepack_max_size = image_size - ((unsigned)exehdr[11] << 4) - exehdr[10];
       const unsigned exepack_stub_plus_reloc_size =  packhdr[3] - exehdr[10];
       if (*(unsigned short*)((char*)packhdr + exehdr[10] - 2) == ('R' | 'B' << 8) &&  /* exepack signature. */
-          exepack_max_size <= 290 + 511 && exepack_stub_plus_reloc_size >= 258 && exepack_stub_plus_reloc_size <= exepack_max_size) {
+          exepack_stub_plus_reloc_size >= 258 && exepack_stub_plus_reloc_size <= exepack_max_size) {
         char *after_packhdr = (char*)packhdr + exehdr[10];
         const char *c = (const char*)memmem(after_packhdr, exepack_stub_plus_reloc_size, "\xcd\x21\xb8\xff\x4c\xcd\x21", 7);
         if (DEBUG) fprintf(stderr, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%d exepack_stub_plus_reloc_size=%d\n", exehdr[10], exepack_max_size, exepack_stub_plus_reloc_size);
