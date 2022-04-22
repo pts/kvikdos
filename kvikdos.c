@@ -371,6 +371,7 @@ static const char *get_linux_filename_r(const char *p, char *out_buf) {
              : (c - 'a' + 0U <= 'z' - 'a' + 0U) ? c & ~32 : c;  /* Convert to uppercase. */
   }
   *out_p = '\0';
+  if (strcmp(out_buf, "NUL") == 0) strcpy(out_buf, "/dev/null");
   return out_buf;
 }
 
