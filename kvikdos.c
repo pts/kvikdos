@@ -272,8 +272,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     psp = (char*)mem + (BASE_PARA << 4);  /* Program Segment Prefix. */
     *(unsigned*)&regs->rsp = sp = 0xfffe;
     *(short*)(psp + sp) = 0;  /* Push a 0 byte. */
-    *(short*)(psp) = 0x20cd;  /* `int 0x20' opcode. */
-    *(unsigned short*)(psp + 6) = MAX_DOS_COM_SIZE + 0x100;  /* .COM bytes available in segment (CP/M). Dosbox doesn't initialize it. */
+    *(unsigned short*)(psp + 6) = MAX_DOS_COM_SIZE + 0x100;  /* .COM bytes available in segment (CP/M). DOSBox doesn't initialize it. */
     /*memset(psp, 0, 0x100);*/  /* Not needed, mmap MAP_ANONYMOUS has done it. */
     *(unsigned*)&regs->rip = 0x100;  /* DOS .com entry point. */
   }
@@ -282,6 +281,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
   /* https://stanislavs.org/helppc/program_segment_prefix.html */
   psp[5] = (char)0xf4;  /* hlt instruction; this is machine code to jump to the CP/M dispatcher. */
   *(unsigned short*)(psp + 0x2c) = ENV_PARA;
+  *(short*)(psp) = 0x20cd;  /* `int 0x20' opcode. */
   /* !! Fill more elements of the PSP for DOS .com and .EXE. */
   return psp;
 }
@@ -549,6 +549,7 @@ int main(int argc, char **argv) {
   sregs.fs.selector = sregs.gs.selector = 0x50;  /* Random value after magic interrupt table. */
   /* EFLAGS https://en.wikipedia.org/wiki/FLAGS_register */
   regs.rflags = 1 << 1;  /* Reserved bit. */
+  /*regs.rflags |= 1 << 9;*/  /* IF=1, enable interrupts. */
 
   { char *psp = load_dos_executable_program(img_fd, filename, mem, header, header_size, &regs, &sregs);
     copy_args_to_dos_args(psp + 0x80, argv);
