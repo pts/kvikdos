@@ -220,6 +220,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     sregs->cs.selector = exehdr[11] + image_para;
     *(unsigned*)&regs->rsp = exehdr[8];
     sregs->ss.selector = exehdr[7] + image_para;
+    *(unsigned*)(psp + 6) = 0xc0;  /* CP/M far call 5 service request address. Obsolete. */
     if (exehdr[10] == 16 || exehdr[10] == 18) {  /* Detect exepack, find decompression stub within it, replace stub with fixed stub to avoid ``Packed file is corrupt'' error. DOS 5.0 does a similar fix. */
       /* More info about the A20 bug in the exepack stubs: https://github.com/joncampbell123/dosbox-x/issues/7#issuecomment-667653041
        * More info about the exepack file format: https://www.bamsoftware.com/software/exepack/
@@ -281,8 +282,31 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
   /* https://stanislavs.org/helppc/program_segment_prefix.html */
   psp[5] = (char)0xf4;  /* hlt instruction; this is machine code to jump to the CP/M dispatcher. */
   *(unsigned short*)(psp + 0x2c) = ENV_PARA;
-  *(short*)(psp) = 0x20cd;  /* `int 0x20' opcode. */
-  /* !! Fill more elements of the PSP for DOS .com and .EXE. */
+  *(unsigned short*)(psp) = 0x20cd;  /* `int 0x20' opcode. */
+  *(unsigned short*)(psp + 0x40) = 5;  /* DOS version number (DOSBox also reports 5). */
+  *(unsigned short*)(psp + 0x50) = 0x21cd;  /* `int 0x21' opcode. */
+  *(unsigned short*)(psp + 0x32) = 20;  /* `Number of bytes in JFT. */
+  *(unsigned*)(psp + 0x34) = 0x18 | BASE_PARA << 16;  /* `Far pointer to JFT. */
+  *(unsigned*)(psp + 0x38) = 0xffffffffU;  /* `Pointer to (lack of) previous PSP. */
+  *(unsigned*)(psp + 0x0a) = *((unsigned*)mem + 0x22);  /* Copy of `int 0x22' vector. */
+  *(unsigned*)(psp + 0x0e) = *((unsigned*)mem + 0x23);  /* Copy of `int 0x23' vector. */
+  *(unsigned*)(psp + 0x12) = *((unsigned*)mem + 0x24);  /* Copy of `int 0x24' vector. */
+  psp[0x52] = (char)0xcb;  /* `retf' opcode. */
+  psp[5] = (char)0x9a;  /* Opcode for `call far segment:offset'. */
+  /* These are the PSP fields we don't fill (but keep as 0 as returned by mmap MAP_ANONYMOUS):
+   * 0x18 20 bytes  file handle array (Undocumented DOS 2.x+); if handle array element is FF then handle is available. Network redirectors often indicate remotes files by setting these to values between 80-FE. DOS 2+ Job File Table JFT), one byte per file handle, FFh = closed. https://en.wikipedia.org/wiki/Job_File_Table
+   * 0x2e dword     SS:SP on entry to last INT 21 call (Undoc. 2.x+)
+   * 0x38 dword     pointer to previous PSP (default FFFF:FFFF, Undoc. 3.x+), used by SHARE in DOS 3.3 !!
+   * 0x3c byte      DOS 4+ (DBCS) interim console flag (see AX=6301h) Novell DOS 7 DBCS interim flag as set with AX=6301h (possibly also used by Far East MS-DOS 3.2-3.3)
+   * 0x3d byte      (APPEND) TrueName flag (see INT 2F/AX=B711h)
+   * 0x3e byte      (Novell NetWare) flag: next byte initialized if CEh (OS/2) capabilities flag
+   * 0x3f byte      (Novell NetWare) Novell task number if previous byte is CEh
+   * 0x42 word      (MSWindows3) selector of next PSP (PDB) in linked list Windows keeps a linked list of Windows programs only
+   * 0x44 word      (MSWindows3) "PDB_Partition"
+   * 0x46 word      (MSWindows3) "PDB_NextPDB"
+   * 0x5c 36 bytes  default unopened FCB #1 (parts overlayed by FCB #2)
+   * 0x6c 20 bytes  default unopened FCB #2 (overlays part of FCB #1) (overwritten if FCB 1 is opened)
+   */
   return psp;
 }
 
