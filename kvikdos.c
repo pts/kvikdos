@@ -1,4 +1,4 @@
-#define _GNU_SOURCE 1  /* For MAP_ANONYMOUS. */
+#define _GNU_SOURCE 1  /* For MAP_ANONYMOUS and memmem(). */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -21,8 +21,16 @@
 #define MEM_SIZE (2 << 20)  /* In bytes. 2 MiB. */
 #endif
 
-/* Minimum value is 0x50, after the magic interrupt table (first 0x500 bytes of DOS memory).
- * ``para'' means paragraph of 16 bytes.
+/* Minimum value is 0x50, after the magic interrupt table (first 0x500 bytes
+ * of DOS memory). Also there is the environment (up to ENV_LIMIT >> 4)
+ * paragraphs between the magic interrup table and base. ``para'' means
+ * paragraph of 16 bytes.
+ *
+ * Minimum BASE_PARA value to avoid the A20 bug in exepack is 0x1000.
+ * However, we fix that bug in load_dos_executable_program differently, by
+ * replacing the stub.
+ * https://github.com/joncampbell123/dosbox-x/issues/7#issuecomment-667653041
+ * https://www.bamsoftware.com/software/exepack/
  */
 #define BASE_PARA 0x100
 
@@ -51,7 +59,7 @@
 
 #define PROGRAM_HEADER_SIZE 28  /* Large enough for .exe header (28 bytes). */
 
-char is_same_ascii_nocase(const char *a, const char *b, unsigned size) {
+static char is_same_ascii_nocase(const char *a, const char *b, unsigned size) {
   while (size-- != 0) {
     const unsigned char pa = *a++;
     const unsigned char pb = *b++;
@@ -59,6 +67,26 @@ char is_same_ascii_nocase(const char *a, const char *b, unsigned size) {
   }
   return 1;
 }
+
+#if !defined(__GLIBC__) && !defined(__UCLIBC__)
+static void *my_memmem(const void *haystack, size_t haystacklen,
+                       const void *needle, size_t needlelen) {
+  const void *c, *haystack_end = (const char*)haystack + haystacklen - needlelen + 1;
+  if (haystacklen < needlelen) return NULL;
+  if (needlelen == 0) return (void*)haystack;
+  if (needlelen == 1) return memchr(haystack, *(const char*)needle, haystacklen);
+  for (c = memchr(haystack, *(const char*)needle, haystacklen); c;
+       c = memchr(c, *(const char*)needle, (const char*)haystack_end - (const char*)c)) {
+    if (memcmp(c, needle, needlelen) == 0) return (void*)c;
+    c = (const void*)((const char*)c + 1);
+  }
+  return NULL;
+}
+#if 0  /* Test. */
+fprintf(stderr, "(%s)\n", (const char *)memmem("foorxbard;", 9, "rd", 2));  /* Shoould print: (rd;) */
+#endif
+#define memmem my_memmem
+#endif
 
 /* Returns the total number of header bytes read from img_fd. */
 static int detect_dos_executable_program(int img_fd, const char *filename, char *p) {
@@ -91,6 +119,33 @@ static int detect_dos_executable_program(int img_fd, const char *filename, char 
   return r;
 }
 
+/* From exepack-1.3.0/src/stub.bin in https://www.bamsoftware.com/software/exepack/exepack-1.3.0.tar.gz */
+static const unsigned char fixed_exepack_stub[283] = {
+    0x89, 0xc5, 0x8c, 0xc3, 0x83, 0xc3, 0x10, 0x0e, 0x1f, 0x8b, 0x0e, 0x06,
+    0x00, 0x89, 0xc8, 0x83, 0xc0, 0x0f, 0xd1, 0xd8, 0xd0, 0xe8, 0xd0, 0xe8,
+    0xd0, 0xe8, 0x8c, 0xda, 0x01, 0xd0, 0x89, 0xda, 0x03, 0x16, 0x0c, 0x00,
+    0x39, 0xd0, 0x73, 0x02, 0x89, 0xd0, 0x8e, 0xc0, 0x31, 0xf6, 0x31, 0xff,
+    0xf3, 0xa4, 0x8e, 0xc2, 0x50, 0xb8, 0x6e, 0x00, 0x50, 0xcb, 0x83, 0xee,
+    0x01, 0x73, 0x08, 0x8c, 0xde, 0x4e, 0x8e, 0xde, 0xbe, 0x0f, 0x00, 0x3e,
+    0x8a, 0x04, 0xc3, 0x83, 0xef, 0x01, 0x73, 0x08, 0x8c, 0xc7, 0x4f, 0x8e,
+    0xc7, 0xbf, 0x0f, 0x00, 0x26, 0x88, 0x05, 0xc3, 0x31, 0xf6, 0xe8, 0xd9,
+    0xff, 0x3c, 0xff, 0x74, 0xf9, 0x46, 0x31, 0xff, 0xe8, 0xcf, 0xff, 0x88,
+    0xc2, 0xe8, 0xca, 0xff, 0x88, 0xc5, 0xe8, 0xc5, 0xff, 0x88, 0xc1, 0x88,
+    0xd0, 0x24, 0xfe, 0x3c, 0xb0, 0x75, 0x0c, 0xe8, 0xb8, 0xff, 0xe3, 0x15,
+    0xe8, 0xc4, 0xff, 0xe2, 0xfb, 0xeb, 0x0e, 0x3c, 0xb2, 0x75, 0x60, 0xe3,
+    0x08, 0xe8, 0xa6, 0xff, 0xe8, 0xb4, 0xff, 0xe2, 0xf8, 0xf6, 0xc2, 0x01,
+    0x74, 0xca, 0x0e, 0x1f, 0xbe, 0x2d, 0x01, 0x31, 0xd2, 0xad, 0x89, 0xc1,
+    0xe3, 0x19, 0xad, 0x89, 0xc7, 0x83, 0xe7, 0x0f, 0xd1, 0xe8, 0xd1, 0xe8,
+    0xd1, 0xe8, 0xd1, 0xe8, 0x01, 0xd0, 0x01, 0xd8, 0x8e, 0xc0, 0x26, 0x01,
+    0x1d, 0xe2, 0xe7, 0x80, 0xc6, 0x10, 0x75, 0xdd, 0x8b, 0x36, 0x0a, 0x00,
+    0x01, 0xde, 0x8b, 0x3e, 0x08, 0x00, 0x01, 0x1e, 0x02, 0x00, 0x83, 0xeb,
+    0x10, 0x8e, 0xdb, 0x8e, 0xc3, 0xfa, 0x8e, 0xd6, 0x89, 0xfc, 0xfb, 0x89,
+    0xe8, 0xbb, 0x00, 0x00, 0x2e, 0xff, 0x2f, 0x90, 0x90, 0x90, 0x90, 0xb4,
+    0x40, 0xbb, 0x02, 0x00, 0xb9, 0x16, 0x00, 0x8c, 0xca, 0x8e, 0xda, 0xba,
+    0x17, 0x01, 0xcd, 0x21, 0xb8, 0xff, 0x4c, 0xcd, 0x21, 0x50, 0x61, 0x63,
+    0x6b, 0x65, 0x64, 0x20, 0x66, 0x69, 0x6c, 0x65, 0x20, 0x69, 0x73, 0x20,
+    0x63, 0x6f, 0x72, 0x72, 0x75, 0x70, 0x74 };
+
 /* r is the total number of header bytes alreday read from img_fd by
  * detect_dos_executable_program. Returns the psp (Program Segment Prefix)
  * address.
@@ -100,12 +155,13 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
   if (header_size >= PROGRAM_HEADER_SIZE && (('M' | 'Z' << 8) == *(unsigned short*)header || ('M' << 8 | 'Z') == *(unsigned short*)header)) {
     const unsigned short * const exehdr = (const unsigned short*)header;
     const unsigned exesize = exehdr[1] ? ((exehdr[2] - 1) << 9) + exehdr[1] : exehdr[2] << 9;
-    const unsigned headsize = exehdr[4] << 4;
-    unsigned memsize = exehdr[5] << 4;
+    const unsigned headsize = (unsigned)exehdr[4] << 4;
+    unsigned memsize = (unsigned)exehdr[5] << 4;  /* Minimum size. */
     const unsigned image_size = exesize - headsize;
     char * const image_addr = (char*)mem + (BASE_PARA << 4) + 0x100;
     const unsigned image_para = BASE_PARA + 0x10;
     unsigned reloc_count = exehdr[3];
+    const unsigned stack_end = ((unsigned)exehdr[7] << 4) + exehdr[8];
     if (exehdr[5] == 0 && exehdr[6] == 0) {  /* min_memory == max_memory == 0. */
       fprintf(stderr, "fatal: loading DOS .exe to upper part of memory not supported: %s\n", filename);
       exit(252);
@@ -115,8 +171,16 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
       exit(252);
     }
     if (memsize < image_size) memsize = image_size;  /* Some .exe files have it. */
+    if (stack_end > memsize) {  /* Some .exe files have it. */
+      memsize = stack_end;
+      /*fprintf(stderr, "fatal: DOS .exe stack pointer after end of program memory: %s\n", filename);*/
+    }
     if ((BASE_PARA << 4) + 0x100 + memsize > DOS_MEM_LIMIT) {
       fprintf(stderr, "fatal: DOS .exe uses too much conventional memory: %s\n", filename);
+      exit(252);
+    }
+    if (((unsigned)exehdr[11] << 4) + exehdr[10] >= image_size) {
+      fprintf(stderr, "fatal: DOS .exe entry point after end of image: %s\n", filename);
       exit(252);
     }
     if ((unsigned)lseek(img_fd, headsize, SEEK_SET) != headsize) {
@@ -143,7 +207,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
         }
         reloc_count -= got >> 2;
         for (r = reloc, rend = r + (got >> 1); r != rend; r += 2) {
-          *(unsigned short*)(image_addr + (r[1] << 4) + r[0]) += image_para;
+          *(unsigned short*)(image_addr + ((unsigned)r[1] << 4) + r[0]) += image_para;
         }
       }
     }
@@ -153,6 +217,37 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     sregs->cs.selector = exehdr[11] + image_para;
     *(unsigned*)&regs->rsp = exehdr[8];
     sregs->ss.selector = exehdr[7] + image_para;
+    if (exehdr[10] == 16 || exehdr[10] == 18) {  /* Detect exepack, find decompression stub within it, replace stub with fixed stub to avoid ``Packed file is corrupt'' error. DOS 5.0 does a similar fix. */
+      /* More info about the A20 bug in the exepack stubs: https://github.com/joncampbell123/dosbox-x/issues/7#issuecomment-667653041
+       * More info about the exepack file format: https://www.bamsoftware.com/software/exepack/
+       * Example error with buggy (unfixed) stubs: fatal: KVM memory access denied phys_addr=00101103 value=0000000000000000 size=1 is_write=0
+       */
+      unsigned short * const packhdr = (unsigned short*)(image_addr + ((unsigned)exehdr[11] << 4));
+      const unsigned exepack_max_size = image_size - ((unsigned)exehdr[11] << 4) - exehdr[10];
+      const unsigned exepack_stub_plus_reloc_size =  packhdr[3] - exehdr[10];
+      if (*(unsigned short*)((char*)packhdr + exehdr[10] - 2) == ('R' | 'B' << 8) &&  /* exepack signature. */
+          exepack_max_size <= 290 + 511 && exepack_stub_plus_reloc_size >= 258 && exepack_stub_plus_reloc_size <= exepack_max_size) {
+        char *after_packhdr = (char*)packhdr + exehdr[10];
+        const char *c = (const char*)memmem(after_packhdr, exepack_stub_plus_reloc_size, "\xcd\x21\xb8\xff\x4c\xcd\x21", 7);
+        if (DEBUG) fprintf(stderr, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%d exepack_stub_plus_reloc_size=%d\n", exehdr[10], exepack_max_size, exepack_stub_plus_reloc_size);
+        if (c) {
+          const unsigned exepack_stub_size = (unsigned)(c + 7 + 22 - after_packhdr);
+          if (exepack_stub_size >= 258 && exepack_stub_size <= 290) {
+            if (DEBUG) fprintf(stderr, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%d exepack_stub_plus_reloc_size=%d exepack_stub_size=%d\n", exehdr[10], exepack_max_size, exepack_stub_plus_reloc_size, exepack_stub_size);
+            /* Fix A20 bug (failure as ``Packed file is corrupt'' because ES
+             * wraps around 0x10000) by replacing the stub.
+             */
+            memmove((char*)packhdr + 18 + sizeof(fixed_exepack_stub), after_packhdr + exepack_stub_size, exepack_stub_plus_reloc_size - exepack_stub_size);  /* Move packed reloc. */
+            memcpy((char*)packhdr + 18, fixed_exepack_stub, sizeof(fixed_exepack_stub));  /* Copy fixed stub. */
+            if (exehdr[10] == 16) {  /* Make it longer, because fixed_exepack_stub works only with an 18-byte header (it has org 18 in stub.asm). */
+              *(unsigned*)&regs->rip = 18;  /* Update DOS .exe entry point. */
+              packhdr[8] = ('R' | 'B' << 8);  /* exepack signature. */
+              packhdr[7] = 1;  /* skip_len. */
+            }
+          }
+        }
+      }
+    }
   } else {
     /* Load DOS .com program. */
     char * const p = (char *)mem + (BASE_PARA << 4) + 0x100;  /* !! Security: check bounds (of mem). */
@@ -688,7 +783,7 @@ int main(int argc, char **argv) {
             /* !! Implement this. */
             const unsigned char set_int_num = (unsigned char)regs.rax;
             const unsigned short dx = *(unsigned short*)&regs.rdx;
-            const unsigned short ds = (unsigned)sregs.ds.selector;
+            const unsigned short ds = sregs.ds.selector;
             const unsigned value = ds << 16 | dx;
             unsigned *p = (unsigned*)mem + set_int_num;
             if (set_int_num == 0x23 ||  /* Application Ctrl-<Break> handler. */
@@ -750,7 +845,7 @@ int main(int argc, char **argv) {
             }
           } else if (ah == 0x4a) {  /* Modify allocated memory blocks. */
             const unsigned short bx = *(unsigned short*)&regs.rbx;
-            const unsigned short es = (unsigned)sregs.es.selector;
+            const unsigned short es = sregs.es.selector;
             if (es != BASE_PARA) {
               fprintf(stderr, "fatal: unsupported block resize: old_para=0x%04x new_size=0x%04x\n", es, bx);
               goto fatal;
