@@ -415,7 +415,7 @@ int main(int argc, char **argv) {
   char *prog_dos_pathname = "C:\\PROG.COM";
   unsigned tick_count;
   unsigned char sphinx_cmm_flags;
-  unsigned last_heap_block_para, last_heap_block_end_para;
+  unsigned last_heap_block_para, last_heap_block_end_para, base_heap_block_end_para;
 
   (void)argc;
   if (!argv[0] || !argv[1] || 0 == strcmp(argv[1], "--help")) {
@@ -588,7 +588,7 @@ int main(int argc, char **argv) {
   sphinx_cmm_flags = 0;
   /* Initially there is only a single heap block: the program image (starting with PSP). We remember it so that the program can resize it using int 0x21 ah == 0x4a. */
   last_heap_block_para = BASE_PARA;
-  last_heap_block_end_para = DOS_ALLOC_PARA_LIMIT;
+  base_heap_block_end_para = last_heap_block_end_para = DOS_ALLOC_PARA_LIMIT;
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
 
   if (DEBUG) dump_regs("debug", &regs, &sregs);
@@ -867,6 +867,7 @@ int main(int argc, char **argv) {
               goto error_on_21;
             }
             last_heap_block_end_para = last_heap_block_para + new_size_para;
+            if (last_heap_block_para == BASE_PARA) base_heap_block_end_para = last_heap_block_end_para;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x48) {  /* Allocate memory. */
             const unsigned size_para = *(unsigned short*)&regs.rbx;
@@ -877,6 +878,22 @@ int main(int argc, char **argv) {
             }
             *(unsigned short*)&regs.rax = last_heap_block_para = last_heap_block_end_para;
             last_heap_block_end_para = last_heap_block_para + size_para;
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x49) {  /* Free allocated memory. */
+            const unsigned block_para = *(unsigned short*)&sregs.es.selector;
+            if (block_para < base_heap_block_end_para) {  /* It's not allowed to free the program image. */
+              goto error_invalid_parameter;
+            }
+            /* This is really best effort: we have enough info only for freeing the very last block. */
+            if (block_para == last_heap_block_para) {
+              if (last_heap_block_para == base_heap_block_end_para) {
+                last_heap_block_para = BASE_PARA;
+                last_heap_block_end_para = base_heap_block_end_para;
+              } else {
+                last_heap_block_end_para = last_heap_block_para;
+                /* Unfortunately we don't have enough info to make last_heap_block_para smaller, so we will leak memory. */
+              }  /* Unfortunately we don't keep enough info to free something in the middle of the heap, so we leak memory here. */
+            }
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x43) {  /* Get/set file attributes. */
             const unsigned char al = (unsigned char)regs.rax;
@@ -893,6 +910,9 @@ int main(int argc, char **argv) {
               fprintf(stderr, "fatal: unimplemented: set file attributes: attr=0x%04x filename=%s\n", *(unsigned short*)&regs.rcx, fn);
               goto fatal;
             }
+          } else if (ah == 0x63) {  /* Get lead byte table. Multibyte support in MS-DOS 2.25. */
+            *(unsigned short*)&regs.rax = 1;  /* Invalid function number. */
+            goto error_on_21;
           } else {
             goto fatal_int;
           }
