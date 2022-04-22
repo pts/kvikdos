@@ -51,6 +51,9 @@
 
 #define DOS_MEM_LIMIT 0xa0000  /* 640 KiB should be enough for everyone :-). */
 
+/* Points after last paragraph which can be allocated by DOS, conventional memory. 640 KiB. */
+#define DOS_ALLOC_PARA_LIMIT 0xa000
+
 #define MAX_DOS_COM_SIZE 0xfee0  /* size + 0x100 bytes of PSP + 0x20 bytes of stack <= 0x10000 bytes. */
 
 #ifndef DEBUG
@@ -412,6 +415,7 @@ int main(int argc, char **argv) {
   char *prog_dos_pathname = "C:\\PROG.COM";
   unsigned tick_count;
   unsigned char sphinx_cmm_flags;
+  unsigned last_heap_block_para, last_heap_block_end_para;
 
   (void)argc;
   if (!argv[0] || !argv[1] || 0 == strcmp(argv[1], "--help")) {
@@ -582,6 +586,10 @@ int main(int argc, char **argv) {
   had_get_int0 = 0;
   tick_count = 0;
   sphinx_cmm_flags = 0;
+  /* Initially there is only a single heap block: the program image (starting with PSP). We remember it so that the program can resize it using int 0x21 ah == 0x4a. */
+  last_heap_block_para = BASE_PARA;
+  last_heap_block_end_para = DOS_ALLOC_PARA_LIMIT;
+  { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
 
   if (DEBUG) dump_regs("debug", &regs, &sregs);
 
@@ -843,18 +851,32 @@ int main(int argc, char **argv) {
               fprintf(stderr, "fatal: unsupported DOS ioctl call: 0x%02x\n", al);
               goto fatal;
             }
-          } else if (ah == 0x4a) {  /* Modify allocated memory blocks. */
-            const unsigned short bx = *(unsigned short*)&regs.rbx;
+          } else if (ah == 0x4a) {  /* Modify allocated memory block. */
+            const unsigned new_size_para = *(unsigned short*)&regs.rbx;
             const unsigned short es = sregs.es.selector;
-            if (es != BASE_PARA) {
-              fprintf(stderr, "fatal: unsupported block resize: old_para=0x%04x new_size=0x%04x\n", es, bx);
-              goto fatal;
+            if (es != last_heap_block_para) {
+              /*fprintf(stderr, "fatal: unsupported block resize: old_para=0x%04x new_size_para=0x%04x\n", es, new_size_para);*/
+              /*goto fatal;*/
+              *(unsigned short*)&regs.rbx = 1;  /* We don't know how large it was. */
+              goto error_insufficient_memory;
             }
-            if (bx > (DOS_MEM_LIMIT >> 4) - BASE_PARA) {
+            if (new_size_para > DOS_ALLOC_PARA_LIMIT - last_heap_block_para) {
+              *(unsigned short*)&regs.rbx = DOS_ALLOC_PARA_LIMIT - last_heap_block_para;
+             error_insufficient_memory:
               *(unsigned short*)&regs.rax = 8;  /* Insufficient memory. */
-              *(unsigned short*)&regs.rbx = (DOS_MEM_LIMIT >> 4) - BASE_PARA;
               goto error_on_21;
             }
+            last_heap_block_end_para = last_heap_block_para + new_size_para;
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x48) {  /* Allocate memory. */
+            const unsigned size_para = *(unsigned short*)&regs.rbx;
+            const unsigned available_para = DOS_ALLOC_PARA_LIMIT - last_heap_block_end_para;
+            if (size_para > available_para) {
+              *(unsigned short*)&regs.rbx = available_para;
+              goto error_insufficient_memory;
+            }
+            *(unsigned short*)&regs.rax = last_heap_block_para = last_heap_block_end_para;
+            last_heap_block_end_para = last_heap_block_para + size_para;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x43) {  /* Get/set file attributes. */
             const unsigned char al = (unsigned char)regs.rax;
