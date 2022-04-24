@@ -164,23 +164,39 @@ static const unsigned char fixed_exepack_stub[283] = {
     0x6b, 0x65, 0x64, 0x20, 0x66, 0x69, 0x6c, 0x65, 0x20, 0x69, 0x73, 0x20,
     0x63, 0x6f, 0x72, 0x72, 0x75, 0x70, 0x74 };
 
+/* All offsets are in 2-byte words. */
+#define EXE_SIGNATURE 0
+#define EXE_LASTSIZE 1
+#define EXE_NBLOCKS 2
+#define EXE_NRELOC 3
+#define EXE_HDRSIZE 4
+#define EXE_MINALLOC 5
+#define EXE_MAXALLOC 6
+#define EXE_SS 7
+#define EXE_SP 8
+#define EXE_CHECKSUM 9  /* Ignored by kvikdos. */
+#define EXE_IP 10
+#define EXE_CS 11
+#define EXE_RELOCPOS 12
+#define EXE_NOVERLAY 13  /* Ignored by kvikdos. */
+
 /* r is the total number of header bytes alreday read from img_fd by
  * detect_dos_executable_program. Returns the psp (Program Segment Prefix)
  * address.
  */
 static char *load_dos_executable_program(int img_fd, const char *filename, void *mem, const char *header, int header_size, struct kvm_regs *regs, struct kvm_sregs *sregs) {
   char *psp;
-  if (header_size >= PROGRAM_HEADER_SIZE && (('M' | 'Z' << 8) == *(unsigned short*)header || ('M' << 8 | 'Z') == *(unsigned short*)header)) {
+  if (header_size >= PROGRAM_HEADER_SIZE && (('M' | 'Z' << 8) == ((unsigned short*)header)[EXE_SIGNATURE] || ('M' << 8 | 'Z') == ((unsigned short*)header)[EXE_SIGNATURE])) {
     const unsigned short * const exehdr = (const unsigned short*)header;
-    const unsigned exesize = exehdr[1] ? ((exehdr[2] - 1) << 9) + exehdr[1] : exehdr[2] << 9;
-    const unsigned headsize = (unsigned)exehdr[4] << 4;
+    const unsigned exesize = exehdr[EXE_LASTSIZE] ? ((exehdr[EXE_NBLOCKS] - 1) << 9) + exehdr[EXE_LASTSIZE] : exehdr[EXE_NBLOCKS] << 9;
+    const unsigned headsize = (unsigned)exehdr[EXE_HDRSIZE] << 4;
     const unsigned image_size = exesize - headsize;
-    unsigned memsize = ((unsigned)exehdr[5] << 4) + image_size;  /* Minimum size of .bss in exehdr[5]. */
+    unsigned memsize = ((unsigned)exehdr[EXE_MINALLOC] << 4) + image_size;  /* Minimum size of .bss in exehdr[EXE_MINALLOC]. */
     char * const image_addr = (char*)mem + (PSP_PARA << 4) + 0x100;
     const unsigned image_para = PSP_PARA + 0x10;
-    unsigned reloc_count = exehdr[3];
-    const unsigned stack_end = ((unsigned)exehdr[7] << 4) + exehdr[8];
-    if (exehdr[5] == 0 && exehdr[6] == 0) {  /* min_memory == max_memory == 0. */
+    unsigned reloc_count = exehdr[EXE_NRELOC];
+    const unsigned stack_end = ((unsigned)exehdr[EXE_SS] << 4) + exehdr[EXE_SP];
+    if (exehdr[EXE_MINALLOC] == 0 && exehdr[EXE_MAXALLOC] == 0) {  /* min_memory == max_memory == 0. */
       fprintf(stderr, "fatal: loading DOS .exe to upper part of memory not supported: %s\n", filename);
       exit(252);
     }
@@ -196,7 +212,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
       fprintf(stderr, "fatal: DOS .exe uses too much conventional memory: %s\n", filename);
       exit(252);
     }
-    if (((unsigned)exehdr[11] << 4) + exehdr[10] >= image_size) {
+    if (((unsigned)exehdr[EXE_CS] << 4) + exehdr[EXE_IP] >= image_size) {
       fprintf(stderr, "fatal: DOS .exe entry point after end of image: %s\n", filename);
       exit(252);
     }
@@ -210,7 +226,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     }
     if (reloc_count) {  /* Process relocations. */
       unsigned short reloc[1024]; /* 2048 bytes on the stack. */
-      if ((unsigned)lseek(img_fd, exehdr[12], SEEK_SET) != exehdr[12]) {
+      if ((unsigned)lseek(img_fd, exehdr[EXE_RELOCPOS], SEEK_SET) != exehdr[EXE_RELOCPOS]) {
         fprintf(stderr, "fatal: error seeking to image relocations: %s\n", filename);
         exit(252);
       }
@@ -230,34 +246,34 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     }
     psp = image_addr - 0x100;
     sregs->ds.selector = sregs->es.selector = image_para - 0x10; /* DS and ES point to PSP. */
-    *(unsigned*)&regs->rip = exehdr[10];  /* DOS .exe entry point. */
-    sregs->cs.selector = exehdr[11] + image_para;
-    *(unsigned*)&regs->rsp = exehdr[8];
-    sregs->ss.selector = exehdr[7] + image_para;
+    *(unsigned*)&regs->rip = exehdr[EXE_IP];  /* DOS .exe entry point. */
+    sregs->cs.selector = exehdr[EXE_CS] + image_para;
+    *(unsigned*)&regs->rsp = exehdr[EXE_SP];
+    sregs->ss.selector = exehdr[EXE_SS] + image_para;
     *(unsigned*)(psp + 6) = 0xc0;  /* CP/M far call 5 service request address. Obsolete. */
-    if (exehdr[10] == 16 || exehdr[10] == 18) {  /* Detect exepack, find decompression stub within it, replace stub with fixed stub to avoid ``Packed file is corrupt'' error. DOS 5.0 does a similar fix. */
+    if (exehdr[EXE_IP] == 16 || exehdr[EXE_IP] == 18) {  /* Detect exepack, find decompression stub within it, replace stub with fixed stub to avoid ``Packed file is corrupt'' error. DOS 5.0 does a similar fix. */
       /* More info about the A20 bug in the exepack stubs: https://github.com/joncampbell123/dosbox-x/issues/7#issuecomment-667653041
        * More info about the exepack file format: https://www.bamsoftware.com/software/exepack/
        * Example error with buggy (unfixed) stubs: fatal: KVM memory access denied phys_addr=00101103 value=0000000000000000 size=1 is_write=0
        */
-      unsigned short * const packhdr = (unsigned short*)(image_addr + ((unsigned)exehdr[11] << 4));
-      const unsigned exepack_max_size = image_size - ((unsigned)exehdr[11] << 4) - exehdr[10];
-      const unsigned exepack_stub_plus_reloc_size =  packhdr[3] - exehdr[10];
-      if (*(unsigned short*)((char*)packhdr + exehdr[10] - 2) == ('R' | 'B' << 8) &&  /* exepack signature. */
+      unsigned short * const packhdr = (unsigned short*)(image_addr + ((unsigned)exehdr[EXE_CS] << 4));
+      const unsigned exepack_max_size = image_size - ((unsigned)exehdr[EXE_CS] << 4) - exehdr[EXE_IP];
+      const unsigned exepack_stub_plus_reloc_size =  packhdr[3] - exehdr[EXE_IP];
+      if (*(unsigned short*)((char*)packhdr + exehdr[EXE_IP] - 2) == ('R' | 'B' << 8) &&  /* exepack signature. */
           exepack_stub_plus_reloc_size >= 258 && exepack_stub_plus_reloc_size <= exepack_max_size) {
-        char *after_packhdr = (char*)packhdr + exehdr[10];
+        char *after_packhdr = (char*)packhdr + exehdr[EXE_IP];
         const char *c = (const char*)memmem(after_packhdr, exepack_stub_plus_reloc_size, "\xcd\x21\xb8\xff\x4c\xcd\x21", 7);
-        if (DEBUG) fprintf(stderr, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%d exepack_stub_plus_reloc_size=%d\n", exehdr[10], exepack_max_size, exepack_stub_plus_reloc_size);
+        if (DEBUG) fprintf(stderr, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%d exepack_stub_plus_reloc_size=%d\n", exehdr[EXE_IP], exepack_max_size, exepack_stub_plus_reloc_size);
         if (c) {
           const unsigned exepack_stub_size = (unsigned)(c + 7 + 22 - after_packhdr);
           if (exepack_stub_size >= 258 && exepack_stub_size <= 290) {
-            if (DEBUG) fprintf(stderr, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%d exepack_stub_plus_reloc_size=%d exepack_stub_size=%d\n", exehdr[10], exepack_max_size, exepack_stub_plus_reloc_size, exepack_stub_size);
+            if (DEBUG) fprintf(stderr, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%d exepack_stub_plus_reloc_size=%d exepack_stub_size=%d\n", exehdr[EXE_IP], exepack_max_size, exepack_stub_plus_reloc_size, exepack_stub_size);
             /* Fix A20 bug (failure as ``Packed file is corrupt'' because ES
              * wraps around 0x10000) by replacing the stub.
              */
             memmove((char*)packhdr + 18 + sizeof(fixed_exepack_stub), after_packhdr + exepack_stub_size, exepack_stub_plus_reloc_size - exepack_stub_size);  /* Move packed reloc. */
             memcpy((char*)packhdr + 18, fixed_exepack_stub, sizeof(fixed_exepack_stub));  /* Copy fixed stub. */
-            if (exehdr[10] == 16) {  /* Make it longer, because fixed_exepack_stub works only with an 18-byte header (it has org 18 in stub.asm). */
+            if (exehdr[EXE_IP] == 16) {  /* Make it longer, because fixed_exepack_stub works only with an 18-byte header (it has org 18 in stub.asm). */
               *(unsigned*)&regs->rip = 18;  /* Update DOS .exe entry point. */
               packhdr[8] = ('R' | 'B' << 8);  /* exepack signature. */
               packhdr[7] = 1;  /* skip_len. */
