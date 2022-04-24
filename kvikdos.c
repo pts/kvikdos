@@ -454,6 +454,18 @@ static char *add_env(char *env, char *env_end, const char *var, char do_check) {
   return env;
 }
 
+static char is_mcb_bad(void *mem, unsigned short block_para) {
+  const char* mcb = (const char*)mem + (block_para << 4) - 16;
+  unsigned block_end_para;
+  if (block_para == 0) return 1;  /* qblink.exe calls with block_para==0 many times. */
+  if (mcb[0] != 'M' && mcb[0] != 'Z') return 2;
+  if (*(const unsigned short*)(mcb + 1) != 0 && *(const unsigned short*)(mcb + 1) != PROCESS_ID) return 3;
+  block_end_para = block_para + *(const unsigned short*)(mcb + 3);
+  if (block_end_para > DOS_ALLOC_PARA_LIMIT) return 4;
+  if (memcmp(mcb + 5, default_program_mcb + 5, 11) != 0) return 5;
+  return 0;  /* MCB looks good. */
+}
+
 int main(int argc, char **argv) {
   struct kvm_fds kvm_fds;
   void *mem;
@@ -909,38 +921,59 @@ int main(int argc, char **argv) {
               fprintf(stderr, "fatal: unsupported DOS ioctl call: 0x%02x\n", al);
               goto fatal;
             }
-          } else if (ah == 0x4a) {  /* Modify allocated memory block. */
+          } else if (ah == 0x4a) {  /* Modify allocated memory block (realloc()). */
             const unsigned new_size_para = *(unsigned short*)&regs.rbx;
-            const unsigned short es = sregs.es.selector;
-            if (es != last_heap_block_para) {
-              /*fprintf(stderr, "fatal: unsupported block resize: old_para=0x%04x new_size_para=0x%04x\n", es, new_size_para);*/
+            unsigned short *size_para_ptr;
+            const unsigned short block_para = sregs.es.selector;
+            unsigned available_para;
+            if (is_mcb_bad(mem, block_para)) { error_bad_mcb:
+              /*fprintf(stderr, "fatal: bad MCB\n"); goto fatal;*/
+              *(unsigned short*)&regs.rax = 7;  /* Memory control blocks destroyed. */
+              goto error_on_21;
+            }
+            if (DEBUG) fprintf(stderr, "debug: realloc block_para=0x%04x new_size_para=0x%04x\n", block_para, new_size_para);
+            if (block_para != last_heap_block_para) {
+              /*fprintf(stderr, "fatal: unsupported block resize: old_para=0x%04x new_size_para=0x%04x\n", block_para, new_size_para);*/
               /*goto fatal;*/
               *(unsigned short*)&regs.rbx = 1;  /* We don't know how large it was. */
               goto error_insufficient_memory;
             }
-            if (new_size_para > DOS_ALLOC_PARA_LIMIT - last_heap_block_para) {
-              *(unsigned short*)&regs.rbx = DOS_ALLOC_PARA_LIMIT - last_heap_block_para;
+            available_para = DOS_ALLOC_PARA_LIMIT - last_heap_block_para;
+            if (new_size_para >= available_para) {  /* == means there no room for the new MCB. */
+              *(unsigned short*)&regs.rbx = available_para - (available_para > 0);
              error_insufficient_memory:
               *(unsigned short*)&regs.rax = 8;  /* Insufficient memory. */
               goto error_on_21;
             }
+            if (DEBUG) fprintf(stderr, "debug: realloc block_para=0x%04x new_size_para=0x%04x OK\n", block_para, new_size_para);
+            size_para_ptr = (unsigned short*)((char*)mem + (last_heap_block_para << 8) + (3 - 16));
+            *size_para_ptr = new_size_para;  /* Change size in MCB. */
             last_heap_block_end_para = last_heap_block_para + new_size_para;
             if (last_heap_block_para == PSP_PARA) base_heap_block_end_para = last_heap_block_end_para;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
-          } else if (ah == 0x48) {  /* Allocate memory. */
+          } else if (ah == 0x48) {  /* Allocate memory (malloc()). */
             const unsigned size_para = *(unsigned short*)&regs.rbx;
             const unsigned available_para = DOS_ALLOC_PARA_LIMIT - last_heap_block_end_para;
-            if (size_para > available_para) {
-              *(unsigned short*)&regs.rbx = available_para;
+            char *mcb;
+            if (DEBUG) fprintf(stderr, "debug: malloc(0x%04x)\n", size_para);
+            if (size_para >= available_para) {
+              *(unsigned short*)&regs.rbx = available_para - (available_para > 0);
               goto error_insufficient_memory;
             }
-            *(unsigned short*)&regs.rax = last_heap_block_para = last_heap_block_end_para;
+            mcb = (char*)mem + (last_heap_block_end_para << 4);
+            memcpy(mcb, default_program_mcb, 16);
+            /* TODO(pts): Change mcb[0] = 'M' if it isn't the last. */
+            *(unsigned short*)(mcb + 3) = size_para;
+            *(unsigned short*)&regs.rax = last_heap_block_para = last_heap_block_end_para + 1;
+            if (DEBUG) fprintf(stderr, "debug: malloc(0x%04x) == 0x%04x\n", size_para, last_heap_block_para);
             last_heap_block_end_para = last_heap_block_para + size_para;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
-          } else if (ah == 0x49) {  /* Free allocated memory. */
+          } else if (ah == 0x49) {  /* Free allocated memory (free()). */
             const unsigned block_para = *(unsigned short*)&sregs.es.selector;
-            if (block_para < base_heap_block_end_para) {  /* It's not allowed to free the program image. */
-              goto error_invalid_parameter;
+            if (DEBUG) fprintf(stderr, "free(0x%04x)\n", block_para);
+            if ((block_para < base_heap_block_end_para) ? (block_para != 0) :  /* It's not allowed to free the program image. qblink.exe calls with block_para==0 many times. */
+                 is_mcb_bad(mem, block_para)) {
+              goto error_bad_mcb;
             }
             /* This is really best effort: we have enough info only for freeing the very last block. */
             if (block_para == last_heap_block_para) {
@@ -952,6 +985,7 @@ int main(int argc, char **argv) {
                 /* Unfortunately we don't have enough info to make last_heap_block_para smaller, so we will leak memory. */
               }  /* Unfortunately we don't keep enough info to free something in the middle of the heap, so we leak memory here. */
             }
+            if (DEBUG) fprintf(stderr, "free(0x%04x) OK\n", block_para);
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x43) {  /* Get/set file attributes. */
             const unsigned char al = (unsigned char)regs.rax;
