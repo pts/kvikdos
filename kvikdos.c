@@ -21,26 +21,23 @@
 #define MEM_SIZE (2 << 20)  /* In bytes. 2 MiB. */
 #endif
 
-/* Minimum value is 0x50, after the magic interrupt table (first 0x500 bytes
- * of DOS memory). Also there is the environment (up to ENV_LIMIT >> 4)
- * paragraphs between the magic interrup table and base. ``para'' means
- * paragraph of 16 bytes.
+/* Start of Program Segment Prefix (PSP) in paragraphs (unit of 16 bytes).
+ * It must be at leasge GUEST_MEM_MODULE_START >> 4, otherwise it isn't
+ * writable by the program.
  *
- * Minimum BASE_PARA value to avoid the A20 bug in exepack is 0x1000.
- * However, we fix that bug in load_dos_executable_program differently, by
- * replacing the stub.
- * https://github.com/joncampbell123/dosbox-x/issues/7#issuecomment-667653041
- * https://www.bamsoftware.com/software/exepack/
+ * Minimum value is 0x50, after the magic interrupt table (first 0x500 bytes
+ * of DOS memory). Also there is the environment (up to ENV_LIMIT >> 4)
+ * paragraphs between the magic interrup table and base.
  */
-#define BASE_PARA 0x100
+#define PSP_PARA 0x100
 
 /* Environment starts at this paragraph. */
 #define ENV_PARA 0x50
 /* How long the environment can be. */
-#define ENV_LIMIT (BASE_PARA << 4)
+#define ENV_LIMIT (PSP_PARA << 4)
 
 /* Must be a multiple of the Linux page size (0x1000), minimum value is
- * 0x500 (after magic interrupt table). Must be at most BASE_PARA << 4. Can
+ * 0x500 (after magic interrupt table). Must be at most PSP_PARA << 4. Can
  * be 0. By setting it to nonzero (0x1000), we effectively make the magic
  * interrupt table read-only.
  */
@@ -161,8 +158,8 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     const unsigned headsize = (unsigned)exehdr[4] << 4;
     const unsigned image_size = exesize - headsize;
     unsigned memsize = ((unsigned)exehdr[5] << 4) + image_size;  /* Minimum size of .bss in exehdr[5]. */
-    char * const image_addr = (char*)mem + (BASE_PARA << 4) + 0x100;
-    const unsigned image_para = BASE_PARA + 0x10;
+    char * const image_addr = (char*)mem + (PSP_PARA << 4) + 0x100;
+    const unsigned image_para = PSP_PARA + 0x10;
     unsigned reloc_count = exehdr[3];
     const unsigned stack_end = ((unsigned)exehdr[7] << 4) + exehdr[8];
     if (exehdr[5] == 0 && exehdr[6] == 0) {  /* min_memory == max_memory == 0. */
@@ -177,7 +174,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
       fprintf(stderr, "fatal: DOS .exe stack pointer after end of program memory: %s\n", filename);
       exit(252);
     }
-    if ((BASE_PARA << 4) + 0x100 + memsize > DOS_MEM_LIMIT) {
+    if ((PSP_PARA << 4) + 0x100 + memsize > DOS_MEM_LIMIT) {
       fprintf(stderr, "fatal: DOS .exe uses too much conventional memory: %s\n", filename);
       exit(252);
     }
@@ -253,7 +250,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     }
   } else {
     /* Load DOS .com program. */
-    char * const p = (char *)mem + (BASE_PARA << 4) + 0x100;  /* !! Security: check bounds (of mem). */
+    char * const p = (char *)mem + (PSP_PARA << 4) + 0x100;  /* !! Security: check bounds (of mem). */
     unsigned sp;
     int r;
     memcpy(p, header, header_size);
@@ -267,9 +264,9 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
       fprintf(stderr, "fatal: DOS executable program too long: %s\n", filename);
       exit(252);
     }
-    /* No need to check for DOS_MEM_LIMIT, because (BASE_PARA << 4) + 0x100 + MAX_DOS_COM_SIZE + 0x10 < DOS_MEM_LIMIT. */
-    sregs->cs.selector = sregs->ds.selector = sregs->es.selector = sregs->ss.selector = BASE_PARA;
-    psp = (char*)mem + (BASE_PARA << 4);  /* Program Segment Prefix. */
+    /* No need to check for DOS_MEM_LIMIT, because (PSP_PARA << 4) + 0x100 + MAX_DOS_COM_SIZE + 0x10 < DOS_MEM_LIMIT. */
+    sregs->cs.selector = sregs->ds.selector = sregs->es.selector = sregs->ss.selector = PSP_PARA;
+    psp = (char*)mem + (PSP_PARA << 4);  /* Program Segment Prefix. */
     *(unsigned*)&regs->rsp = sp = 0xfffe;
     *(short*)(psp + sp) = 0;  /* Push a 0 byte. */
     *(unsigned short*)(psp + 6) = MAX_DOS_COM_SIZE + 0x100;  /* .COM bytes available in segment (CP/M). DOSBox doesn't initialize it. */
@@ -285,7 +282,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
   *(unsigned short*)(psp + 0x40) = 5;  /* DOS version number (DOSBox also reports 5). */
   *(unsigned short*)(psp + 0x50) = 0x21cd;  /* `int 0x21' opcode. */
   *(unsigned short*)(psp + 0x32) = 20;  /* `Number of bytes in JFT. */
-  *(unsigned*)(psp + 0x34) = 0x18 | BASE_PARA << 16;  /* `Far pointer to JFT. */
+  *(unsigned*)(psp + 0x34) = 0x18 | PSP_PARA << 16;  /* `Far pointer to JFT. */
   *(unsigned*)(psp + 0x38) = 0xffffffffU;  /* `Pointer to (lack of) previous PSP. */
   *(unsigned*)(psp + 0x0a) = *((unsigned*)mem + 0x22);  /* Copy of `int 0x22' vector. */
   *(unsigned*)(psp + 0x0e) = *((unsigned*)mem + 0x23);  /* Copy of `int 0x23' vector. */
@@ -612,7 +609,7 @@ int main(int argc, char **argv) {
   tick_count = 0;
   sphinx_cmm_flags = 0;
   /* Initially there is only a single heap block: the program image (starting with PSP). We remember it so that the program can resize it using int 0x21 ah == 0x4a. */
-  last_heap_block_para = BASE_PARA;
+  last_heap_block_para = PSP_PARA;
   base_heap_block_end_para = last_heap_block_end_para = DOS_ALLOC_PARA_LIMIT;
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
 
@@ -892,7 +889,7 @@ int main(int argc, char **argv) {
               goto error_on_21;
             }
             last_heap_block_end_para = last_heap_block_para + new_size_para;
-            if (last_heap_block_para == BASE_PARA) base_heap_block_end_para = last_heap_block_end_para;
+            if (last_heap_block_para == PSP_PARA) base_heap_block_end_para = last_heap_block_end_para;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x48) {  /* Allocate memory. */
             const unsigned size_para = *(unsigned short*)&regs.rbx;
@@ -912,7 +909,7 @@ int main(int argc, char **argv) {
             /* This is really best effort: we have enough info only for freeing the very last block. */
             if (block_para == last_heap_block_para) {
               if (last_heap_block_para == base_heap_block_end_para) {
-                last_heap_block_para = BASE_PARA;
+                last_heap_block_para = PSP_PARA;
                 last_heap_block_end_para = base_heap_block_end_para;
               } else {
                 last_heap_block_end_para = last_heap_block_para;
