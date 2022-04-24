@@ -17,6 +17,10 @@
 #  include <linux/kvm.h>
 #endif
 
+#ifndef DEBUG
+#define DEBUG 0
+#endif
+
 #if 0  /* We don't use ROM and BIOS area and then XMS above DOS_MEM_LIMIT, we just map DOS_MEM_LIMIT. */
 #define MEM_SIZE (2 << 20)  /* In bytes. 2 MiB. */
 #endif
@@ -31,10 +35,12 @@
  */
 #define PSP_PARA 0x100
 
+#define PROGRAM_MCB_PARA (PSP_PARA - 1)
+
 /* Environment starts at this paragraph. */
 #define ENV_PARA 0x50
 /* How long the environment can be. */
-#define ENV_LIMIT (PSP_PARA << 4)
+#define ENV_LIMIT (PROGRAM_MCB_PARA << 4)
 
 /* Must be a multiple of the Linux page size (0x1000), minimum value is
  * 0x500 (after magic interrupt table). Must be at most PSP_PARA << 4. Can
@@ -46,18 +52,30 @@
 /* Points to 0x40:int_num, pointer encoded as cs:ip. */
 #define MAGIC_INT_VALUE(int_num) (0x400000U | (unsigned)int_num)
 
-#define DOS_MEM_LIMIT 0xa0000  /* 640 KiB should be enough for everyone :-). */
+/* Maximum byte offset where the program (including .bss and stack) can end.
+ * 640 KiB should be enough for everyone :-).
+ */
+#define DOS_MEM_LIMIT 0xa0000
 
 /* Points after last paragraph which can be allocated by DOS, conventional memory. 640 KiB. */
 #define DOS_ALLOC_PARA_LIMIT 0xa000
 
 #define MAX_DOS_COM_SIZE 0xfee0  /* size + 0x100 bytes of PSP + 0x20 bytes of stack <= 0x10000 bytes. */
 
-#ifndef DEBUG
-#define DEBUG 0
-#endif
-
 #define PROGRAM_HEADER_SIZE 28  /* Large enough for .exe header (28 bytes). */
+
+#define PROCESS_ID  0x192  /* Same as in DOSBox. */
+
+/* https://stanislavs.org/helppc/memory_control_block.html */
+static const char default_program_mcb[16] = {
+    'Z',  /* 'Z' indicates last member of MCB chain; 'M' would be non-last. */
+    (char)PROCESS_ID,  /* \0\0 indicates free block. */
+    (char)(PROCESS_ID >> 8),
+    (char)((DOS_MEM_LIMIT >> 4) - PSP_PARA),  /* Number of paragraphs low byte. */
+    (char)(((DOS_MEM_LIMIT >> 4) - PSP_PARA)) >> 8,  /* Number of paragraphs high byte. */
+    (char)0xc6, (char)0x88, (char)0xb2,  /* Reserved bytes, random. */
+    'K', 'V', '1', 'K', 'P', 'R', '0', 'G',  /* "KV1KPR0G". Program name. */
+};
 
 static char is_same_ascii_nocase(const char *a, const char *b, unsigned size) {
   while (size-- != 0) {
@@ -593,6 +611,8 @@ int main(int argc, char **argv) {
     env = add_env(env, env_end, ".", 0);  /* Just skip 2 bytes, DOSBox also does it. */
     env = add_env(env, env_end, prog_dos_pathname, 0);  /* Full program pathname. */
   }
+
+  memcpy((char*)mem + (PROGRAM_MCB_PARA << 4), default_program_mcb, 16);
 
 /* We have to set both selector and base, otherwise it won't work. A `mov
  * ds, ax' instruction in the 16-bit KVM guest will set both.
