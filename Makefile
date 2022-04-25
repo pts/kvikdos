@@ -2,7 +2,7 @@
 .SUFFIXES:
 MAKEFLAGS += -r
 
-ALL = kvikdos guest.com slowp.com
+ALL = kvikdos guest.com slowp.com malloct.com
 
 CFLAGS = -ansi -pedantic -s -O2 -W -Wall -Wextra -Werror=implicit-function-declaration -fno-strict-aliasing $(XCFLAGS)
 XCFLAGS =  # To be overridden from the command-line.
