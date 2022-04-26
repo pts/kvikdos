@@ -949,13 +949,21 @@ int main(int argc, char **argv) {
           } else if (ah == 0x19) {  /* Get current drive. */
             *(unsigned char*)&regs.rax = dir_state.drive - 'A';
           } else if (ah == 0x47) {  /* Get current directory. */
+            char *p, *p0, *pend;
+            const char *s;
             /* Input: DL: 0 = current drive, 1: A: */
             if (*(unsigned char*)&regs.rdx != 0) {
               *(unsigned short*)&regs.rax = 0xf;  /* Invalid drive specified. */
               goto error_on_21;
             }
-            /* Current directory is \ (\ stripped from both sides). */
-            *((char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx)) = '\0';  /* !! Security: check bounds, should be 64 bytes supplied by the caller. */
+            p0 = p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + *(unsigned short*)&regs.rdx;
+            pend = p + 63;
+            s = dir_state.current_dir[dir_state.drive - 'A'];
+            for (; *s != '\0' && p != pend; ++s, ++p) {
+              *p = *s;
+            }
+            if (p != p0 && p[-1] == '/') --p;  /* Remove trailing '/'. */
+            *p = '\0';  /* Silently truncate to 64 bytes. */
           } else if (ah == 0x3d || ah == 0x3c) {  /* Open to handle. Create to handle. */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             const int flags = (ah == 0x3c) ? O_RDWR | O_CREAT | O_TRUNC :
