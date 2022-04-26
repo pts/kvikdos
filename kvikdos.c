@@ -27,14 +27,12 @@
 
 /* Memory map for kvikdos:
  *
- * 0x00000...0x00000    +0x400  Interrupt vector table (IVT).
- * 0x00400...0x00500    +0x100  BIOS data area (BDA). https://stanislavs.org/helppc/bios_data_area.html  https://wiki.osdev.org/Memory_Map_(x86)  http://www.bioscentral.com/misc/bda.htm
- *                              !! Used for hlt instructions for interrupt entry points.
- *                              !! Populate this.
- * 0x00500...0x00534     +0x34  ENV_PARA. BIOS/DOS data area. https://stanislavs.org/helppc/bios_data_area.html
- *                              !! Used for environment variables and program pathname.
- * 0x00534...0x00ff0    +0xabc  Remaining environment varialbes and program pathname.
- * 0x00ff0...0x01000     +0x10  Memory Control Block (MCB) of PSP.
+ * 0x00000...0x00400    +0x400  Interrupt vector table (IVT).
+ * 0x00400...0x00500    +0x100  BIOS data area (BDA). Kept as 00s. https://stanislavs.org/helppc/bios_data_area.html  https://wiki.osdev.org/Memory_Map_(x86)  http://www.bioscentral.com/misc/bda.htm
+ * 0x00500...0x00540     +0x40  BIOS/DOS data area. Kept as 00s. https://stanislavs.org/helppc/bios_data_area.html
+ * 0x00540...0x00640    +0x100  INT_HLT_PARA. hlt instructions for interrupt entry points. Needed for getting the interrupt number in KVM_EXIT_HLT.
+ * 0x00640...0x00ff0    +0xabc  ENV_PARA. Environment variables and program pathname.
+ * 0x00ff0...0x01000     +0x10  PROGRAM_MCB_PARA. Memory Control Block (MCB) of PSP.
  * 0x01000...0x01100    +0x100  PSP_PARA. Program Segment Prefix (PSP).
  * 0x01100...0xa0000  +0x9ef00  Loaded program image, .bss and stack. This region is called ``conventional memory''.
  * 0xa0000                  +0  DOS_ALLOC_PARA_LIMIT and DOS_MEM_LIMIT.
@@ -77,6 +75,8 @@
  * 0xffffe                +0x1  ROM machine ID
  */
 
+#define INT_HLT_PARA 0x54
+
 /* Start of Program Segment Prefix (PSP) in paragraphs (unit of 16 bytes).
  * It must be at leasge GUEST_MEM_MODULE_START >> 4, otherwise it isn't
  * writable by the program.
@@ -90,7 +90,7 @@
 #define PROGRAM_MCB_PARA (PSP_PARA - 1)
 
 /* Environment starts at this paragraph. */
-#define ENV_PARA 0x50
+#define ENV_PARA 0x64
 /* How long the environment can be. */
 #define ENV_LIMIT (PROGRAM_MCB_PARA << 4)
 
@@ -102,7 +102,7 @@
 #define GUEST_MEM_MODULE_START 0x1000
 
 /* Points to 0x40:int_num, pointer encoded as cs:ip. */
-#define MAGIC_INT_VALUE(int_num) (0x400000U | (unsigned)int_num)
+#define MAGIC_INT_VALUE(int_num) ((unsigned)INT_HLT_PARA << 16 | (unsigned)int_num)
 
 /* Maximum byte offset where the program (including .bss and stack) can end.
  * 640 KiB should be enough for everyone :-).
@@ -689,7 +689,7 @@ int main(int argc, char **argv) {
   /* Fill magic interrupt table. */
   { unsigned u;
     for (u = 0; u < 0x100; ++u) { ((unsigned*)mem)[u] = MAGIC_INT_VALUE(u); }
-    memset((char*)mem + 0x400, 0xf4, 256);  /* 256 hlt instructions, one for each int. */
+    memset((char*)mem + (INT_HLT_PARA << 4), 0xf4, 0x100);  /* 256 hlt instructions, one for each int. TODO(pts): Is hlt+iret faster? */
   }
   /* !! Initialize BIOS data area until 0x534, move magic interrupt table later.
    * https://stanislavs.org/helppc/bios_data_area.html
@@ -802,7 +802,7 @@ int main(int argc, char **argv) {
       fprintf(stderr, "fatal: shutdown\n");
       exit(252);
      case KVM_EXIT_HLT:
-      if ((unsigned)sregs.cs.selector == 0x40 && (unsigned)((unsigned)regs.rip - 1) < 0x100) {  /* hlt caused by int through our magic interrupt table. */
+      if ((unsigned)sregs.cs.selector == INT_HLT_PARA && (unsigned)((unsigned)regs.rip - 1) < 0x100) {  /* hlt caused by int through our magic interrupt table. */
         const unsigned char int_num = ((unsigned)regs.rip - 1) & 0xff;
         const unsigned short *csip_ptr = (const unsigned short*)((char*)mem + ((unsigned)sregs.ss.selector << 4) + (*(unsigned short*)&regs.rsp));  /* !! What if rsp wraps around 64 KiB boundary? Test it. Also calculate int_cs again. */
         const unsigned short int_ip = csip_ptr[0], int_cs = csip_ptr[1];  /* Return address. */  /* !! Security: check bounds, also check that rsp <= 0xfffe. */
