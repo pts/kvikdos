@@ -802,6 +802,7 @@ int main(int argc, char **argv) {
   had_get_int0 = 0;
   tick_count = 0;
   sphinx_cmm_flags = 0;
+  dir_state.drive = 'C';
   dir_state.current_dir[0][0] = '\0';
   dir_state.current_dir[1][0] = '\0';
   dir_state.current_dir[2][0] = '\0';
@@ -946,7 +947,7 @@ int main(int argc, char **argv) {
             *(unsigned short*)&regs.rcx = tm->tm_year + 1900;
             *(unsigned short*)&regs.rdx = (tm->tm_mon + 1) << 8 | tm->tm_mday;
           } else if (ah == 0x19) {  /* Get current drive. */
-            *(unsigned char*)&regs.rax = 'C' - 'A';
+            *(unsigned char*)&regs.rax = dir_state.drive - 'A';
           } else if (ah == 0x47) {  /* Get current directory. */
             /* Input: DL: 0 = current drive, 1: A: */
             if (*(unsigned char*)&regs.rdx != 0) {
@@ -1310,6 +1311,11 @@ int main(int argc, char **argv) {
               fprintf(stderr, "fatal: unimplemented: set file attributes: attr=0x%04x filename=%s\n", *(unsigned short*)&regs.rcx, fn);
               goto fatal;
             }
+          } else if (ah == 0x0e) {  /* Select disk. */
+            /* TODO(pts): Use the default drive specified here (dl + 'A') in get_linux_filename_r(...). */
+            const unsigned char dl = (unsigned char)regs.rdx;
+            if (dl < 4 && dir_state.linux_mount_dir[dl]) dir_state.drive = dl + 'A';
+            *(unsigned char*)&regs.rax = 26;  /* 26 drives: 'A' .. 'Z'. */
           } else if (ah == 0x63) {  /* Get lead byte table. Multibyte support in MS-DOS 2.25. */
             *(unsigned short*)&regs.rax = 1;  /* Invalid function number. */
             goto error_on_21;
