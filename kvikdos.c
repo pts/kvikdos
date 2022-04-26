@@ -742,7 +742,7 @@ int main(int argc, char **argv) {
       env = add_env(env, env_end, *envp0++, 1);
     }
     env = add_env(env, env_end, "", 0);  /* Empty var marks end of env. */
-    env = add_env(env, env_end, ".", 0);  /* Just skip 2 bytes, DOSBox also does it. */
+    env = add_env(env, env_end, "\1", 0);  /* Number of subsequent variables (1). */
     env = add_env(env, env_end, prog_dos_pathname, 0);  /* Full program pathname. */
   }
 
