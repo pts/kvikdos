@@ -25,6 +25,58 @@
 #define MEM_SIZE (2 << 20)  /* In bytes. 2 MiB. */
 #endif
 
+/* Memory map for kvikdos:
+ *
+ * 0x00000...0x00000    +0x400  Interrupt vector table (IVT).
+ * 0x00400...0x00500    +0x100  BIOS data area (BDA). https://stanislavs.org/helppc/bios_data_area.html  https://wiki.osdev.org/Memory_Map_(x86)  http://www.bioscentral.com/misc/bda.htm
+ *                              !! Used for hlt instructions for interrupt entry points.
+ *                              !! Populate this.
+ * 0x00500...0x00534     +0x34  ENV_PARA. BIOS/DOS data area. https://stanislavs.org/helppc/bios_data_area.html
+ *                              !! Used for environment variables and program pathname.
+ * 0x00534...0x00ff0    +0xabc  Remaining environment varialbes and program pathname.
+ * 0x00ff0...0x01000     +0x10  Memory Control Block (MCB) of PSP.
+ * 0x01000...0x01100    +0x100  PSP_PARA. Program Segment Prefix (PSP).
+ * 0x01100...0xa0000  +0x9ef00  Loaded program image, .bss and stack. This region is called ``conventional memory''.
+ * 0xa0000                  +0  DOS_ALLOC_PARA_LIMIT and DOS_MEM_LIMIT.
+ *
+ * On a normal machine, there is also EBDA which ends at 0xa0000. You can
+ * determine the size of the EBDA by using BIOS function `int 0x12', or by
+ * examining the word at 0x413 in the BDA. Both of those methods
+ * will tell you how much conventional memory is usable before the EBDA.
+ *
+ * Some other memory areas on a normal machine:
+ *
+ * 0xa0000.. 0xfffff            Upper memory block (UMB).
+ * 0xffff0..0x10fff0  +0x10000  High memory area (HMA).
+ * 0xa0000...0xc0000  +0x20000  Video display memory
+ * 0xc0000...0xc8000  +0x08000  Video BIOS (ROM)
+ * 0xc8000...0xf0000  +0x28000  BIOS Expansions (ROM)
+ * 0xf0000.. 0xfffff  +0x10000  Motherboard BIOS.
+ * 0xa0000                      EGA/VGA RAM for graphics display mode 0Dh & above
+ * 0xb0000                      MDA RAM, Hercules graphics display RAM
+ * 0xb8000                      CGA display RAM
+ * 0xc0000                      EGA/VGA BIOS ROM (thru C7FF)
+ * 0xc4000                      Video adapter ROM space
+ * 0xc6000              +0x100  PGA communication area
+ * 0xc8000                +16K  Hard disk adapter BIOS ROM
+ * 0xc8005                      XT Hard disk ROM format, AH=Drive, AL=Interleave
+ * 0xd0000                +32K  luster adapter BIOS ROM
+ * 0xd8000                      PCjr conventionalsoftware cartridge address
+ * 0xe0000                +64K  Expansion ROM space (hardwired on AT+)
+ *                       +128K  PS/2 System ROM (thru 0xf0000)
+ * 0xf0000                      System monitor ROM
+ *                              PCjr: software cartridge override address
+ * 0xf4000                      System expansion ROMs
+ * 0xf6000                      IBM ROM BASIC (AT)
+ * 0xf8000                      PCjr software cartridge override address
+ * 0xfc000                      BIOS ROM
+ * 0xff000                      System ROM
+ * 0xfFa6e                      ROM graphics character table
+ * 0xffff0                      ROM bootstrap code == soft reset. Ctl-Alt-<Del> or JMP FFFF:0.
+ * 0xffff5                +0x8  ROM date (not applicable for all clones)
+ * 0xffffe                +0x1  ROM machine ID
+ */
+
 /* Start of Program Segment Prefix (PSP) in paragraphs (unit of 16 bytes).
  * It must be at leasge GUEST_MEM_MODULE_START >> 4, otherwise it isn't
  * writable by the program.
