@@ -638,6 +638,18 @@ int main(int argc, char **argv) {
                     argv[0]);
     exit(252);
   }
+
+  dir_state.drive = 'C';
+  dir_state.current_dir[0][0] = '\0';
+  dir_state.current_dir[1][0] = '\0';
+  dir_state.current_dir[2][0] = '\0';
+  dir_state.current_dir[3][0] = '\0';
+  dir_state.dos_prog_abs = NULL;  /* For security, use dos_prog_abs mapping only for read-only opens below. */
+  dir_state.linux_mount_dir[0] = NULL;
+  dir_state.linux_mount_dir[1] = NULL;
+  dir_state.linux_mount_dir[2] = "";  /* By default: --mount=C:. */
+  dir_state.linux_mount_dir[3] = NULL;
+
   envp = envp0 = ++argv;
   while (argv[0]) {
     char *arg = *argv++;
@@ -651,13 +663,46 @@ int main(int argc, char **argv) {
         exit(1);
       }
       *envp++ = *argv++;  /* Reuse the argv array. */
-    } else if (0 == strncmp(arg, "--env=", 6)) {
+    } else if (0 == strncmp(arg, "--env=", 6)) {  /* Can be specified multiple times. */
       *envp++ = arg + 6;  /* Reuse the argv array. */
     } else if (0 == strcmp(arg, "--prog")) {
       if (!argv[0]) goto missing_argument;
-      dos_prog_abs = *argv++;
+      arg = *argv++;
+     do_prog:
+      dos_prog_abs = arg;
     } else if (0 == strncmp(arg, "--prog=", 7)) {
-      dos_prog_abs = arg + 7;
+      arg += 7;
+      goto do_prog;
+    } else if (0 == strcmp(arg, "--mount")) {  /* Can be specified multiple times. */
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+     do_mount:  /* Default: --mount C:. */
+      if ((arg[0] & ~32) - 'A' + 0U > 'D' - 'A' + 0U || arg[1] != ':') {
+        fprintf(stderr, "fatal: mount argument must with <drive>:, <drive> must be A, B, C or D: %s\n", arg);
+        exit(1);
+      } else {
+        const char drive_idx = (arg[0] & ~32) - 'A';
+        arg += 2;
+        if (DEBUG) fprintf(stderr, "debug: mount %c: %s\n", drive_idx + 'A', arg);
+        while (arg[0] == '.' && arg[1] == '/') {
+          arg += 2;
+          for (; arg[0] == '/'; ++arg) {}
+        }
+        if (arg[0] == '.' && arg[1] == '\0') {
+          ++arg;
+        } else if (arg[0] != '\0') {
+          char *p = arg + strlen(arg);
+          if (arg[1] != '\0' && p[-1] == '.' && p[-2] == '/') *--p = '\0';  /* Remove trailing . if it ends with /. */
+          if (p[-1] != '/') {
+            fprintf(stderr, "fatal: mount directory target must end with /: %s\n", arg);
+            exit(1);
+          }
+        }
+        dir_state.linux_mount_dir[(unsigned)drive_idx] = arg;  /* argv retains ownership of arg. */
+      }
+    } else if (0 == strcmp(arg, "--mount=")) {
+      arg += 8;
+      goto do_mount;
     } else {
       fprintf(stderr, "fatal: unknown command-line flag: %s\n", arg);
       exit(1);
@@ -802,16 +847,6 @@ int main(int argc, char **argv) {
   had_get_int0 = 0;
   tick_count = 0;
   sphinx_cmm_flags = 0;
-  dir_state.drive = 'C';
-  dir_state.current_dir[0][0] = '\0';
-  dir_state.current_dir[1][0] = '\0';
-  dir_state.current_dir[2][0] = '\0';
-  dir_state.current_dir[3][0] = '\0';
-  dir_state.linux_mount_dir[0] = NULL;
-  dir_state.linux_mount_dir[1] = NULL;
-  dir_state.linux_mount_dir[2] = "";  /* Same as "./", for C:\ */
-  dir_state.linux_mount_dir[3] = NULL;
-  dir_state.dos_prog_abs = NULL;  /* For security, use dos_prog_abs mapping only for read-only opens below. */
   dir_state.linux_prog = prog_filename;
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
 
