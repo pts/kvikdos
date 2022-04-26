@@ -118,16 +118,80 @@
 
 #define PROCESS_ID  0x192  /* Same as in DOSBox. */
 
+#define MCB_TYPE(mcb) (*(char*)(mcb))  /* 'Z' indicates last member of MCB chain; 'M' would be non-last. */
+#define MCB_PID(mcb) (*(unsigned short*)((char*)(mcb) + 1)) /* 0 indicates free block, PROCESS_ID indicates used block. */
+#define MCB_SIZE_PARA(mcb) (*(unsigned short*)((char*)(mcb) + 3))  /* Block size in paragraphs (excluding MCB), must be at least 1 in kvikdos. */
+#define MCB_PSIZE_PARA(mcb) (*(unsigned short*)((char*)(mcb) + 5))  /* Size of previous block (excluding MCB), or 0 if this is the first block. This is a kvikdos-specific field, DOS doesn't specify it. */
+
 /* https://stanislavs.org/helppc/memory_control_block.html */
 static const char default_program_mcb[16] = {
     'Z',  /* 'Z' indicates last member of MCB chain; 'M' would be non-last. */
     (char)PROCESS_ID,  /* \0\0 indicates free block. */
     (char)(PROCESS_ID >> 8),
-    (char)((DOS_MEM_LIMIT >> 4) - PSP_PARA),  /* Number of paragraphs low byte. */
-    (char)(((DOS_MEM_LIMIT >> 4) - PSP_PARA)) >> 8,  /* Number of paragraphs high byte. */
-    (char)0xc6, (char)0x88, (char)0xb2,  /* Reserved bytes, random. */
+    (char)(DOS_ALLOC_PARA_LIMIT - PSP_PARA),  /* Number of paragraphs low byte. */
+    (char)((DOS_ALLOC_PARA_LIMIT - PSP_PARA) >> 8),  /* Number of paragraphs high byte. */
+    0, 0,  /* Size of previous block. Unused for PROGRAM_MCB_PARA. */
+    (char)0xb2,  /* Reserved bytes, random. */
     'K', 'V', '1', 'K', 'P', 'R', '0', 'G',  /* "KV1KPR0G". Program name. */
 };
+
+static const char freed_mcb[16] = {
+    '\x88', '\xc9', '\xc0', '\x96', '\x1e', '\xc4', '\x42', '\xd5',  /* Random bytes, part of signature. */
+    'K', 'V', '1', 'K', 'F', 'R', '3', '3',  /* "KV1KFR33". Program name signature. */
+};
+
+static char is_mcb_bad(void *mem, unsigned short block_para) {
+  const char* mcb = (const char*)mem + (block_para << 4) - 16;
+  unsigned short size_para;
+  if (block_para < PSP_PARA) return 1;  /* MCB too low in memory. qblink.exe calls with block_para==0 many times, but it's still bad. */
+  if (block_para >= DOS_ALLOC_PARA_LIMIT) return 2;  /* MCB too high in memory. */
+  if (memcmp(mcb + 7, default_program_mcb + 7, 9) != 0) return 3;  /* MCB has bad signature. */
+  if (MCB_TYPE(mcb) == 'Z') {
+    if (MCB_PID(mcb) == 0) return 4;  /* Last MCB is free. */
+  } else if (MCB_TYPE(mcb) != 'M') {
+    return 5;  /* Bad MCB type. */
+  }
+  if (MCB_PID(mcb) != 0 && MCB_PID(mcb) != PROCESS_ID) return 6;  /* Bad MCB process ID. */
+  size_para = MCB_SIZE_PARA(mcb);
+  if (MCB_TYPE(mcb) == 'Z') {
+    if (block_para + size_para > DOS_ALLOC_PARA_LIMIT) return 7;  /* Final MCB too long. */
+  } else {
+    const char * const next_mcb = mcb + 16 + (size_para << 4);
+    if (block_para + size_para >= DOS_ALLOC_PARA_LIMIT) return 8;  /* Non-final MCB too long. */
+    if (MCB_PSIZE_PARA(next_mcb) != size_para) return 9;  /* MCB size and next psize mismatch. */
+    if (MCB_PID(mcb) == 0 && MCB_PID(next_mcb) == 0) return 10;  /* found adjacent free MCBs in next. */
+  }
+  if (block_para == PSP_PARA) {
+    if (MCB_PSIZE_PARA(mcb) != 0) return 11;  /* Nonzero PSP MCB psize. */
+    if (MCB_PID(mcb) == 0) return 12;  /* PSP MCB is free. */
+  } else {
+    const char * const prev_mcb = mcb - 16 - (MCB_PSIZE_PARA(mcb) << 4);
+    if (block_para < PSP_PARA + 1 + MCB_PSIZE_PARA(prev_mcb)) return 13;  /* MCB psize too large. */
+    if (MCB_TYPE(prev_mcb) != 'M') return 14;  /* Bad prev MCB type. */
+    if (MCB_SIZE_PARA(prev_mcb) != MCB_PSIZE_PARA(mcb)) return 15;  /* MCB prev size and psize mismatch. */
+    if (MCB_PID(mcb) == 0 && MCB_PID(prev_mcb) == 0) return 16;  /* Found adjacent free MCBs in prev. */
+  }
+  return 0;  /* MCB looks good. */
+}
+
+#if DEBUG
+static void check_all_mcbs(void *mem) {
+  unsigned block_para = PSP_PARA;
+  for (;;) {
+    const char mcb_error = is_mcb_bad(mem, block_para);
+    const char * const mcb = (const char*)mem + (block_para << 4) - 16;
+    if (mcb_error) {
+      fprintf(stderr, "fatal: bad MCB for block_para=0x%04x: %d\n", block_para, mcb_error);
+      exit(252);
+    }
+    if (MCB_TYPE(mcb) == 'Z') break;
+    block_para += 1 + MCB_SIZE_PARA(mcb);
+  }
+}
+#define DEBUG_CHECK_ALL_MCBS(mem) check_all_mcbs(mem)
+#else
+#define DEBUG_CHECK_ALL_MCBS(mem) do {} while (0)
+#endif
 
 static char is_same_ascii_nocase(const char *a, const char *b, unsigned size) {
   while (size-- != 0) {
@@ -236,7 +300,7 @@ static const unsigned char fixed_exepack_stub[283] = {
  * detect_dos_executable_program. Returns the psp (Program Segment Prefix)
  * address.
  */
-static char *load_dos_executable_program(int img_fd, const char *filename, void *mem, const char *header, int header_size, struct kvm_regs *regs, struct kvm_sregs *sregs) {
+static char *load_dos_executable_program(int img_fd, const char *filename, void *mem, const char *header, int header_size, struct kvm_regs *regs, struct kvm_sregs *sregs, unsigned short *block_size_para_out) {
   char *psp;
   if (header_size >= PROGRAM_HEADER_SIZE && (('M' | 'Z' << 8) == ((unsigned short*)header)[EXE_SIGNATURE] || ('M' << 8 | 'Z') == ((unsigned short*)header)[EXE_SIGNATURE])) {
     const unsigned short * const exehdr = (const unsigned short*)header;
@@ -303,6 +367,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     *(unsigned*)&regs->rsp = exehdr[EXE_SP];
     sregs->ss.selector = exehdr[EXE_SS] + image_para;
     *(unsigned*)(psp + 6) = 0xc0;  /* CP/M far call 5 service request address. Obsolete. */
+    *block_size_para_out = (memsize >> 4) + 0x10;  /* Including PSP. */
     if (exehdr[EXE_IP] == 16 || exehdr[EXE_IP] == 18) {  /* Detect exepack, find decompression stub within it, replace stub with fixed stub to avoid ``Packed file is corrupt'' error. DOS 5.0 does a similar fix. */
       /* More info about the A20 bug in the exepack stubs: https://github.com/joncampbell123/dosbox-x/issues/7#issuecomment-667653041
        * More info about the exepack file format: https://www.bamsoftware.com/software/exepack/
@@ -358,6 +423,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     *(unsigned short*)(psp + 6) = MAX_DOS_COM_SIZE + 0x100;  /* .COM bytes available in segment (CP/M). DOSBox doesn't initialize it. */
     /*memset(psp, 0, 0x100);*/  /* Not needed, mmap MAP_ANONYMOUS has done it. */
     *(unsigned*)&regs->rip = 0x100;  /* DOS .com entry point. */
+    *block_size_para_out = 0x1000;  /* 65536 bytes, including PSP. */
   }
   /* https://stanislavs.org/helppc/program_segment_prefix.html */
   *(unsigned short*)(psp + 2) = DOS_MEM_LIMIT >> 4;  /* Top of memory. */
@@ -506,18 +572,6 @@ static char *add_env(char *env, char *env_end, const char *var, char do_check) {
   return env;
 }
 
-static char is_mcb_bad(void *mem, unsigned short block_para) {
-  const char* mcb = (const char*)mem + (block_para << 4) - 16;
-  unsigned block_end_para;
-  if (block_para == 0) return 1;  /* qblink.exe calls with block_para==0 many times. */
-  if (mcb[0] != 'M' && mcb[0] != 'Z') return 2;
-  if (*(const unsigned short*)(mcb + 1) != 0 && *(const unsigned short*)(mcb + 1) != PROCESS_ID) return 3;
-  block_end_para = block_para + *(const unsigned short*)(mcb + 3);
-  if (block_end_para > DOS_ALLOC_PARA_LIMIT) return 4;
-  if (memcmp(mcb + 5, default_program_mcb + 5, 11) != 0) return 5;
-  return 0;  /* MCB looks good. */
-}
-
 int main(int argc, char **argv) {
   struct kvm_fds kvm_fds;
   void *mem;
@@ -534,7 +588,6 @@ int main(int argc, char **argv) {
   char *prog_dos_pathname = "C:\\PROG.COM";
   unsigned tick_count;
   unsigned char sphinx_cmm_flags;
-  unsigned last_heap_block_para, last_heap_block_end_para, base_heap_block_end_para;
 
   (void)argc;
   if (!argv[0] || !argv[1] || 0 == strcmp(argv[1], "--help")) {
@@ -670,7 +723,8 @@ int main(int argc, char **argv) {
   regs.rflags = 1 << 1;  /* Reserved bit. */
   /*regs.rflags |= 1 << 9;*/  /* IF=1, enable interrupts. */
 
-  { char *psp = load_dos_executable_program(img_fd, filename, mem, header, header_size, &regs, &sregs);
+  memcpy((char*)mem + (PROGRAM_MCB_PARA << 4), default_program_mcb, 16);
+  { char *psp = load_dos_executable_program(img_fd, filename, mem, header, header_size, &regs, &sregs, &MCB_SIZE_PARA((char*)mem + (PROGRAM_MCB_PARA << 4)));
     copy_args_to_dos_args(psp + 0x80, argv);
   }
   close(img_fd);
@@ -692,8 +746,6 @@ int main(int argc, char **argv) {
     env = add_env(env, env_end, prog_dos_pathname, 0);  /* Full program pathname. */
   }
 
-  memcpy((char*)mem + (PROGRAM_MCB_PARA << 4), default_program_mcb, 16);
-
 /* We have to set both selector and base, otherwise it won't work. A `mov
  * ds, ax' instruction in the 16-bit KVM guest will set both.
  */
@@ -708,9 +760,6 @@ int main(int argc, char **argv) {
   had_get_int0 = 0;
   tick_count = 0;
   sphinx_cmm_flags = 0;
-  /* Initially there is only a single heap block: the program image (starting with PSP). We remember it so that the program can resize it using int 0x21 ah == 0x4a. */
-  last_heap_block_para = PSP_PARA;
-  base_heap_block_end_para = last_heap_block_end_para = DOS_ALLOC_PARA_LIMIT;
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
 
   if (DEBUG) dump_regs("debug", &regs, &sregs);
@@ -973,71 +1022,220 @@ int main(int argc, char **argv) {
               fprintf(stderr, "fatal: unsupported DOS ioctl call: 0x%02x\n", al);
               goto fatal;
             }
-          } else if (ah == 0x4a) {  /* Modify allocated memory block (realloc()). */
+          } else if (ah == 0x4a) {  /* Modify allocated memory block (inplace_realloc()). */
             const unsigned new_size_para = *(unsigned short*)&regs.rbx;
-            unsigned short *size_para_ptr;
             const unsigned short block_para = sregs.es.selector;
-            unsigned available_para;
-            if (is_mcb_bad(mem, block_para)) { error_bad_mcb:
+            unsigned available_para, old_size_para;
+            char * const mcb = (char*)mem + (block_para << 4) - 16;
+            char *next_mcb;
+            if (is_mcb_bad(mem, block_para) || MCB_PID(mcb) == 0) {
+              if (DEBUG) fprintf(stderr, "debug: inplace_realloc bad block_para=0x%04x new_size_para=0x%04x\n", block_para, new_size_para);
+             error_bad_mcb:
               /*fprintf(stderr, "fatal: bad MCB\n"); goto fatal;*/
               *(unsigned short*)&regs.rax = 7;  /* Memory control blocks destroyed. */
               goto error_on_21;
             }
-            if (DEBUG) fprintf(stderr, "debug: realloc block_para=0x%04x new_size_para=0x%04x\n", block_para, new_size_para);
-            if (block_para != last_heap_block_para) {
-              /*fprintf(stderr, "fatal: unsupported block resize: old_para=0x%04x new_size_para=0x%04x\n", block_para, new_size_para);*/
-              /*goto fatal;*/
-              *(unsigned short*)&regs.rbx = 1;  /* We don't know how large it was. */
-              goto error_insufficient_memory;
+            if (DEBUG) fprintf(stderr, "debug: inplace_realloc block_para=0x%04x new_size_para=0x%04x\n", block_para, new_size_para);
+            DEBUG_CHECK_ALL_MCBS(mem);  /* No need, the is_mcb_bad calls below do all the checks. */
+            old_size_para = MCB_SIZE_PARA(mcb);
+            if (old_size_para != new_size_para) {
+              next_mcb = MCB_TYPE(mcb) != 'Z' ? (mcb + 16 + (old_size_para << 4)) : NULL;
+              if (next_mcb && is_mcb_bad(mem, block_para + 1 + old_size_para)) goto error_bad_mcb;
+              available_para = !next_mcb ? (unsigned)(DOS_ALLOC_PARA_LIMIT - block_para) : MCB_PID(next_mcb) != 0 ? old_size_para : old_size_para + 1 + MCB_SIZE_PARA(next_mcb);
+              if (new_size_para > available_para) {
+                *(unsigned short*)&regs.rbx = available_para;
+               error_insufficient_memory:
+                *(unsigned short*)&regs.rax = 8;  /* Insufficient memory. */
+                goto error_on_21;
+              }
+              if (DEBUG) fprintf(stderr, "debug: inplace_realloc block_para=0x%04x new_size_para=0x%04x available_para=0x%04x\n", block_para, new_size_para, available_para);
+              if (!next_mcb) {
+                MCB_SIZE_PARA(mcb) = new_size_para;
+              } else if (MCB_PID(next_mcb) != 0) {  /* Insert a free block after the current block. */
+                char * const free_mcb = mcb + 16 + (new_size_para << 4);
+                memcpy(free_mcb, default_program_mcb, 16);
+                MCB_TYPE(free_mcb) = 'M';
+                MCB_PID(free_mcb) = 0;  /* Mark as free. */
+                MCB_SIZE_PARA(free_mcb) = MCB_PSIZE_PARA(next_mcb) = old_size_para - new_size_para - 1;
+                MCB_PSIZE_PARA(free_mcb) = MCB_SIZE_PARA(mcb) = new_size_para;
+              } else if (new_size_para == available_para) {  /* Exact size match. Merge the following free block into the current block. */
+                const unsigned next_mcb_size_para = MCB_SIZE_PARA(next_mcb);
+                memset(next_mcb, 0, 16);
+                next_mcb = next_mcb + 16 + (next_mcb_size_para << 4);
+                MCB_PSIZE_PARA(next_mcb) = MCB_SIZE_PARA(mcb) = available_para;
+              } else {  /* Make the following free block smaller or larger. */
+                char * const next_mcb2 = mcb + 16 + (new_size_para << 4);
+                memcpy(next_mcb2, default_program_mcb, 16);
+                MCB_TYPE(next_mcb2) = 'M';
+                MCB_PID(next_mcb2) = 0;  /* Mark as free. */
+                MCB_PSIZE_PARA(next_mcb + 16 + (MCB_SIZE_PARA(next_mcb) << 4)) =
+                    MCB_SIZE_PARA(next_mcb2) = MCB_SIZE_PARA(next_mcb) + old_size_para - new_size_para;
+                MCB_PSIZE_PARA(next_mcb2) = MCB_SIZE_PARA(mcb) = new_size_para;
+                memset(next_mcb, 0, 16);
+              }
+              if (is_mcb_bad(mem, block_para)) {
+                fprintf(stderr, "fatal: bad MCB after inplace_realloc()\n");
+                exit(252);
+              }
+              if (next_mcb && is_mcb_bad(mem, available_para = block_para + 1 + MCB_SIZE_PARA((char*)mem + (block_para << 4) - 16))) {
+                fprintf(stderr, "fatal: bad next/free MCB after inplace_realloc(): %d\n", is_mcb_bad(mem, available_para));
+                exit(252);
+              }
             }
-            available_para = DOS_ALLOC_PARA_LIMIT - last_heap_block_para;
-            if (new_size_para >= available_para) {  /* == means there no room for the new MCB. */
-              *(unsigned short*)&regs.rbx = available_para - (available_para > 0);
-             error_insufficient_memory:
-              *(unsigned short*)&regs.rax = 8;  /* Insufficient memory. */
-              goto error_on_21;
-            }
-            if (DEBUG) fprintf(stderr, "debug: realloc block_para=0x%04x new_size_para=0x%04x OK\n", block_para, new_size_para);
-            size_para_ptr = (unsigned short*)((char*)mem + (last_heap_block_para << 8) + (3 - 16));
-            *size_para_ptr = new_size_para;  /* Change size in MCB. */
-            last_heap_block_end_para = last_heap_block_para + new_size_para;
-            if (last_heap_block_para == PSP_PARA) base_heap_block_end_para = last_heap_block_end_para;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x48) {  /* Allocate memory (malloc()). */
-            const unsigned size_para = *(unsigned short*)&regs.rbx;
-            const unsigned available_para = DOS_ALLOC_PARA_LIMIT - last_heap_block_end_para;
-            char *mcb;
-            if (DEBUG) fprintf(stderr, "debug: malloc(0x%04x)\n", size_para);
-            if (size_para >= available_para) {
-              *(unsigned short*)&regs.rbx = available_para - (available_para > 0);
-              goto error_insufficient_memory;
+            const unsigned alloc_size_para = *(unsigned short*)&regs.rbx;
+            if (DEBUG) fprintf(stderr, "debug: malloc(0x%04x)\n", alloc_size_para);
+            /*DEBUG_CHECK_ALL_MCBS(mem);*/  /* No need, the is_mcb_bad calls below do all the checks. */
+            {
+              unsigned best_fit_waste_para = (unsigned)-1;
+              unsigned best_fit_block_para = 0;
+              unsigned best_fit_prev_block_para = 0;  /* Preceding block. */
+              unsigned largest_available_para = 0;
+              { /* Try to find best match. */
+                unsigned block_para = PSP_PARA, prev_block_para = 0;
+                for (;;) {
+                  const char * const mcb = (const char*)mem + (block_para << 4) - 16;
+                  unsigned size_para;
+                  if (is_mcb_bad(mem, block_para)) goto error_bad_mcb;
+                  if (DEBUG) fprintf(stderr, "debug: malloc find block=0x%04x...0x%04x size=0x%04x psize=0x%04x mcb_type=%c is_used=%d\n", block_para, block_para + MCB_SIZE_PARA(mcb), MCB_SIZE_PARA(mcb), MCB_PSIZE_PARA(mcb), MCB_TYPE(mcb), MCB_PID(mcb) != 0);
+                  size_para = MCB_SIZE_PARA(mcb);
+                  if (MCB_TYPE(mcb) == 'Z') {  /* Last block (must be non-free), try afterwards. */
+                    prev_block_para = block_para;
+                    block_para += 1 + size_para;
+                    if (block_para == DOS_ALLOC_PARA_LIMIT + 1) break;  /* There is nothing after the last block. */
+                    size_para = DOS_ALLOC_PARA_LIMIT - block_para;
+                    goto try_fit;
+                  } else if (MCB_PID(mcb) == 0) {  /* A free block. */
+                   try_fit:
+                    if (size_para >= alloc_size_para) {
+                      const unsigned waste_para = size_para - alloc_size_para;
+                      if (DEBUG) fprintf(stderr, "debug: malloc fit prev_block=0x%04x block=0x%04x waste=0x%04x\n", prev_block_para, block_para, waste_para);
+                      if (waste_para < best_fit_waste_para) {
+                        best_fit_waste_para = waste_para;
+                        best_fit_block_para = block_para;
+                        best_fit_prev_block_para = prev_block_para;
+                      }
+                    } else if (size_para > largest_available_para) {
+                      largest_available_para = size_para;
+                    }
+                    if (MCB_PID(mcb) != 0) break;  /* Last block (non-free). */
+                  }
+                  prev_block_para = block_para;
+                  block_para += 1 + size_para;
+                }
+              }
+              if (best_fit_waste_para == (unsigned)-1) {
+                *(unsigned short*)&regs.rbx = largest_available_para - (largest_available_para > 0);
+                goto error_insufficient_memory;
+              } else {
+                char * const prev_mcb = (char*)mem + (best_fit_prev_block_para << 4) - 16;
+                char * const mcb = (char*)mem + (best_fit_block_para << 4) - 16;
+                char * const free_mcb = (char*)mem + ((best_fit_block_para + alloc_size_para) << 4);
+                char mcb_error;
+                if (MCB_TYPE(prev_mcb) == 'Z') {  /* Append after last block. */
+                  if (DEBUG) {
+                    fprintf(stderr, "debug: malloc append prev_block=0x%04x block=0x%04x free=0x%04x\n",
+                            best_fit_prev_block_para, best_fit_block_para, best_fit_block_para + alloc_size_para + 1);
+                  }
+                  memcpy(mcb, default_program_mcb, 16);
+                  /*MCB_TYPE(mcb) = 'Z';*/  /* Already set. */
+                  /*MCB_PID(mcb) = PROCESS_ID;*/  /* Already set. */
+                  MCB_TYPE(prev_mcb) = 'M';
+                  MCB_SIZE_PARA(mcb) = alloc_size_para;
+                  MCB_PSIZE_PARA(mcb) = MCB_SIZE_PARA(prev_mcb);
+                } else {  /* Change existing free block. */
+                  char * const next_mcb = mcb + (MCB_SIZE_PARA(mcb) << 4) + 16;
+                  MCB_PID(mcb) = PROCESS_ID;  /* Mark as in use. */
+                  if (DEBUG) {
+                    fprintf(stderr, "debug: malloc middle prev_block=0x%04x block=0x%04x next=0x%04x free=0x%04x is_exact_fit=%d\n",
+                            best_fit_prev_block_para, best_fit_block_para, best_fit_block_para + MCB_SIZE_PARA(mcb) + 1, best_fit_block_para + alloc_size_para + 1,
+                            best_fit_block_para + MCB_SIZE_PARA(mcb) + 1 == best_fit_block_para + alloc_size_para + 1);
+                  }
+                  if (free_mcb == next_mcb) {  /* Exact fit. */
+                    if (DEBUG) fprintf(stderr, "debug: malloc exact fit\n");
+                  } else {  /* Not an exact fit, append a free block. */
+                    const unsigned size_para = MCB_SIZE_PARA(mcb);
+                    memcpy(free_mcb, default_program_mcb, 16);
+                    /*MCB_TYPE(mcb) = 'M';*/  /* Not needed, already set. */
+                    MCB_PSIZE_PARA(free_mcb) = MCB_SIZE_PARA(mcb) = alloc_size_para;
+                    /* MCB_PSIZE_PARA(mcb) is already correct. */
+                    MCB_TYPE(free_mcb) = 'M';
+                    MCB_PID(free_mcb) = 0;
+                    MCB_PSIZE_PARA(next_mcb) = MCB_SIZE_PARA(free_mcb) = size_para - alloc_size_para - 1;
+                    mcb_error = is_mcb_bad(mem, best_fit_block_para + alloc_size_para + 1);
+                    if (mcb_error) {  /* free_mcb. */
+                      fprintf(stderr, "fatal: bad free MCB after malloc(): %d\n", mcb_error);
+                      exit(252);
+                    }
+                  }
+                }
+                mcb_error = is_mcb_bad(mem, best_fit_block_para);
+                if (mcb_error) {
+                  fprintf(stderr, "fatal: bad MCB after malloc(): %d\n", mcb_error);
+                  exit(252);
+                }
+              }
+              if (DEBUG) fprintf(stderr, "debug: malloc(0x%04x) == 0x%04x\n", alloc_size_para, best_fit_block_para);
+              *(unsigned short*)&regs.rax = best_fit_block_para;  /* Insufficient memory. */
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             }
-            mcb = (char*)mem + (last_heap_block_end_para << 4);
-            memcpy(mcb, default_program_mcb, 16);
-            /* TODO(pts): Change mcb[0] = 'M' if it isn't the last. */
-            *(unsigned short*)(mcb + 3) = size_para;
-            *(unsigned short*)&regs.rax = last_heap_block_para = last_heap_block_end_para + 1;
-            if (DEBUG) fprintf(stderr, "debug: malloc(0x%04x) == 0x%04x\n", size_para, last_heap_block_para);
-            last_heap_block_end_para = last_heap_block_para + size_para;
-            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x49) {  /* Free allocated memory (free()). */
             const unsigned block_para = *(unsigned short*)&sregs.es.selector;
-            if (DEBUG) fprintf(stderr, "free(0x%04x)\n", block_para);
-            if ((block_para < base_heap_block_end_para) ? (block_para != 0) :  /* It's not allowed to free the program image. qblink.exe calls with block_para==0 many times. */
-                 is_mcb_bad(mem, block_para)) {
+            char *mcb = (char*)mem + (block_para << 4) - 16;
+            if (DEBUG) fprintf(stderr, "debug: free(0x%04x)\n", block_para);
+            DEBUG_CHECK_ALL_MCBS(mem);
+            if (block_para == PSP_PARA) {  /* It's not allowed to free the program image. */
+              goto error_invalid_parameter;
+            } else if (block_para > PSP_PARA && block_para < DOS_ALLOC_PARA_LIMIT && mcb[0] == freed_mcb[0] && memcmp(mcb, freed_mcb, 16) == 0) {  /* Already free, has been freed. Succeed as noop just like DOSBox 0.74 and MS-DOS 6.22 do. */
+              if (DEBUG) fprintf(stderr, "debug: free: already freed\n");
+            } else if (is_mcb_bad(mem, block_para)) {
+              if (DEBUG) fprintf(stderr, "debug: free: bad MCB para=0x%04x: %d\n", block_para, is_mcb_bad(mem, block_para));
               goto error_bad_mcb;
+            } else if (MCB_PID(mcb) == 0) {  /* Already free. Succeed as noop just like DOSBox 0.74 and MS-DOS 6.22 do. */
+              if (DEBUG) fprintf(stderr, "debug: free: already free\n");
+            } else if (is_mcb_bad(mem, block_para - MCB_PSIZE_PARA(mcb) - 1)) {
+              if (DEBUG) fprintf(stderr, "debug: free: bad prev MCB para=0x%04x: %d\n", block_para - MCB_PSIZE_PARA(mcb) - 1, is_mcb_bad(mem, block_para - MCB_PSIZE_PARA(mcb) - 1));
+              goto error_bad_mcb;
+            } else if (MCB_TYPE(mcb) != 'Z' && is_mcb_bad(mem, block_para + MCB_SIZE_PARA(mcb) + 1)) {
+              if (DEBUG) fprintf(stderr, "debug: free: bad next MCB para=0x%04x: %d\n", block_para + MCB_SIZE_PARA(mcb) + 1, is_mcb_bad(mem, block_para + MCB_SIZE_PARA(mcb) + 1));
+              goto error_bad_mcb;
+            } else {
+              char *prev_mcb = mcb - 16 - (MCB_PSIZE_PARA(mcb) << 4);  /* Always exists since block_para != PSP_PARA. */
+              char *next_mcb = mcb + 16 + (MCB_SIZE_PARA(mcb) << 4);
+              if (MCB_TYPE(mcb) != 'Z' && MCB_PID(next_mcb) == 0) {  /* Merge it with the following free block. */
+                char *next_mcb2 = next_mcb + 16 + (MCB_SIZE_PARA(next_mcb) << 4);
+                const unsigned next_para2 = block_para + MCB_SIZE_PARA(mcb) + 1 + MCB_SIZE_PARA(next_mcb) + 1;
+                const char next_type = MCB_TYPE(next_mcb);
+                if (DEBUG) fprintf(stderr, "debug: free: merge with next free\n");
+                if (next_type != 'Z' && is_mcb_bad(mem, next_para2)) {
+                  if (DEBUG) fprintf(stderr, "debug: free: bad next2 MCB block_para=%04x next_para=0x%04x next_para2=0x%04x: %d\n", block_para, block_para + MCB_SIZE_PARA(mcb) + 1, next_para2, is_mcb_bad(mem, next_para2));
+                  goto error_bad_mcb;
+                }
+                MCB_SIZE_PARA(mcb) += 1 + MCB_SIZE_PARA(next_mcb);
+                memset(next_mcb, 0, 16);
+                if (next_type != 'Z') MCB_PSIZE_PARA(next_mcb2) = MCB_SIZE_PARA(mcb);
+                MCB_TYPE(mcb) = next_type;
+              }
+              MCB_PID(mcb) = 0;  /* Mark it as free. */
+              if (MCB_PID(prev_mcb) == 0) {  /* Merge it with the preceding free block. */
+                const char mcb_type = MCB_TYPE(mcb);
+                if (DEBUG) fprintf(stderr, "debug: free: merge with prev free\n");
+                MCB_SIZE_PARA(prev_mcb) += 1 + MCB_SIZE_PARA(mcb);
+                memcpy(mcb, freed_mcb, 16);
+                if (mcb_type != 'Z') MCB_PSIZE_PARA(next_mcb) = MCB_SIZE_PARA(prev_mcb);
+                MCB_TYPE(prev_mcb) = mcb_type;
+                mcb = prev_mcb;
+              }
+              if (MCB_TYPE(mcb) == 'Z') {  /* Delete it as last free MCB. */
+                if (DEBUG) fprintf(stderr, "debug: free: delete last\n");
+                prev_mcb = mcb - 16 - (MCB_PSIZE_PARA(mcb) << 4);
+                memcpy(mcb, freed_mcb, 16);
+                MCB_TYPE(prev_mcb) = 'Z';
+              }
             }
-            /* This is really best effort: we have enough info only for freeing the very last block. */
-            if (block_para == last_heap_block_para) {
-              if (last_heap_block_para == base_heap_block_end_para) {
-                last_heap_block_para = PSP_PARA;
-                last_heap_block_end_para = base_heap_block_end_para;
-              } else {
-                last_heap_block_end_para = last_heap_block_para;
-                /* Unfortunately we don't have enough info to make last_heap_block_para smaller, so we will leak memory. */
-              }  /* Unfortunately we don't keep enough info to free something in the middle of the heap, so we leak memory here. */
-            }
-            if (DEBUG) fprintf(stderr, "free(0x%04x) OK\n", block_para);
+            if (DEBUG) fprintf(stderr, "debug: free(0x%04x) OK\n", block_para);
+            DEBUG_CHECK_ALL_MCBS(mem);
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x43) {  /* Get/set file attributes. */
             const unsigned char al = (unsigned char)regs.rax;

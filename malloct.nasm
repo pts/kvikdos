@@ -1,9 +1,8 @@
 ;
-; malloct.nasm: a DOS program doing test calls of malloc, realloc and free
+; malloct.nasm: a DOS program doing test calls of malloc, inplace_realloc and free
 ; by pts@fazekas.hu at Mon Apr 25 11:36:41 CEST 2022
 ;
-; This program works in DOSBox 0.74.
-; TODO(pts): Test in MS-DOS 6.22.
+; This program works in DOSBox 0.74, MS-DOS 6.22 ad kvikdos.
 ;
 
 bits 16
@@ -16,19 +15,19 @@ _start:		xor ax, ax
 		mov sp, 0xf00
 		push ax
 
-		mov ah, 0x4a		; realloc(), PSP in ES.
+		mov ah, 0x4a		; inplace_realloc(), PSP in ES.
 		mov bx, 0xffff		; New size in para. Too large.
 		int 0x21
 		jnc strict short error	; Expecting error.
 
-		mov ah, 0x4a		; realloc(), PSP in ES.
+		mov ah, 0x4a		; inplace_realloc(), PSP in ES.
 		mov bx, es
 		sub bx, 0xa000 + 1	; DOSBox 0.74 fails even without the +1.
 		neg bx			; New size in para. Still too large.
 		int 0x21
 		jnc strict short error	; Expecting error.
 
-		mov ah, 0x4a		; realloc(), PSP in ES.
+		mov ah, 0x4a		; inplace_realloc(), PSP in ES.
 		mov bx, 0x1000 >> 4	; 0x100 PSP + 0xf00 program bytes.
 		int 0x21
 		jc strict short error
@@ -146,7 +145,6 @@ next_free_even:	mov bp, word [es:0]
 		mov es, bp
 		jne strict short next_free_even
 .done:		mov bp, si
-		;jmp strict short next_free_odd.first
 
 next_free_odd:	mov es, bp
 		mov bp, word [es:0]	; This is a memory location in a recently free()d block, but since nothing else is running, we reuse it.
@@ -177,12 +175,101 @@ next_free_odd:	mov es, bp
 
 		; Works up to this point in DOSBox 0.74 and MS-DOS 6.22.
 
+		mov ah, 0x48		; malloc(). Size in BX.
+		mov bx, 10
+		int 0x21
+		jc strict short error2
+		mov si, ax
+
+		mov ah, 0x48		; malloc(). Size in BX.
+		mov bx, 11
+		int 0x21
+		jc strict short error2
+		mov di, ax
+
+		mov ah, 0x48		; malloc(). Size in BX.
+		mov bx, 12
+		int 0x21
+		jc strict short error2
+		mov bp, ax
+
+		mov ah, 0x49		; free(). Para in ES.
+		mov es, di
+		int 0x21
+		jc strict short error2
+
+		mov ah, 0x49		; free(). Para in ES.
+		mov es, si
+		int 0x21
+		jc strict short error2
+
+		mov ah, 0x48		; malloc(). Size in BX.
+		mov bx, 10 + 1 + 11	; For an exact fit.
+		int 0x21
+		jc strict short error2
+		mov si, ax
+
+		mov ah, 0x49		; free(). Para in ES.
+		mov es, si
+		int 0x21
+		jc strict short error2
+
+		mov ah, 0x48		; malloc(). Size in BX.
+		mov bx, 10 + 11		; Just 1 para shorter than an exact fit.
+		int 0x21
+		jc strict short error2
+		mov si, ax
+
+		mov ah, 0x4a		; inplace_realloc(), PSP in ES.
+		mov es, si
+		mov bx, 10 + 11		; New size in para. Unchanged.
+		int 0x21
+		jc strict short error2
+
+		mov ah, 0x4a		; inplace_realloc(), PSP in ES. Setting AH again is needed on DOSBox. The previous call shouldn't modify it.
+		mov bx, 10 + 11 + 2	; One too large.
+		int 0x21
+		jnc strict short error2
+		cmp bx, strict byte 10 + 11 + 1
+		je strict short error2.skip
+
+error2:		jmp strict near error
+.skip:
+
+		mov ah, 0x4a		; inplace_realloc(), PSP in ES.
+		mov bx, 10 + 11 + 1
+		int 0x21
+		jc strict short error2
+
+		mov ah, 0x4a		; inplace_realloc(), PSP in ES.
+		mov bx, 10 + 11
+		int 0x21
+		jc strict short error2
+
+		mov ah, 0x4a		; inplace_realloc(), PSP in ES.
+		mov bx, 10 + 11 - 5
+		int 0x21
+		jc strict short error2
+
+		mov ah, 0x4a		; inplace_realloc(), PSP in ES.
+		mov bx, 10 + 11 - 3
+		int 0x21
+		jc strict short error2
+
+		mov ah, 0x49		; free(). Para in ES.
+		mov es, si
+		int 0x21
+		jc strict short error2
+
+		mov ah, 0x49		; free(). Para in ES.
+		mov es, bp
+		int 0x21
+		jc strict short error2
+
 _exit:		mov ah, 9
 		mov dx, message
 		int 0x21
 		ret			; Exit to DOS with EXIT_SUCCESS.
-
-error2:		jmp strict near error
 
 
 message:	db 'malloct OK.', 13, 10, '$'
