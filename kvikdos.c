@@ -518,36 +518,75 @@ static int get_linux_handle(unsigned short handle, const struct kvm_fds *kvm_fds
        : handle;
 }
 
-static char fnbuf[128], fnbuf2[128];
+typedef struct DirState {
+  char drive;  /* 'A', 'B', 'C' or 'D'. */
+  char current_dir[4][128];  /* In DOS syntax. If current_dir[2] is "FOO\BAR\", then it corresponds to C:\FOO\BAR. */
+  const char *linux_mount_dir[4];  /* Linux directory to which the specific drive has been mounted, with '/' suffix, or NULL. Owned externally. linux_mount_dir[2] == "/tmp/foo/" maps DOS path C:\MY\FILE.TXT to Linux path /tmp/foo/MY/FILE.TXT .  */
+  const char *dos_prog_abs;  /* DOS absolute pathname of the program being run. Externally owned, can be NULL. */
+  const char *linux_prog;  /* Linux pathname of the program being run. Externally owned, can be NULL. */
+} DirState;
 
-static const char *get_linux_filename_r(const char *p, char *out_buf) {
-  const char *q, *p_end = p + 126;  /* DOS supports even less, DOSBox supports 80. */
-  char *out_p;
-  for (q = p; q != p_end && *q != '\0'; ++q) {}
-  if (*q != '\0') {
-    fprintf(stderr, "fatal: DOS filename too long\n");  /* !! Report error 0x3 (Path not found) or 0x44 (Network name limit exceeded). */
-    exit(252);
-  }
-  if (p[1] == ':') {
-    if ((p[0] & ~32) == 'C') {
-      p += 2;  /* Convert drive-relative to absolute. */
+#define LINUX_PATH_SIZE 1024
+
+static const char *get_linux_filename_r(const char *p, const DirState *dir_state, char *out_buf) {
+  char *out_p = out_buf, *out_pend;
+  const char *in_linux;
+  const char *in_dos[2] = { "", "" };
+  char drive_idx;
+  if (dir_state->dos_prog_abs && strcmp(p, dir_state->dos_prog_abs) == 0) {
+    in_linux = dir_state->linux_prog;
+  } else {
+    if (p[0] != '\0' && p[1] == ':') {
+      drive_idx = (p[0] & ~32) - 'A';
+      if ((unsigned char)drive_idx >= 4) {  /* Bad or unknown drive letter. */  /* !! Report error 0x3 (Path not found) */
+        /*fprintf(stderr, "fatal: DOS filename on wrong drive: 0x%02x\n", (unsigned char)p[0]);*/  /* !! Report error 0x3 (Path not found) */
+        /*exit(252);*/
+        goto error;
+      }
+      in_linux = dir_state->linux_mount_dir[(int)drive_idx];
+      if (!in_linux) goto error;  /* !! Report error 0x3 (Path not found) */
+      p += 2;
     } else {
-      fprintf(stderr, "fatal: DOS filename on wrong drive: 0x%02x\n", (unsigned char)p[0]);  /* !! Report error 0x3 (Path not found) */
-      exit(252);
+      in_linux = NULL;
+      drive_idx = dir_state->drive - 'A';
+    }
+    if (*p == '\\') {
+      for (; *p == '\\'; ++p) {}
+    } else {
+      in_dos[0] = dir_state->current_dir[(int)drive_idx];
+    }
+    in_dos[1] = p;
+  }
+  out_pend = out_p + LINUX_PATH_SIZE - 1;
+  if (in_linux) {
+    const size_t size = strlen(in_linux);
+    if (size > (size_t)(out_pend - out_p)) { too_long:  /* Pathname too long. !!! Handle this error. !! Report error 0x3 (Path not found) or 0x44 (Network name limit exceeded). */
+      goto error;
+    }
+    memcpy(out_p, in_linux, size);
+    out_p += size;
+  }
+  {  /* Convert pathnames in in_dos */
+    const char * const *in_dosi;
+    for (in_dosi = in_dos; in_dosi != in_dos + 2; ++in_dosi) {
+      p = *in_dosi;
+      for (; *p != '\0';) {
+        const char c = *p++;
+        if (out_p == out_pend) goto too_long;
+        *out_p++ = (c == '\\') ? '/'  /* Convert '\\' to '/'. */
+                 : (c - 'a' + 0U <= 'z' - 'a' + 0U) ? c & ~32 : c;  /* Convert to uppercase. */
+      }
     }
   }
-  for (; *p == '\\'; ++p) {}  /* Convert relative to absolute. */
-  for (out_p = out_buf; *p != '\0';) {
-    const char c = *p++;
-    *out_p++ = (c == '\\') ? '/'  /* Convert '\\' to '/'. */
-             : (c - 'a' + 0U <= 'z' - 'a' + 0U) ? c & ~32 : c;  /* Convert to uppercase. */
-  }
+ error:
   *out_p = '\0';
   if (strcmp(out_buf, "NUL") == 0) strcpy(out_buf, "/dev/null");
   return out_buf;
 }
 
-#define get_linux_filename(p) get_linux_filename_r((p), fnbuf)
+static char fnbuf[LINUX_PATH_SIZE], fnbuf2[LINUX_PATH_SIZE];
+
+#define get_linux_filename(p) get_linux_filename_r((p), &dir_state, fnbuf)
 
 /* `var' usually looks like `PATH=C:\value'. Everything before the '=' is converted to lowercase. */
 static char *add_env(char *env, char *env_end, const char *var, char do_check) {
@@ -580,14 +619,15 @@ int main(int argc, char **argv) {
   struct kvm_run *run;
   struct kvm_regs regs;
   struct kvm_sregs sregs;
-  const char *filename;
+  const char *prog_filename;
   char header[PROGRAM_HEADER_SIZE];
   unsigned header_size;
   char had_get_int0;
   char **envp, **envp0;
-  char *prog_dos_pathname = "C:\\PROG.COM";
+  char *dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
   unsigned tick_count;
   unsigned char sphinx_cmm_flags;
+  DirState dir_state;
 
   (void)argc;
   if (!argv[0] || !argv[1] || 0 == strcmp(argv[1], "--help")) {
@@ -615,9 +655,9 @@ int main(int argc, char **argv) {
       *envp++ = arg + 6;  /* Reuse the argv array. */
     } else if (0 == strcmp(arg, "--prog")) {
       if (!argv[0]) goto missing_argument;
-      prog_dos_pathname = *argv++;
+      dos_prog_abs = *argv++;
     } else if (0 == strncmp(arg, "--prog=", 7)) {
-      prog_dos_pathname = arg + 7;
+      dos_prog_abs = arg + 7;
     } else {
       fprintf(stderr, "fatal: unknown command-line flag: %s\n", arg);
       exit(1);
@@ -628,14 +668,14 @@ int main(int argc, char **argv) {
     fprintf(stderr, "fatal: missing <dos-com-or-exe-file> program filename\n");
     exit(1);
   }
-  filename = *argv++;
+  prog_filename = *argv++;
 
-  img_fd = open(filename, O_RDONLY);
+  img_fd = open(prog_filename, O_RDONLY);
   if (img_fd < 0) {
-    fprintf(stderr, "fatal: can not open DOS executable program: %s: %s\n", filename, strerror(errno));
+    fprintf(stderr, "fatal: can not open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
     exit(252);
   }
-  header_size = detect_dos_executable_program(img_fd, filename, header);
+  header_size = detect_dos_executable_program(img_fd, prog_filename, header);
 
   if ((kvm_fds.kvm_fd = open("/dev/kvm", O_RDWR)) < 0) {
     perror("fatal: failed to open /dev/kvm");
@@ -724,11 +764,12 @@ int main(int argc, char **argv) {
   /*regs.rflags |= 1 << 9;*/  /* IF=1, enable interrupts. */
 
   memcpy((char*)mem + (PROGRAM_MCB_PARA << 4), default_program_mcb, 16);
-  { char *psp = load_dos_executable_program(img_fd, filename, mem, header, header_size, &regs, &sregs, &MCB_SIZE_PARA((char*)mem + (PROGRAM_MCB_PARA << 4)));
+  { char *psp = load_dos_executable_program(img_fd, prog_filename, mem, header, header_size, &regs, &sregs, &MCB_SIZE_PARA((char*)mem + (PROGRAM_MCB_PARA << 4)));
     copy_args_to_dos_args(psp + 0x80, argv);
   }
   close(img_fd);
 
+  /* http://www.techhelpmanual.com/346-dos_environment.html */
   { char *env = (char*)mem + (ENV_PARA << 4);
     char * const env_end = (char*)mem + ENV_LIMIT;
 #if 0
@@ -743,7 +784,7 @@ int main(int argc, char **argv) {
     }
     env = add_env(env, env_end, "", 0);  /* Empty var marks end of env. */
     env = add_env(env, env_end, "\1", 0);  /* Number of subsequent variables (1). */
-    env = add_env(env, env_end, prog_dos_pathname, 0);  /* Full program pathname. */
+    env = add_env(env, env_end, dos_prog_abs, 0);  /* Full program pathname. */
   }
 
 /* We have to set both selector and base, otherwise it won't work. A `mov
@@ -760,6 +801,16 @@ int main(int argc, char **argv) {
   had_get_int0 = 0;
   tick_count = 0;
   sphinx_cmm_flags = 0;
+  dir_state.current_dir[0][0] = '\0';
+  dir_state.current_dir[1][0] = '\0';
+  dir_state.current_dir[2][0] = '\0';
+  dir_state.current_dir[3][0] = '\0';
+  dir_state.linux_mount_dir[0] = NULL;
+  dir_state.linux_mount_dir[1] = NULL;
+  dir_state.linux_mount_dir[2] = "";  /* Same as "./", for C:\ */
+  dir_state.linux_mount_dir[3] = NULL;
+  dir_state.dos_prog_abs = dos_prog_abs;
+  dir_state.linux_prog = prog_filename;
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
 
   if (DEBUG) dump_regs("debug", &regs, &sregs);
@@ -911,6 +962,7 @@ int main(int argc, char **argv) {
              * https://stanislavs.org/helppc/file_attributes.html
              */
             int fd = open(get_linux_filename(p), flags, 0644);
+            if (DEBUG) fprintf(stderr, "debug: dos_open(%s)\n", p);
             if (fd < 0) { error_from_linux:
               *(unsigned short*)&regs.rax = get_dos_error_code(errno);
               goto error_on_21;
@@ -955,7 +1007,7 @@ int main(int argc, char **argv) {
           } else if (ah == 0x56) {  /* Rename file. */
             const char * const p_old = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             const char * const p_new = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rdi);  /* !! Security: check bounds. */
-            int fd = rename(get_linux_filename(p_old), get_linux_filename_r(p_new, fnbuf2));
+            int fd = rename(get_linux_filename(p_old), get_linux_filename_r(p_new, &dir_state, fnbuf2));
             if (fd < 0) goto error_from_linux;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x25) {  /* Set interrupt vector. */
