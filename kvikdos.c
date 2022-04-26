@@ -770,7 +770,7 @@ int main(int argc, char **argv) {
   close(img_fd);
 
   /* http://www.techhelpmanual.com/346-dos_environment.html */
-  { char *env = (char*)mem + (ENV_PARA << 4);
+  { char *env = (char*)mem + (ENV_PARA << 4), *env0 = env;
     char * const env_end = (char*)mem + ENV_LIMIT;
 #if 0
     env = add_env(env, env_end, "PATH=D:\\foo;C:\\bar", 1);
@@ -782,6 +782,7 @@ int main(int argc, char **argv) {
        */
       env = add_env(env, env_end, *envp0++, 1);
     }
+    if (env == env0) env = add_env(env, env_end, "$=", 1);  /* Some programs such as pbc.exe would fail with an empty environment, so we create a fake variable. */
     env = add_env(env, env_end, "", 0);  /* Empty var marks end of env. */
     env = add_env(env, env_end, "\1", 0);  /* Number of subsequent variables (1). */
     env = add_env(env, env_end, dos_prog_abs, 0);  /* Full program pathname. */
