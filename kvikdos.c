@@ -809,7 +809,7 @@ int main(int argc, char **argv) {
   dir_state.linux_mount_dir[1] = NULL;
   dir_state.linux_mount_dir[2] = "";  /* Same as "./", for C:\ */
   dir_state.linux_mount_dir[3] = NULL;
-  dir_state.dos_prog_abs = dos_prog_abs;
+  dir_state.dos_prog_abs = NULL;  /* For security, use dos_prog_abs mapping only for read-only opens below. */
   dir_state.linux_prog = prog_filename;
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
 
@@ -961,9 +961,13 @@ int main(int argc, char **argv) {
             /* For create, CX contains attributes (read-only, hidden, system, archive), we just ignore it.
              * https://stanislavs.org/helppc/file_attributes.html
              */
-            int fd = open(get_linux_filename(p), flags, 0644);
+            int fd;
+            const char *linux_filename;
             if (DEBUG) fprintf(stderr, "debug: dos_open(%s)\n", p);
-            if (fd < 0) { error_from_linux:
+            dir_state.dos_prog_abs = flags == O_RDONLY ? dos_prog_abs : NULL;  /* For loading the overlay from prog_filename, even if not mounted. */
+            linux_filename = get_linux_filename(p);
+            dir_state.dos_prog_abs = NULL;  /* For security. */
+            if ((fd = open(linux_filename, flags, 0644)) < 0) { error_from_linux:
               *(unsigned short*)&regs.rax = get_dos_error_code(errno);
               goto error_on_21;
             }
