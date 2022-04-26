@@ -28,7 +28,7 @@
 /* Memory map for kvikdos:
  *
  * 0x00000...0x00400    +0x400  Interrupt vector table (IVT).
- * 0x00400...0x00500    +0x100  BIOS data area (BDA). Kept as 00s. https://stanislavs.org/helppc/bios_data_area.html  https://wiki.osdev.org/Memory_Map_(x86)  http://www.bioscentral.com/misc/bda.htm
+ * 0x00400...0x00500    +0x100  BIOS data area (BDA). Kept as 00s. https://stanislavs.org/helppc/bios_data_area.html  https://wiki.osdev.org/Memory_Map_(x86)  http://www.bioscentral.com/misc/bda.htm  http://staff.ustc.edu.cn/~xyfeng/research/cos/resources/BIOS/Resources/biosdata.htm
  * 0x00500...0x00540     +0x40  BIOS/DOS data area. Kept as 00s. https://stanislavs.org/helppc/bios_data_area.html
  * 0x00540...0x00640    +0x100  INT_HLT_PARA. hlt instructions for interrupt entry points. Needed for getting the interrupt number in KVM_EXIT_HLT.
  * 0x00640...0x00ff0    +0xabc  ENV_PARA. Environment variables and program pathname.
@@ -70,9 +70,9 @@
  * 0xfc000                      BIOS ROM
  * 0xff000                      System ROM
  * 0xfFa6e                      ROM graphics character table
- * 0xffff0                      ROM bootstrap code == soft reset. Ctl-Alt-<Del> or JMP FFFF:0.
- * 0xffff5                +0x8  ROM date (not applicable for all clones)
- * 0xffffe                +0x1  ROM machine ID
+ * 0xffff0                      ROM bootstrap code == soft reset. Ctl-Alt-<Del> or JMP FFFF:0. far jmp instruction to begin POST.
+ * 0xffff5                +0x8  ROM BIOS date (not applicable for all clones) in ASCII.
+ * 0xffffe                +0x1  ROM machine ID. IBM computer type code.
  */
 
 #define INT_HLT_PARA 0x54
