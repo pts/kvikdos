@@ -611,6 +611,80 @@ static char *add_env(char *env, char *env_end, const char *var, char do_check) {
   return env;
 }
 
+/* Example name_prefix: "PATH=". */
+static const char *getenv_prefix(const char *name_prefix, const char **env, const char **env_end) {
+  const size_t name_prefix_size = strlen(name_prefix);
+  for (; env != env_end; ++env) {
+    if (strncmp(*env, name_prefix, name_prefix_size) == 0) return *env + name_prefix_size;
+  }
+  return NULL;
+}
+
+/* Same extension lookup order as in DOS. */
+static const char * const find_program_exts[] = { ".COM", ".com", ".EXE", ".exe", ".BAT", ".bat", NULL };
+static const char * const find_program_no_exts[] = { "", NULL };
+
+/* Both prog_filename and the return value are Linux pathnames.
+ * Uses global variable fnbuf as temporary storage and possible return value.
+ */
+static const char *find_program(const char *prog_filename, const DirState *dir_state, const char *dos_path) {
+  size_t size;
+  const char *p, *pp, *pq;
+  char *r;
+  char c;
+  const char * const * exts0;
+  for (p = prog_filename; (c = *p) != '\0' && c != ':' && c != '/' && c != '\\'; ++p) {}
+  if (*p != '\0') return prog_filename;  /* Too complicated, don't attempt DOS %PATH% lookup. */
+  size = strlen(prog_filename);
+  for (p = prog_filename + size; p != prog_filename && *--p != '.';) {}
+  /* DOS allows only exts in find_program_exts, we allow anything the user specifies here. */
+  exts0 = (*p != '.') ? find_program_exts : find_program_no_exts;
+  if (DEBUG) fprintf(stderr, "debug: DOS path lookup prog_filename=%s p=%s dos_path=%s\n", prog_filename, p, dos_path);
+  pp = pq = NULL;
+  for (;;) {  /* Find in current directory first, then continue finding on DOS %PATH%. */
+    const char * const * exts;
+    r = fnbuf;
+    if (pp) {
+      char c;
+      for (pq = pp; (c = *pp) != ';' && c != '\0'; ++pp) {}
+      *(char*)pp = '\0';  /* Temporary terminator within dos_path, for get_linux_filename_r. */
+      get_linux_filename_r(pq, dir_state, fnbuf);
+      if (*fnbuf == '\0') goto end_of_pp;  /* TODO(pts): `return prog_filename' on too long. */
+      *(char*)pp = c;
+      r = fnbuf + strlen(fnbuf);
+      if ((unsigned)(r - fnbuf)  >= sizeof(fnbuf)) return prog_filename;  /* Too long. */
+      *r++ = '/';
+    }
+    if ((unsigned)(r - fnbuf) + size >= sizeof(fnbuf)) return prog_filename;  /* Too long. */
+    memcpy(r, prog_filename, size);
+    r += size;
+    *r = '\0';
+    if (DEBUG) fprintf(stderr, "debug: trying progs: %s\n", fnbuf);
+    for (exts = exts0; *exts; ++exts) {
+      const size_t ext_size = strlen(*exts);
+      struct stat st;
+      if ((unsigned)(r - fnbuf) + ext_size >= sizeof(fnbuf)) return prog_filename;  /* Too long. */
+      memcpy(r, *exts, ext_size);
+      r[ext_size] = '\0';
+      if (DEBUG) fprintf(stderr, "debug: trying prog: %s\n", fnbuf);
+      if (stat(fnbuf, &st) == 0 && S_ISREG(st.st_mode)) {
+        if (DEBUG) fprintf(stderr, "debug: found prog: %s\n", fnbuf);
+        return fnbuf;  /* Found program file. */
+      }
+    }
+   end_of_pp:
+    if (pp) {
+    } else if (dos_path) {
+      pp = dos_path;
+    } else {
+      break;
+    }
+    for (; *pp == ';'; ++pp) {}  /* Skip over %PATH% separator characters ';'. */
+    if (*pp == '\0') break;
+  }
+  return prog_filename;
+}
+
 int main(int argc, char **argv) {
   struct kvm_fds kvm_fds;
   void *mem;
@@ -669,7 +743,7 @@ int main(int argc, char **argv) {
       if (!argv[0]) goto missing_argument;
       arg = *argv++;
      do_prog:
-      dos_prog_abs = arg;
+      dos_prog_abs = arg;  /* !! autopopulate it based on prog_filename and dir_state.linux_mount_dir[...]. */
     } else if (0 == strncmp(arg, "--prog=", 7)) {
       arg += 7;
       goto do_prog;
@@ -713,8 +787,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "fatal: missing <dos-com-or-exe-file> program filename\n");
     exit(1);
   }
-  prog_filename = *argv++;
+  prog_filename = *argv++;  /* This is a Linux filename. */
+  /* Remaining arguments in argv will be passed to the DOS program in PSP:0x80. */
 
+  prog_filename = find_program(prog_filename, &dir_state, getenv_prefix("PATH=", (char const**)envp0, (char const**)envp));
   img_fd = open(prog_filename, O_RDONLY);
   if (img_fd < 0) {
     fprintf(stderr, "fatal: can not open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
