@@ -782,6 +782,7 @@ int main(int argc, char **argv) {
   char ctrl_break_checking;  /* 0 or 1. Just a flag, doesn't have any use case. */
   DirState dir_state;
   unsigned dta_seg_ofs;  /* Disk transfer address (DTA). */
+  unsigned ongoing_set_int;
 
   (void)argc;
   if (!argv[0] || !argv[1] || 0 == strcmp(argv[1], "--help")) {
@@ -1029,6 +1030,7 @@ int main(int argc, char **argv) {
   ctrl_break_checking = 0;
   dir_state.linux_prog = prog_filename;
   dta_seg_ofs = 0x80 | PSP_PARA << 16;
+  ongoing_set_int = 0;  /* No set_int operation ongoing. */
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
 
   if (DEBUG) dump_regs("debug", &regs, &sregs);
@@ -1260,7 +1262,7 @@ int main(int argc, char **argv) {
             if (fd < 0) goto error_from_linux;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x25) {  /* Set interrupt vector. */
-            if (!set_int((unsigned char)regs.rax, *(unsigned short*)&regs.rdx | sregs.ds.selector << 16, mem, had_get_int0)) goto fatal;
+            if (set_int((unsigned char)regs.rax, *(unsigned short*)&regs.rdx | sregs.ds.selector << 16, mem, had_get_int0)) goto fatal;
           } else if (ah == 0x35) {  /* Get interrupt vector. */
             /* !! Implement this. */
             const unsigned char get_int_num = (unsigned char)regs.rax;
@@ -1653,6 +1655,30 @@ int main(int argc, char **argv) {
           memcpy((char*)mem + addr, run->mmio.data, mmio_len);
         } else if (addr == 0xffffe && !run->mmio.is_write && mmio_len == 1) {  /* BASIC programs compiled by Microsoft BASIC Professional Development System 7.1 compiler pbc.exe */
           run->mmio.data[0] = 0xfc;  /* Machine ID is regular OC (0xfc). Same as default in src/ints/bios.cpp in DOSBox 0.74. */
+        } else if (addr < 0x400 && run->mmio.is_write && addr + mmio_len <= 0x400 && ((mmio_len == 2 && (addr & 1) == 0) || (mmio_len == 4 && (addr & 3) == 0))) {  /* Set interrupt vector directly (not via int 0x21 call with ah == 0x25). */
+          /* Microsoft BASIC Professional Development System 7.1 compiler pbc.exe */
+          const unsigned char set_int_num = addr >> 2;
+          if (mmio_len == 2) {  /* There are subsequent sets (segment and offset parts), we buffer them, and call set_int only once. */
+            if (addr & 2) {  /* Set segment part. */
+              if ((ongoing_set_int & 0xff) == set_int_num && (ongoing_set_int & 0x100)) {
+                *(unsigned*)run->mmio.data = *(unsigned short*)run->mmio.data << 16 | ongoing_set_int >> 16;
+                goto do_set_int;
+              } else {
+                ongoing_set_int = 0x200 | set_int_num | *(unsigned short*)run->mmio.data << 16;
+                break;  /* Prevent `ongoing_set_int = 0' below. */
+              }
+            } else {  /* Set offset part. */
+              if ((ongoing_set_int & 0xff) == set_int_num && (ongoing_set_int & 0x200)) {
+                *(unsigned*)run->mmio.data = *(unsigned short*)run->mmio.data | ongoing_set_int >> 16 << 16;
+                goto do_set_int;
+              } else {
+                ongoing_set_int = 0x100 | set_int_num | *(unsigned short*)run->mmio.data << 16;
+                break;  /* Prevent `ongoing_set_int = 0' below. */
+              }
+            }
+          } else { do_set_int:
+            if (set_int(set_int_num, *(unsigned*)run->mmio.data, mem, had_get_int0)) goto fatal;
+          }
         } else {
           highmsg[0] = '\0';
          bad_memory_access:
@@ -1660,6 +1686,7 @@ int main(int argc, char **argv) {
           goto fatal;
         }
       }
+      ongoing_set_int = 0;  /* No set_int operation ongoing. */
       break;  /* Just continue at following cs:ip. */
      case KVM_EXIT_INTERNAL_ERROR:
       fprintf(stderr, "fatal: KVM internal error suberror=%d\n", (unsigned)run->internal.suberror);
