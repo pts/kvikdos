@@ -436,9 +436,9 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
   *(unsigned short*)(psp + 0x32) = 20;  /* `Number of bytes in JFT. */
   *(unsigned*)(psp + 0x34) = 0x18 | PSP_PARA << 16;  /* `Far pointer to JFT. */
   *(unsigned*)(psp + 0x38) = 0xffffffffU;  /* `Pointer to (lack of) previous PSP. */
-  *(unsigned*)(psp + 0x0a) = *((unsigned*)mem + 0x22);  /* Copy of `int 0x22' vector. */
-  *(unsigned*)(psp + 0x0e) = *((unsigned*)mem + 0x23);  /* Copy of `int 0x23' vector. */
-  *(unsigned*)(psp + 0x12) = *((unsigned*)mem + 0x24);  /* Copy of `int 0x24' vector. */
+  *(unsigned*)(psp + 0x0a) = *((unsigned*)mem + 0x22);  /* Copy of `int 0x22' vector. Program terminate address. Not an interrupt. */
+  *(unsigned*)(psp + 0x0e) = *((unsigned*)mem + 0x23);  /* Copy of `int 0x23' vector. Ctrl-<Break> handler address. Not an interrupt.  */
+  *(unsigned*)(psp + 0x12) = *((unsigned*)mem + 0x24);  /* Copy of `int 0x24' vector. Critical error handler. Do not execute directly (why?). */
   psp[0x52] = (char)0xcb;  /* `retf' opcode. */
   psp[5] = (char)0x9a;  /* Opcode for `call far segment:offset'. */
   /* These are the PSP fields we don't fill (but keep as 0 as returned by mmap MAP_ANONYMOUS):
