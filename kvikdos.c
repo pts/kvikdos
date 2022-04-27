@@ -1631,14 +1631,15 @@ int main(int argc, char **argv) {
         goto fatal;
       }
      case KVM_EXIT_MMIO:
-      if ((unsigned)run->mmio.phys_addr == 0xfffea && run->mmio.len == 1 && !run->mmio.is_write && (sphinx_cmm_flags & 3) == 3) {
-        /* SPHiNX C-- 1.04 compiler does this, just ignore. */
-        break;
-      } else {
-        fprintf(stderr, "fatal: KVM memory access denied phys_addr=%08x value=%08x%08x size=%d is_write=%d\n", (unsigned)run->mmio.phys_addr, ((unsigned*)run->mmio.data)[1], ((unsigned*)run->mmio.data)[0], run->mmio.len, run->mmio.is_write);
+      { const char mmio_len = run->mmio.len;
+        if ((unsigned)run->mmio.phys_addr == 0xfffea && mmio_len == 1 && !run->mmio.is_write && (sphinx_cmm_flags & 3) == 3) {
+          /* SPHiNX C-- 1.04 compiler does this, just ignore. */
+        } else {
+          fprintf(stderr, "fatal: KVM memory access denied phys_addr=%08x value=%08x%08x size=%d is_write=%d\n", (unsigned)run->mmio.phys_addr, ((unsigned*)run->mmio.data)[1], ((unsigned*)run->mmio.data)[0], mmio_len, run->mmio.is_write);
+          goto fatal;
+        }
       }
-      /*break;*/  /* Just continue at following cs:ip. */
-      goto fatal;
+      break;  /* Just continue at following cs:ip. */
      case KVM_EXIT_INTERNAL_ERROR:
       fprintf(stderr, "fatal: KVM internal error suberror=%d\n", (unsigned)run->internal.suberror);
       /* We get this for an int call if we don't map
