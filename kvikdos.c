@@ -1608,6 +1608,12 @@ int main(int argc, char **argv) {
           } else {
             goto fatal_int;
           }
+        } else if (int_num == 0x2a) {  /* Network. */
+          if (ah == 0x00) {  /* Network installation query. */
+            /* By returning ah == 0x00 we indicate that the network is not installed. */
+          } else {
+            goto fatal_int;
+          }
         } else if (int_num == 0x11) {  /* Get BIOS equipment flags. */
           *(unsigned short*)&regs.rax = *(const unsigned short*)((const char*)mem + 0x410);
         } else {
