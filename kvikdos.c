@@ -929,9 +929,10 @@ int main(int argc, char **argv) {
     for (u = 0; u < 0x100; ++u) { ((unsigned*)mem)[u] = MAGIC_INT_VALUE(u); }
     memset((char*)mem + (INT_HLT_PARA << 4), 0xf4, 0x100);  /* 256 hlt instructions, one for each int. TODO(pts): Is hlt+iret faster? */
   }
-  /* !! Initialize BIOS data area until 0x534, move magic interrupt table later.
+  /* !! Initialize more BIOS data area until 0x534, move magic interrupt table later.
    * https://stanislavs.org/helppc/bios_data_area.html
    */
+  *(unsigned short*)((char*)mem + 0x410) = 0x22;  /* BIOS equipment flags. https://stanislavs.org/helppc/int_11.html */
 
   if ((kvm_fds.vcpu_fd = ioctl(kvm_fds.vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
     perror("fatal: can not create KVM vcpu");
@@ -1552,6 +1553,8 @@ int main(int argc, char **argv) {
           } else {
             goto fatal_int;
           }
+        } else if (int_num == 0x11) {  /* Get BIOS equipment flags. */
+          *(unsigned short*)&regs.rax = *(const unsigned short*)((const char*)mem + 0x410);
         } else {
          fatal_int:
           fprintf(stderr, "fatal: unsupported int 0x%02x ah:%02x cs:%04x ip:%04x\n", int_num, ah, int_cs, int_ip);
