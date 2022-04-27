@@ -1602,6 +1602,12 @@ int main(int argc, char **argv) {
           } else {
             goto fatal_int;
           }
+        } else if (int_num == 0x16) {  /* Keyboard. */
+          if (ah == 0x12) {  /* Get extended keyboard status. */
+            *(unsigned short*)&regs.rax = *(const unsigned short*)((const char*)mem + 0x417);  /* In BDA, 0 by default, no modifier keys pressed. */
+          } else {
+            goto fatal_int;
+          }
         } else if (int_num == 0x11) {  /* Get BIOS equipment flags. */
           *(unsigned short*)&regs.rax = *(const unsigned short*)((const char*)mem + 0x410);
         } else {
