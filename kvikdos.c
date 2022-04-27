@@ -740,6 +740,29 @@ static const char *find_program(const char *prog_filename, const DirState *dir_s
   return prog_filename;
 }
 
+/* Sets interrupt vector for int_num to value_seg_ofs in IVT. Does some
+ * checks. Returns 0 on success.
+ */
+static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, char had_get_int0) {
+  unsigned * const p = (unsigned*)mem + int_num;
+  if (DEBUG) {
+    fprintf(stderr, "debug: set interrupt vector int:%02x to cs:%04x ip:%04x\n",
+            int_num, (unsigned short)(value_seg_ofs >> 16), (unsigned short)value_seg_ofs);
+  }
+  if (int_num == 0x23 ||  /* Application Ctrl-<Break> handler. */
+      value_seg_ofs == *p ||  /* Unchanged. */
+      value_seg_ofs == MAGIC_INT_VALUE(int_num) ||  /* Set back to original. */
+      (had_get_int0 && (int_num == 0x00 || int_num == 0x24 || int_num == 0x3f))  /* Turbo Pascal 7.0. 0x24 is the critical error handler. */) {
+    /* We will never send Ctrl-<Break>. */
+  } else {
+    fprintf(stderr, "fatal: unsupported set interrupt vector int:%02x to cs:%04x ip:%04x\n",
+            int_num, (unsigned short)(value_seg_ofs >> 16), (unsigned short)value_seg_ofs);
+    return 1;
+  }
+  *p = value_seg_ofs;
+  return 0;  /* Success. */
+}
+
 int main(int argc, char **argv) {
   struct kvm_fds kvm_fds;
   void *mem;
@@ -1237,23 +1260,7 @@ int main(int argc, char **argv) {
             if (fd < 0) goto error_from_linux;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x25) {  /* Set interrupt vector. */
-            /* !! Implement this. */
-            const unsigned char set_int_num = (unsigned char)regs.rax;
-            const unsigned short dx = *(unsigned short*)&regs.rdx;
-            const unsigned short ds = sregs.ds.selector;
-            const unsigned value = ds << 16 | dx;
-            unsigned *p = (unsigned*)mem + set_int_num;
-            if (set_int_num == 0x23 ||  /* Application Ctrl-<Break> handler. */
-                value == *p ||  /* Unchanged. */
-                value == MAGIC_INT_VALUE(set_int_num) ||  /* Set back to original. */
-                (had_get_int0 && (set_int_num == 0x00 || set_int_num == 0x24 || set_int_num == 0x3f))  /* Turbo Pascal 7.0. 0x24 is the critical error handler. */) {
-              /* We will never send Ctrl-<Break>. */
-              *p = value;
-            } else {
-              fprintf(stderr, "fatal: unsupported set interrupt vector int:%02x to cs:%04x ip:%04x\n",
-                      set_int_num, ds, dx);
-              goto fatal;
-            }
+            if (!set_int((unsigned char)regs.rax, *(unsigned short*)&regs.rdx | sregs.ds.selector << 16, mem, had_get_int0)) goto fatal;
           } else if (ah == 0x35) {  /* Get interrupt vector. */
             /* !! Implement this. */
             const unsigned char get_int_num = (unsigned char)regs.rax;
