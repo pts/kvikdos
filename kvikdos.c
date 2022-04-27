@@ -1640,8 +1640,12 @@ int main(int argc, char **argv) {
      case KVM_EXIT_MMIO:
       { const char mmio_len = run->mmio.len;
         const unsigned addr = (unsigned)run->mmio.phys_addr;
+        char highmsg[2];
         /* CS:IP points to the instruction doing the memory operation (not after). */
-        if (addr == 0xfffea && mmio_len == 1 && !run->mmio.is_write && (sphinx_cmm_flags & 3) == 3) {
+        if (sizeof(run->mmio.phys_addr) > 4 && run->mmio.phys_addr >> (32 * (sizeof(run->mmio.phys_addr) > 4))) {  /* Physical address is larger than 32 bits. */
+          highmsg[0] = '+'; highmsg[1] = '\0';
+          goto bad_memory_access;
+        } else if (addr == 0xfffea && mmio_len == 1 && !run->mmio.is_write && (sphinx_cmm_flags & 3) == 3) {
           /* SPHiNX C-- 1.04 compiler does this, just ignore. */
         } else if (addr - (ENV_PARA << 4) < (PROGRAM_MCB_PARA - 1 - ENV_PARA) << 4 && run->mmio.is_write && mmio_len <= 16) {  /* Overwrites environment area. */
           /* Microsoft BASIC Professional Development System 7.1 linker pblink.exe. It overwrites length and program name with program name and args. */
@@ -1650,7 +1654,9 @@ int main(int argc, char **argv) {
         } else if (addr == 0xffffe && !run->mmio.is_write && mmio_len == 1) {  /* BASIC programs compiled by Microsoft BASIC Professional Development System 7.1 compiler pbc.exe */
           run->mmio.data[0] = 0xfc;  /* Machine ID is regular OC (0xfc). Same as default in src/ints/bios.cpp in DOSBox 0.74. */
         } else {
-          fprintf(stderr, "fatal: KVM memory access denied phys_addr=%08x value=%08x%08x size=%d is_write=%d\n", addr, ((unsigned*)run->mmio.data)[1], ((unsigned*)run->mmio.data)[0], mmio_len, run->mmio.is_write);
+          highmsg[0] = '\0';
+         bad_memory_access:
+          fprintf(stderr, "fatal: KVM memory access denied phys_addr=%08x%s value=%08x%08x size=%d is_write=%d\n", addr, highmsg, ((unsigned*)run->mmio.data)[1], ((unsigned*)run->mmio.data)[0], mmio_len, run->mmio.is_write);
           goto fatal;
         }
       }
