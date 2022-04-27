@@ -497,12 +497,12 @@ static int ensure_fd_is_at_least(int fd, int min_fd) {
 }
 
 /* le is Linux errno. */
-static unsigned short get_dos_error_code(int le) {
+static unsigned short get_dos_error_code(int le, unsigned short default_code) {
   /* https://stanislavs.org/helppc/dos_error_codes.html */
   return le == ENOENT ? 2  /* File not found. */
        : le == EACCES ? 5  /* Access denied. */
        : le == EBADF ? 6  /* Invalid handle. */
-       : 0x1f;  /* General failure. */
+       : default_code;  /* Example: 0x1f: General failure. */
 }
 
 struct kvm_fds {
@@ -1166,7 +1166,7 @@ int main(int argc, char **argv) {
             linux_filename = get_linux_filename(p);
             dir_state.dos_prog_abs = NULL;  /* For security. */
             if ((fd = open(linux_filename, flags, 0644)) < 0) { error_from_linux:
-              *(unsigned short*)&regs.rax = get_dos_error_code(errno);
+              *(unsigned short*)&regs.rax = get_dos_error_code(errno, 0x1f);  /* By default: General failure. */
               goto error_on_21;
             }
             if (fd < 5) fd = ensure_fd_is_at_least(fd, 5);  /* Skip the first 5 DOS standard handles. */
