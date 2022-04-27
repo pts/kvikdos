@@ -749,11 +749,11 @@ static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, ch
     fprintf(stderr, "debug: set interrupt vector int:%02x to cs:%04x ip:%04x\n",
             int_num, (unsigned short)(value_seg_ofs >> 16), (unsigned short)value_seg_ofs);
   }
-  if (int_num == 0x23 ||  /* Application Ctrl-<Break> handler. */
+  if (int_num - 0x22 + 0U <= 0x24 - 022 +0U ||  /* Application Ctrl-<Break> handler == 0x23. We allow 0x22..0x24. */
       value_seg_ofs == *p ||  /* Unchanged. */
       value_seg_ofs == MAGIC_INT_VALUE(int_num) ||  /* Set back to original. */
       (had_get_int0 && (int_num == 0x00 || int_num == 0x24 || int_num == 0x3f))  /* Turbo Pascal 7.0. 0x24 is the critical error handler. */) {
-    /* We will never send Ctrl-<Break>. */
+    /* FYI kvikdos never sends Ctrl-<Break>. */
   } else {
     fprintf(stderr, "fatal: unsupported set interrupt vector int:%02x to cs:%04x ip:%04x\n",
             int_num, (unsigned short)(value_seg_ofs >> 16), (unsigned short)value_seg_ofs);
@@ -1267,7 +1267,7 @@ int main(int argc, char **argv) {
             /* !! Implement this. */
             const unsigned char get_int_num = (unsigned char)regs.rax;
             if (get_int_num == 0) had_get_int0 = 1;  /* Turbo Pascal 7.0 programs start with this. */
-            if (had_get_int0) {
+            if (had_get_int0 || get_int_num - 0x22 + 0U <= 0x24 - 0x22 + 0U) {  /* Microsoft BASIC Professional Development System 7.1 linker pblink.exe gets interrupt vector 0x24. */
               const unsigned short *pp = (const unsigned short*)((char*)mem + (get_int_num << 2));
               if (DEBUG) fprintf(stderr, "debug: get interrupt vector int:%02x is cs:%04x ip:%04x\n", get_int_num, pp[1], pp[0]);
               (*(unsigned short*)&regs.rbx) = pp[0];
