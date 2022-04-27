@@ -756,6 +756,7 @@ int main(int argc, char **argv) {
   const char *dos_prog_abs = NULL;  /* Owned externally. */
   unsigned tick_count;
   unsigned char sphinx_cmm_flags;
+  char ctrl_break_checking;  /* 0 or 1. Just a flag, doesn't have any use case. */
   DirState dir_state;
 
   (void)argc;
@@ -1001,6 +1002,7 @@ int main(int argc, char **argv) {
   had_get_int0 = 0;
   tick_count = 0;
   sphinx_cmm_flags = 0;
+  ctrl_break_checking = 0;
   dir_state.linux_prog = prog_filename;
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
 
@@ -1525,6 +1527,26 @@ int main(int argc, char **argv) {
               *(unsigned short*)&regs.rax = (st.st_mode & 0200) ? 0 : 1;  /* Indicate DOS read-only flag if owner doesn't have write permissions on Linux. */
             } else {  /* Set. */
               fprintf(stderr, "fatal: unimplemented: set file attributes: attr=0x%04x filename=%s\n", *(unsigned short*)&regs.rcx, fn);
+              goto fatal;
+            }
+          } else if (ah == 0x33) {  /* Get/set system values. */
+            const unsigned char al = (unsigned char)regs.rax;
+            const unsigned char dl = (unsigned char)regs.rdx;
+            if (al == 0) {
+              *(unsigned char*)&regs.rdx = ctrl_break_checking;  /* 0 or 1. */
+            } else if (al == 1) {
+              ctrl_break_checking = (dl > 0);
+            } else if (al == 2) {
+              const unsigned char old = ctrl_break_checking;
+              ctrl_break_checking = (dl > 0);
+              *(unsigned char*)&regs.rdx = old;
+            } else if (al == 5) {
+              *(unsigned char*)&regs.rdx = 'C' - 'A' + 1;  /* Boot drive. */
+            } else if (al == 6) {
+              *(unsigned short*)&regs.rbx = 0x500;  /* DOS 5.0. */
+              *(unsigned short*)&regs.rdx = 0x100;  /* DL contains DOS revision number 0. */
+            } else {
+              fprintf(stderr, "fatal: unimplemented: get/set system values: al:%04x dl:%04x\n", al, dl);
               goto fatal;
             }
           } else if (ah == 0x0e) {  /* Select disk. */
