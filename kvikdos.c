@@ -1204,6 +1204,22 @@ int main(int argc, char **argv) {
             const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
             if (fd < 0) goto error_invalid_handle;  /* Not strictly needed, close(...) would check. */
             if (close(fd) != 0) goto error_from_linux;
+          } else if (ah == 0x45) {  /* Duplicate handle (dup()). */
+            const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
+            int fd2;
+            if (fd < 0) goto error_invalid_handle;
+            fd2 = dup(fd);
+            if (fd < 0) {
+              *(unsigned short*)&regs.rax = get_dos_error_code(errno, 4);  /* By default: Too many open files. */
+              goto error_on_21;
+            }
+            if (fd2 < 5) fd2 = ensure_fd_is_at_least(fd2, 5);  /* Skip the first 5 DOS standard handles. */
+            if ((fd2 + 0U) >> 16) {
+              *(unsigned short*)&regs.rax = 4;  /* Too many open files. */
+              goto error_on_21;
+            }
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            *(unsigned short*)&regs.rax = fd2;
           } else if (ah == 0x41) {  /* Delete file. */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             int fd = unlink(get_linux_filename(p));
