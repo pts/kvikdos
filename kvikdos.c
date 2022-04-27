@@ -1155,7 +1155,7 @@ int main(int argc, char **argv) {
             }
             if (p != p0 && p[-1] == '/') --p;  /* Remove trailing '/'. */
             *p = '\0';  /* Silently truncate to 64 bytes. */
-          } else if (ah == 0x3d || ah == 0x3c) {  /* Open to handle. Create to handle. */
+          } else if (ah == 0x3d || ah == 0x3c) {  /* Open to handle (open()). Create to handle (creat()). */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             const int flags = (ah == 0x3c) ? O_RDWR | O_CREAT | O_TRUNC :
                 *(unsigned char*)&regs.rax & 3;  /* O_RDONLY == 0, O_WRONLY == 1, O_RDWR == 2 same in DOS and Linux. */
