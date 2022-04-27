@@ -1626,6 +1626,11 @@ int main(int argc, char **argv) {
           }
         } else if (int_num == 0x11) {  /* Get BIOS equipment flags. */
           *(unsigned short*)&regs.rax = *(const unsigned short*)((const char*)mem + 0x410);
+        } else if (int_num == 0x00) {  /* Division by zero. */
+          /* This is called only if the program doesn't override the interrupt vector.
+           * Example instructions: `xor ax, ax', `div ax'.
+           */
+          fprintf(stderr, "fatal: unhandled division by zero cs:%04x ip:%04x\n", int_cs, int_ip);
         } else {
          fatal_int:
           fprintf(stderr, "fatal: unsupported int 0x%02x ah:%02x cs:%04x ip:%04x\n", int_num, ah, int_cs, int_ip);
