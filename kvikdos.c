@@ -1634,6 +1634,10 @@ int main(int argc, char **argv) {
       { const char mmio_len = run->mmio.len;
         if ((unsigned)run->mmio.phys_addr == 0xfffea && mmio_len == 1 && !run->mmio.is_write && (sphinx_cmm_flags & 3) == 3) {
           /* SPHiNX C-- 1.04 compiler does this, just ignore. */
+        } else if ((unsigned)run->mmio.phys_addr - (ENV_PARA << 4) < (PROGRAM_MCB_PARA - 1 - ENV_PARA) << 4 && run->mmio.is_write && mmio_len <= 16) {  /* Overwrites environment area. */
+          /* Microsoft BASIC Professional Development System 7.1 linker pblink.exe. It overwrites length and program name with program name and args. */
+          /* This emulation is a little bit slow (because of the ioctl(... KVM_RUN ...) overhead), but it's called only less than 75 times at startup. */
+          memcpy((char*)mem + (unsigned)run->mmio.phys_addr, run->mmio.data, mmio_len);
         } else {
           fprintf(stderr, "fatal: KVM memory access denied phys_addr=%08x value=%08x%08x size=%d is_write=%d\n", (unsigned)run->mmio.phys_addr, ((unsigned*)run->mmio.data)[1], ((unsigned*)run->mmio.data)[0], mmio_len, run->mmio.is_write);
           goto fatal;
