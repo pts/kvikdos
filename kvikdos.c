@@ -1075,8 +1075,10 @@ int main(int argc, char **argv) {
             const char c = (unsigned char)regs.rdx;
             (void)!write(1, &c, 1);  /* Emulate STDPRN with stdout. */
           } else if (ah == 0x30) {  /* Get DOS version number. */
+            const unsigned char al = (unsigned char)regs.rax;
             *(unsigned short*)&regs.rax = 5 | 0 << 8;  /* 5.0. */
-            *(unsigned short*)&regs.rbx = 0xff00;  /* MS-DOS with high 8 bits of OEM serial number in BL. */
+            *(unsigned short*)&regs.rbx = al == 1 ? 0x1000 :  /* DOS in HMA. */
+                0xff00;  /* MS-DOS with high 8 bits of OEM serial number in BL. */
             *(unsigned short*)&regs.rcx = 0;  /* Low 16 bits of OEM serial number in CX. */
           } else if (ah == 0x40) {  /* Write using handle. */
             const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
