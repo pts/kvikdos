@@ -807,7 +807,7 @@ int main(int argc, char **argv) {
       arg = *argv++;
      do_mount:  /* Default: --mount C:. */
       if ((arg[0] & ~32) - 'A' + 0U > 'D' - 'A' + 0U || arg[1] != ':') {
-        fprintf(stderr, "fatal: mount argument must with <drive>:, <drive> must be A, B, C or D: %s\n", arg);
+        fprintf(stderr, "fatal: mount argument must start with <drive>:, <drive> must be A, B, C or D: %s\n", arg);
         exit(1);
       } else {
         const char drive_idx = (arg[0] & ~32) - 'A';
@@ -828,9 +828,21 @@ int main(int argc, char **argv) {
         }
         dir_state.linux_mount_dir[(unsigned)drive_idx] = arg;  /* argv retains ownership of arg. */
       }
-    } else if (0 == strcmp(arg, "--mount=")) {
+    } else if (0 == strncmp(arg, "--mount=", 8)) {
       arg += 8;
       goto do_mount;
+    } else if (0 == strcmp(arg, "--drive")) {  /* Can be specified multiple times. */
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+     do_drive:  /* Default: --drive C: */
+      if ((arg[0] & ~32) - 'A' + 0U > 'D' - 'A' + 0U || !(arg[1] == '\0' || (arg[1] == ':' && arg[2] == '\0'))) {
+        fprintf(stderr, "fatal: drive argument must be <drive>:, <drive> must be A, B, C or D: %s\n", arg);
+        exit(1);
+      }
+      dir_state.drive = arg[0] & ~32;
+    } else if (0 == strncmp(arg, "--drive=", 8)) {
+      arg += 8;
+      goto do_drive;
     } else {
       fprintf(stderr, "fatal: unknown command-line flag: %s\n", arg);
       exit(1);
@@ -839,6 +851,11 @@ int main(int argc, char **argv) {
   /* Now: argv contains remaining (non-flag) arguments. */
   if (!argv[0]) {
     fprintf(stderr, "fatal: missing <dos-com-or-exe-file> program filename\n");
+    exit(1);
+  }
+  if (!dir_state.linux_mount_dir[dir_state.drive - 'A']) {
+    /*dir_state.drive = 'C';*/
+    fprintf(stderr, "fatal: no mount point for default drive (specify --mount=...): %c:\n", dir_state.drive);
     exit(1);
   }
   prog_filename = *argv++;  /* This is a Linux filename. */
