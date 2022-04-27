@@ -758,6 +758,7 @@ int main(int argc, char **argv) {
   unsigned char sphinx_cmm_flags;
   char ctrl_break_checking;  /* 0 or 1. Just a flag, doesn't have any use case. */
   DirState dir_state;
+  unsigned dta_seg_ofs;  /* Disk transfer address (DTA). */
 
   (void)argc;
   if (!argv[0] || !argv[1] || 0 == strcmp(argv[1], "--help")) {
@@ -1004,6 +1005,7 @@ int main(int argc, char **argv) {
   sphinx_cmm_flags = 0;
   ctrl_break_checking = 0;
   dir_state.linux_prog = prog_filename;
+  dta_seg_ofs = 0x80 | PSP_PARA << 16;
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
 
   if (DEBUG) dump_regs("debug", &regs, &sregs);
@@ -1554,6 +1556,12 @@ int main(int argc, char **argv) {
             const unsigned char dl = (unsigned char)regs.rdx;
             if (dl < 4 && dir_state.linux_mount_dir[dl]) dir_state.drive = dl + 'A';
             *(unsigned char*)&regs.rax = 26;  /* 26 drives: 'A' .. 'Z'. */
+          } else if (ah == 0x2f) {  /* Get disk transfer address (DTA). */
+            sregs.es.selector = dta_seg_ofs >> 16;
+            sregs.es.selector = PSP_PARA;
+            *(unsigned short*)&regs.rbx = dta_seg_ofs;
+          } else if (ah == 0x1a) {  /* Set disk transfer address (DTA). */
+            dta_seg_ofs = *(unsigned short*)&regs.rdx | sregs.ds.selector << 16 ;
           } else if (ah == 0x63) {  /* Get lead byte table. Multibyte support in MS-DOS 2.25. */
             *(unsigned short*)&regs.rax = 1;  /* Invalid function number. */
             goto error_on_21;
