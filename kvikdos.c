@@ -573,6 +573,7 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
       for (; *p != '\0';) {
         const char c = *p++;
         if (out_p == out_pend) goto too_long;
+        /* !! Security: don't allow too many ..s, e.g. C:\..\..\..\..\..\..\..\MY\FILE */
         *out_p++ = (c == '\\') ? '/'  /* Convert '\\' to '/'. */
                  : (c - 'a' + 0U <= 'z' - 'a' + 0U) ? c & ~32 : c;  /* Convert to uppercase. */
       }
@@ -587,6 +588,60 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
 static char fnbuf[LINUX_PATH_SIZE], fnbuf2[LINUX_PATH_SIZE];
 
 #define get_linux_filename(p) get_linux_filename_r((p), &dir_state, fnbuf)
+
+#define DOS_PATH_SIZE 64  /* See int 0x21 ah == 0x47 (get current directory) */
+static char dosfnbuf[DOS_PATH_SIZE];
+
+/* Converts Linux pathname p to DOS absolute pathname into out_buf (of
+ * DOS_PATH_SIZE bytes). Always returns out_buf. On error, sets out_buf to
+ * the empty string. */
+static const char *get_dos_abs_filename_r(const char *p, const DirState *dir_state, char *out_buf) {
+  char drive, best_drive;
+  size_t best_mp_size;
+  const char *p0;
+  while (p[0] == '.' && p[1] == '/') {
+    for (p += 2; p[0] == '/'; ++p) {}
+  }
+  p0 = p;
+  best_drive = '\0'; best_mp_size = 0;
+  for (drive = 'A'; drive <= 'D'; ++drive) {  /* TODO(pts): Find the longest matching linux_mount_dir. */
+    const char *mp = dir_state->linux_mount_dir[drive - 'A'];
+    if (mp) {
+      const size_t mp_size = strlen(mp);
+      if (0 == strncmp(p0, mp, mp_size) && mp_size >= best_mp_size) {  /* >= here ensures that we can find mp_size == 0 (default). */
+        best_drive = drive;
+        best_mp_size = best_mp_size;
+      }
+    }
+  }
+  if (best_drive == '\0') goto error;  /* No mounted drives. */
+  {
+    const char *mp = dir_state->linux_mount_dir[best_drive - 'A'];
+    const size_t mp_size = strlen(mp);
+    if (0 == strncmp(p0, mp, mp_size)) {
+      char *r = out_buf;
+      char *rend = out_buf + DOS_PATH_SIZE - 1;
+      *r++ = best_drive;
+      *r++ = ':';
+      *r++ = '\\';
+      for (p = p0 + mp_size; *p != '\0';) {
+        const char c = *p++;
+        if (r == rend) goto error;  /* DOS pathname too long. */
+        if (c == '/') {
+          for (; *p == '/'; ++p) {}  /* Skip subsequent slashes. */
+        }
+        /* TODO(pts): Check that each pathname component is at most 8.3 bytes long. */
+        *r++ = (c == '/') ? '\\'  /* Convert '/' to '\\'. */
+             : (c - 'a' + 0U <= 'z' - 'a' + 0U) ? c & ~32 : c;  /* Convert to uppercase. */
+      }
+      *r = '\0';
+      return out_buf;
+    }
+  }
+ error:
+  *out_buf = '\0';  /* Mount point not found. */
+  return out_buf;
+}
 
 /* `var' usually looks like `PATH=C:\value'. Everything before the '=' is converted to lowercase. */
 static char *add_env(char *env, char *env_end, const char *var, char do_check) {
@@ -698,7 +753,7 @@ int main(int argc, char **argv) {
   unsigned header_size;
   char had_get_int0;
   char **envp, **envp0;
-  char *dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
+  const char *dos_prog_abs = NULL;  /* Owned externally. */
   unsigned tick_count;
   unsigned char sphinx_cmm_flags;
   DirState dir_state;
@@ -759,8 +814,7 @@ int main(int argc, char **argv) {
         arg += 2;
         if (DEBUG) fprintf(stderr, "debug: mount %c: %s\n", drive_idx + 'A', arg);
         while (arg[0] == '.' && arg[1] == '/') {
-          arg += 2;
-          for (; arg[0] == '/'; ++arg) {}
+          for (arg += 2; arg[0] == '/'; ++arg) {}
         }
         if (arg[0] == '.' && arg[1] == '\0') {
           ++arg;
@@ -791,6 +845,12 @@ int main(int argc, char **argv) {
   /* Remaining arguments in argv will be passed to the DOS program in PSP:0x80. */
 
   prog_filename = find_program(prog_filename, &dir_state, getenv_prefix("PATH=", (char const**)envp0, (char const**)envp));
+  if (dos_prog_abs == NULL) {
+    /* TODO(pts): Use pathnames in the DOS %PATH% instead to convert prog_filename back to DOS. */
+    dos_prog_abs = get_dos_abs_filename_r(prog_filename, &dir_state, dosfnbuf);
+    if (DEBUG) fprintf(stderr, "debug: dos_prog_abs=%s\n", dos_prog_abs);
+    if (dos_prog_abs[0] == '\0') dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
+  }
   img_fd = open(prog_filename, O_RDONLY);
   if (img_fd < 0) {
     fprintf(stderr, "fatal: can not open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
