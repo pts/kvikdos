@@ -76,7 +76,11 @@ Features and advantages:
 * kvikdos is very fast, it runs CPU-intensive code at almost native speeds
   with Linux KVM. For I/O-intensive code, kvikdos tries to satisfy DOS I/O
   calls using the corresponding Linux system calls (mapping as directly as
-  possible), thus it has less overhead than other emulators.
+  possible), thus it has less overhead than other emulators. See
+  benchmark/benchmark.md for a comparison between kvikdos, DOSBox and QEMU.
+  For CPU-intensive worklad, kvikdos and QEMU + KVM are on par, each of them
+  is about 11.49 times faster than the next emulator. For mixed CPU and I/O
+  workload, kvikdos is 4.507 times faster than anything else.
 
 * All features of a modern Intel CPU (such as floating point instructions
   and 32-bit registers), except for protected mode and using more than 1 MiB
