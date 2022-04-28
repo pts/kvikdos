@@ -818,7 +818,7 @@ static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, ch
       ((had_get_ints & 4) && int_num == 0x06) ||  /* TLINK 4.0. */
       ((had_get_ints & 1) && (int_num == 0x00 || int_num == 0x24 || int_num == 0x3f))  /* Turbo Pascal 7.0. */ ||
       ((had_get_ints & 1) && int_num == 0x75)  /* Microsoft QuickBASIC 4.50 compiler qbc.exe. */  ||
-      ((had_get_ints & 1) && (int_num == 0x00 || int_num == 0x02 || int_num - 0x35 + 0U <= 0x3f - 0x35 + 0U))  /* Microsoft BASIC Professional Development System 7.1 compiler pbc.exe. */) {
+      ((had_get_ints & 1) && (int_num == 0x00 || int_num == 0x02 || int_num - 0x35 + 0U <= 0x3f - 0x35 + 0U))  /* Microsoft BASIC Professional Development System 7.10 compiler pbc.exe. */) {
     /* FYI kvikdos never sends Ctrl-<Break>. */
   } else {
     fprintf(stderr, "fatal: unsupported set interrupt vector int:%02x to cs:%04x ip:%04x\n",
@@ -1377,7 +1377,7 @@ int main(int argc, char **argv) {
             if (get_int_num == 0x18) had_get_ints |= 2;  /* TASM 3.2, for memory allocation. */
             if (get_int_num == 0x06) had_get_ints |= 4;  /* TLINK 4.0. */
             if (had_get_ints & 1 ||
-                get_int_num - 0x22 + 0U <= 0x24 - 0x22 + 0U ||  /* Microsoft BASIC Professional Development System 7.1 linker pblink.exe gets interrupt vector 0x24. */
+                get_int_num - 0x22 + 0U <= 0x24 - 0x22 + 0U ||  /* Microsoft BASIC Professional Development System 7.10 linker pblink.exe gets interrupt vector 0x24. */
                 get_int_num == 0x18 ||  /* TASM 3.2, used for memory allocation. */
                 get_int_num == 0x06) {  /* TLINK 4.0. */
               const unsigned short *pp = (const unsigned short*)((char*)mem + (get_int_num << 2));
@@ -1854,13 +1854,13 @@ int main(int argc, char **argv) {
         } else if (addr == 0xfffea && mmio_len == 1 && !run->mmio.is_write && (sphinx_cmm_flags & 3) == 3) {
           /* SPHiNX C-- 1.04 compiler does this, just ignore. */
         } else if (addr - (ENV_PARA << 4) < (PROGRAM_MCB_PARA - 1 - ENV_PARA) << 4 && run->mmio.is_write && mmio_len <= 16) {  /* Overwrites environment area. */
-          /* Microsoft BASIC Professional Development System 7.1 linker pblink.exe. It overwrites length and program name with program name and args. */
+          /* Microsoft BASIC Professional Development System 7.10 linker pblink.exe. It overwrites length and program name with program name and args. */
           /* This emulation is a little bit slow (because of the ioctl(... KVM_RUN ...) overhead), but it's called only less than 75 times at startup. */
           memcpy((char*)mem + addr, run->mmio.data, mmio_len);
-        } else if (addr == 0xffffe && !run->mmio.is_write && mmio_len == 1) {  /* BASIC programs compiled by Microsoft BASIC Professional Development System 7.1 compiler pbc.exe */
+        } else if (addr == 0xffffe && !run->mmio.is_write && mmio_len == 1) {  /* BASIC programs compiled by Microsoft BASIC Professional Development System 7.10 compiler pbc.exe */
           run->mmio.data[0] = 0xfc;  /* Machine ID is regular OC (0xfc). Same as default in src/ints/bios.cpp in DOSBox 0.74. */
         } else if (addr < 0x400 && run->mmio.is_write && addr + mmio_len <= 0x400 && ((mmio_len == 2 && (addr & 1) == 0) || (mmio_len == 4 && (addr & 3) == 0))) {  /* Set interrupt vector directly (not via int 0x21 call with ah == 0x25). */
-          /* Microsoft BASIC Professional Development System 7.1 compiler pbc.exe */
+          /* Microsoft BASIC Professional Development System 7.10 compiler pbc.exe */
           const unsigned char set_int_num = addr >> 2;
           if (mmio_len == 2) {  /* There are subsequent sets (segment and offset parts), we buffer them, and call set_int only once. */
             if (addr & 2) {  /* Set segment part. */
