@@ -1,3 +1,10 @@
+/*
+ * kvikdos.c: a very fast DOS emulator for Linux
+ * by pts@fazekas.hu at 2022-04-20
+ *
+ * This is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.
+ */
+
 #define _GNU_SOURCE 1  /* For MAP_ANONYMOUS and memmem(). */
 #include <errno.h>
 #include <fcntl.h>
