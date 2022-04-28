@@ -896,6 +896,7 @@ int main(int argc, char **argv) {
   DirState dir_state;
   unsigned dta_seg_ofs;  /* Disk transfer address (DTA). */
   unsigned ongoing_set_int;
+  unsigned short last_dos_error_code;
 
   (void)argc;
   if (!argv[0] || !argv[1] || 0 == strcmp(argv[1], "--help")) {
@@ -1145,6 +1146,7 @@ int main(int argc, char **argv) {
   dir_state.linux_prog = prog_filename;
   dta_seg_ofs = 0x80 | PSP_PARA << 16;
   ongoing_set_int = 0;  /* No set_int operation ongoing. */
+  last_dos_error_code = 0;
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
   { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
 
@@ -1230,6 +1232,9 @@ int main(int argc, char **argv) {
              error_invalid_handle:
               *(unsigned short*)&regs.rax = 6;  /* Invalid handle. */
              error_on_21:
+              { last_dos_error_code = *(unsigned short*)&regs.rax;
+                if (last_dos_error_code > 0x12) *(unsigned short*)&regs.rax = 0x0d;  /* Invalid data. Use int 0x21 call with ah == 0x59 to get the real error. */
+              }
               *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
             } else {
               const char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
@@ -1781,6 +1786,15 @@ int main(int argc, char **argv) {
             }
           } else if (ah == 0x51 || ah == 0x62) {  /* Get process ID (PSP) (0x51). Get PSP (0x62). */
             *(unsigned short*)&regs.rbx = PSP_PARA;
+          } else if (ah == 0x59) {  /* Get extended error information. */
+            *(unsigned short*)&regs.rax = last_dos_error_code;
+            if (last_dos_error_code == 0)  {  /* No error. */
+              *(unsigned short*)&regs.rbx = 0xd << 8  /* error class: unknown */ | 6  /* ignore */;
+              *(unsigned short*)&regs.rcx = *(unsigned char*)&regs.rcx | 1 << 8;  /* CH: Locus: unknown. */
+            } else {
+              *(unsigned short*)&regs.rbx = 6 << 8  /* error class: system failure */ | 4  /* abort with cleanup */;
+              *(unsigned short*)&regs.rcx = *(unsigned char*)&regs.rcx | 2 << 8;  /* CH: Locus: block device. */
+            }
           } else {
             goto fatal_int;
           }
