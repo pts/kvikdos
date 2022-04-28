@@ -1204,6 +1204,7 @@ int main(int argc, char **argv) {
             const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
             if (fd < 0) goto error_invalid_handle;  /* Not strictly needed, close(...) would check. */
             if (close(fd) != 0) goto error_from_linux;
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x45) {  /* Duplicate handle (dup()). */
             const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
             int fd2;
