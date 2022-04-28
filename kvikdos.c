@@ -630,7 +630,7 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
   out_pend = out_p + LINUX_PATH_SIZE - 1;
   if (in_linux) {
     const size_t size = strlen(in_linux);
-    if (size > (size_t)(out_pend - out_p)) { too_long:  /* Pathname too long. !!! Handle this error. !! Report error 0x3 (Path not found) or 0x44 (Network name limit exceeded). */
+    if (size > (size_t)(out_pend - out_p)) { too_long:  /* Pathname too long. !! Handle this error. !! Report error 0x3 (Path not found) or 0x44 (Network name limit exceeded). */
       goto error;
     }
     memcpy(out_p, in_linux, size);
