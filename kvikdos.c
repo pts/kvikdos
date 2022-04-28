@@ -123,6 +123,8 @@
  */
 #define is_linear_byte_user_writable(linear) ((linear) - (ENV_PARA << 4) < (DOS_MEM_LIMIT - (ENV_PARA << 4)))
 
+#define FINDFIRST_MAGIC 0xd5ba1ad0U
+
 /* --- Memory allocation helpers. */
 
 #define PROCESS_ID  0x192  /* Same as in DOSBox. */
@@ -1683,6 +1685,7 @@ int main(int argc, char **argv) {
               dta = (char*)mem + dta_linear;
               memset(dta, '\0', 0x16);
               tm = localtime(&st.st_mtime);
+              *(unsigned*)dta = FINDFIRST_MAGIC;  /* Just a random value which findnext can identify. */
               *(unsigned short*)(dta + 0x16) = tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11;
               *(unsigned short*)(dta + 0x18) = tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 1980) << 9;
               *(unsigned*)(dta + 0x1a) = (sizeof(st.st_size) > 4 && st.st_size >> (32 * (sizeof(st.st_size) > 4))) ?
@@ -1692,6 +1695,13 @@ int main(int argc, char **argv) {
               if (DEBUG) fprintf(stderr, "debug: found Linux file: %s\n", fnb);
             }
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x4f) {  /* Find next matching file (findnext). */
+            const unsigned dta_linear = (dta_seg_ofs & 0xffff) + (dta_seg_ofs >> 16 << 4);
+            if (!is_linear_byte_user_writable(dta_linear) || !is_linear_byte_user_writable(dta_linear + 0x2b - 1)) goto error_invalid_parameter;
+            { char * const dta = (char*)mem + dta_linear;
+              if (*(unsigned*)dta != FINDFIRST_MAGIC) goto error_invalid_parameter;
+              goto no_more_files;
+            }
           } else if (ah == 0x37) {  /* Get/set switch character (for command-line flags). */
             const unsigned char al = (unsigned char)regs.rax;
             if (al == 0x00) {  /* Get. */
