@@ -77,6 +77,48 @@
  * 0xffffe                +0x1  ROM machine ID. IBM computer type code.
  */
 
+/* Typical system interrupts, from http://www2.ift.ulaval.ca/~marchand/ift17583/dosints.pdf :
+ *
+ * int 0x00 - internal - DIVIDE ERROR
+ * int 0x01 - internal - SINGLE-STEP
+ * int 0x02 - hardware - NMI (NON-MASKABLE INTERRUPT)
+ * int 0x03 - ONE-BYTE INTERRUPT
+ * int 0x04 - internal - OVERFLOW
+ * int 0x05 - PRINT-SCREEN KEY
+ * int 0x05 - internal - BOUND CHECK FAILED (186/286)
+ * int 0x06 - internal - UNDEFINED OPCODE (286)
+ * int 0x07 - internal - NO MATH UNIT AVAILABLE (286)
+ * int 0x08 - IRQ0 - TIMER INTERRUPT
+ * int 0x09 - IRQ1 - KEYBOARD INTERRUPT
+ * int 0x0a - IRQ2 - EGA VERTICAL RETRACE
+ * int 0x0b - IRQ3 - COM2 INTERRUPT
+ * int 0x0c - IRQ4 - COM1 INTERRUPT
+ * int 0x0d - IRQ5 - FIXED DISK (PC), LPT2 (AT/PS)
+ * int 0x0e - IRQ6 - DISKETTE INTERRUPT
+ * int 0x0f - IRQ7 - PRINTER INTERRUPT
+ * int 0x70 - IRQ8 (AT/XT286/PS50+) - REAL-TIME CLOCK
+ * int 0x71 - IRQ9 (AT/XT286/PS50+) - LAN ADAPTER 1
+ * int 0x72 - IRQ10 (AT/XT286/PS50+) - RESERVED
+ * int 0x73 - IRQ11 (AT/XT286/PS50+) - RESERVED
+ * int 0x74 - IRQ12 (PS50+) - MOUSE INTERRUPT
+ * int 0x75 - IRQ13 (AT/XT286/PS50+) - 80287 ERROR
+ * int 0x76 - IRQ14 (AT/XT286/PS50+) - FIXED DISK
+ * int 0x77 - IRQ15 (AT/XT286/PS50+) - RESERVED
+ *
+ * Typical 286 protected-mode interrupts:
+ *
+ * int 0x08 - internal - DOUBLE FAULT
+ * int 0x09 - internal - MATH UNIT PROTECTION FAULT
+ * int 0x0a - internal - INVALID TASK STATE SEGMENT
+ * int 0x0b - internal - NOT PRESENT
+ * int 0x0c - internal - STACK FAULT (80286)
+ * int 0x0d - internal - GENERAL PROTECTION VIOLATION
+ *
+ * Typial 386 interrupts:
+ *
+ * int 0x0e - internal - PAGE FAULT (386 native mode)
+ */
+
 #define INT_HLT_PARA 0x54
 
 /* Start of Program Segment Prefix (PSP) in paragraphs (unit of 16 bytes).
