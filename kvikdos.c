@@ -1756,6 +1756,8 @@ int main(int argc, char **argv) {
               fprintf(stderr, "fatal: unsupported subcall for switch character: 0x%02x\n", al);
               goto fatal;
             }
+          } else if (ah == 0x51 || ah == 0x62) {  /* Get process ID (PSP) (0x51). Get PSP (0x62). */
+            *(unsigned short*)&regs.rbx = PSP_PARA;
           } else {
             goto fatal_int;
           }
