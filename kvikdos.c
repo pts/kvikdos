@@ -808,6 +808,7 @@ static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, ch
       value_seg_ofs == *p ||  /* Unchanged. */
       value_seg_ofs == MAGIC_INT_VALUE(int_num) ||  /* Set back to original. */
       ((had_get_ints & 2) && int_num == 0x18) ||  /* TASM 3.2. */
+      ((had_get_ints & 4) && int_num == 0x06) ||  /* TLINK 4.0. */
       ((had_get_ints & 1) && (int_num == 0x00 || int_num == 0x24 || int_num == 0x3f))  /* Turbo Pascal 7.0. */ ||
       ((had_get_ints & 1) && (int_num == 0x00 || int_num == 0x02 || int_num - 0x35 + 0U <= 0x3f - 0x35 + 0U))  /* Microsoft BASIC Professional Development System 7.1 compiler pbc.exe. */) {
     /* FYI kvikdos never sends Ctrl-<Break>. */
@@ -1366,9 +1367,11 @@ int main(int argc, char **argv) {
             const unsigned char get_int_num = (unsigned char)regs.rax;
             if (get_int_num == 0) had_get_ints |= 1;  /* Turbo Pascal 7.0 programs start with this. */
             if (get_int_num == 0x18) had_get_ints |= 2;  /* TASM 3.2, for memory allocation. */
+            if (get_int_num == 0x06) had_get_ints |= 4;  /* TLINK 4.0. */
             if (had_get_ints & 1 ||
                 get_int_num - 0x22 + 0U <= 0x24 - 0x22 + 0U ||  /* Microsoft BASIC Professional Development System 7.1 linker pblink.exe gets interrupt vector 0x24. */
-                get_int_num == 0x18) {  /* TASM 3.2, used for memory allocation. */
+                get_int_num == 0x18 ||  /* TASM 3.2, used for memory allocation. */
+                get_int_num == 0x06) {  /* TLINK 4.0. */
               const unsigned short *pp = (const unsigned short*)((char*)mem + (get_int_num << 2));
               if (DEBUG) fprintf(stderr, "debug: get interrupt vector int:%02x is cs:%04x ip:%04x\n", get_int_num, pp[1], pp[0]);
               (*(unsigned short*)&regs.rbx) = pp[0];
