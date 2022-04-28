@@ -1607,6 +1607,15 @@ int main(int argc, char **argv) {
               goto fatal;
             }
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x37) {  /* Get/set switch character (for command-line flags). */
+            const unsigned char al = (unsigned char)regs.rax;
+            if (al == 0x00) {  /* Get. */
+              *(unsigned char*)&regs.rax = 0;  /* Success. */
+              *(unsigned char*)&regs.rdx = '/';
+            } else {
+              fprintf(stderr, "fatal: unsupported subcall for switch character: 0x%02x\n", al);
+              goto fatal;
+            }
           } else {
             goto fatal_int;
           }
