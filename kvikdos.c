@@ -118,6 +118,13 @@
 
 #define PROGRAM_HEADER_SIZE 28  /* Large enough for .exe header (28 bytes). */
 
+/* Returns true iff the byte at the specified DOS linear address is
+ * user-writable (i.e. the program is allowed to write it).
+ */
+#define is_linear_byte_user_writable(linear) ((linear) - (ENV_PARA << 4) < (DOS_MEM_LIMIT - (ENV_PARA << 4)))
+
+/* --- Memory allocation helpers. */
+
 #define PROCESS_ID  0x192  /* Same as in DOSBox. */
 
 #define MCB_TYPE(mcb) (*(char*)(mcb))  /* 'Z' indicates last member of MCB chain; 'M' would be non-last. */
@@ -194,6 +201,8 @@ static void check_all_mcbs(void *mem) {
 #else
 #define DEBUG_CHECK_ALL_MCBS(mem) do {} while (0)
 #endif
+
+/* --- */
 
 static char is_same_ascii_nocase(const char *a, const char *b, unsigned size) {
   while (size-- != 0) {
@@ -779,6 +788,32 @@ static const struct {
   unsigned short casemap_callback_seg;  /* Natural alignment of 2 bytes. */
   char data_separator[2];
 } country_info = { 0, "$", ",", ".", "-", ":", 0, 2, 0, 0xf, INT_HLT_PARA - 1, "," };
+
+static const char *get_dos_basename(const char *fn) {
+  const char *fnp;
+  if (fn[0] != '\0' && fn[1] == ':') fn += 2;
+  for (fnp = fn + strlen(fn); fnp != fn && fnp[-1] != '\\'; --fnp) {}
+  return fnp;
+}
+
+static const char *get_linux_basename(const char *fn) {
+  const char *fnp;
+  for (fnp = fn + strlen(fn); fnp != fn && fnp[-1] != '/'; --fnp) {}
+  return fnp;
+}
+
+/* Returns bool indicating whether all components of the specified filename (as a DOS pathname, maybe absolute) are limited to DOS 8.3 characters. */
+static char is_dos_filename_83(const char *fn) {
+  unsigned u;
+  if (fn[0] != '\0' && fn[1] == ':') fn += 2;
+  for (u = 0; u <= 8 && *fn != '.' && *fn != '\0'; ++fn, ++u) {}
+  if (u > 8) return 0;
+  if (*fn == '.') {
+    for (u = 0, ++fn; u <= 3 && *fn != '\0'; ++fn, ++u) {}
+    if (u > 3) return 0;
+  }
+  return 1;
+}
 
 int main(int argc, char **argv) {
   struct kvm_fds kvm_fds;
@@ -1605,6 +1640,56 @@ int main(int argc, char **argv) {
             } else {
               fprintf(stderr, "fatal: unsupported subcall for country: 0x%02x\n", al);
               goto fatal;
+            }
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x37) {  /* Get/set switch character (for command-line flags). */
+            const unsigned char al = (unsigned char)regs.rax;
+            if (al == 0x00) {  /* Get. */
+              *(unsigned char*)&regs.rax = 0;  /* Success. */
+              *(unsigned char*)&regs.rdx = '/';
+            } else {
+              fprintf(stderr, "fatal: unsupported subcall for switch character: 0x%02x\n", al);
+              goto fatal;
+            }
+          } else if (ah == 0x4e) {  /* Find first matching file (findfirst). */
+            const unsigned short attrs = *(unsigned short*)&regs.rcx;
+            const char * const pattern = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            const char *fn, *fnb;
+            const unsigned dta_linear = (dta_seg_ofs & 0xffff) + (dta_seg_ofs >> 16 << 4);
+            if (!is_linear_byte_user_writable(dta_linear) || !is_linear_byte_user_writable(dta_linear + 0x2b - 1)) goto error_invalid_parameter;
+            if (attrs & 8) {  /* Volume label requested. */
+             no_more_files:
+              *(unsigned short*)&regs.rax = 0x12;  /* No more files. */
+              goto error_on_21;
+            }
+            if (strchr(pattern, '*') || strchr(pattern, '?')) {  /* TODO(pts): What happens if there are wildcards in earlier pathname components? */
+              fprintf(stderr, "fatal: unsupported wildcards in findfirst pattern: %s\n", pattern);
+              goto fatal;
+            }
+            if (!is_dos_filename_83(get_dos_basename(pattern))) goto no_more_files;
+            fn = get_linux_filename(pattern);
+            fnb = get_linux_basename(fn);
+            if (strlen(fnb) > 12) {
+              goto no_more_files;  /* is_dos_filename_83 ensures this, but let's double check for security of the strcpy(...) below. */
+            } else {
+              char *dta;
+              struct stat st;
+              struct tm *tm;
+              if (stat(fn, &st) != 0) {
+                if (errno == ENOENT) goto no_more_files;
+                goto error_from_linux;
+              }
+              if (S_ISDIR(st.st_mode) && !(attrs & 0x10)) goto no_more_files;
+              dta = (char*)mem + dta_linear;
+              memset(dta, '\0', 0x16);
+              tm = localtime(&st.st_mtime);
+              *(unsigned short*)(dta + 0x16) = tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11;
+              *(unsigned short*)(dta + 0x18) = tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 1980) << 9;
+              *(unsigned*)(dta + 0x1a) = (sizeof(st.st_size) > 4 && st.st_size >> (32 * (sizeof(st.st_size) > 4))) ?
+                  0xffffffffU : st.st_size;  /* Cap file size at 0xffffffff, no way to return more than 32 bits. */
+              strcpy(dta + 0x1e, fnb);  /* Secure because of the strlen(fnb) check above. */
+              /* We use 0x1e + 13 == 0x2b bytes in dta. */
+              if (DEBUG) fprintf(stderr, "debug: found Linux file: %s\n", fnb);
             }
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x37) {  /* Get/set switch character (for command-line flags). */
