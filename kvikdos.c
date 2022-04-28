@@ -29,7 +29,9 @@
  *
  * 0x00000...0x00400    +0x400  Interrupt vector table (IVT).
  * 0x00400...0x00500    +0x100  BIOS data area (BDA). Kept as 00s. https://stanislavs.org/helppc/bios_data_area.html  https://wiki.osdev.org/Memory_Map_(x86)  http://www.bioscentral.com/misc/bda.htm  http://staff.ustc.edu.cn/~xyfeng/research/cos/resources/BIOS/Resources/biosdata.htm
- * 0x00500...0x00540     +0x40  BIOS/DOS data area. Kept as 00s. https://stanislavs.org/helppc/bios_data_area.html
+ * 0x00500...0x00534     +0x34  BIOS/DOS data area. Kept as 00s. https://stanislavs.org/helppc/bios_data_area.html
+ * 0x00534...0x0053f      +0xb  Unused (00).
+ * 0x0053f...0x00540        +1  `retf' opcode used by country case map.
  * 0x00540...0x00640    +0x100  INT_HLT_PARA. hlt instructions for interrupt entry points. Needed for getting the interrupt number in KVM_EXIT_HLT.
  * 0x00640...0x00ff0    +0xabc  ENV_PARA. Environment variables and program pathname.
  * 0x00ff0...0x01000     +0x10  PROGRAM_MCB_PARA. Memory Control Block (MCB) of PSP.
@@ -764,6 +766,19 @@ static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, ch
   return 0;  /* Success. */
 }
 
+static const struct {
+  unsigned short date_format;
+  char currency[5];
+  char thousands_separator[2];
+  char decimal_separator[2];
+  char date_separator[2];
+  char time_separator[2];
+  char currency_format, digits_after_decimal, time_format;
+  unsigned short casemap_callback_ofs;  /* Points to a `retf' opcode. Natural alignment of 2 bytes. */
+  unsigned short casemap_callback_seg;  /* Natural alignment of 2 bytes. */
+  char data_separator[2];
+} country_info = { 0, "$", ",", ".", "-", ":", 0, 2, 0, 0xf, INT_HLT_PARA - 1, "," };
+
 int main(int argc, char **argv) {
   struct kvm_fds kvm_fds;
   void *mem;
@@ -960,6 +975,7 @@ int main(int argc, char **argv) {
    * https://stanislavs.org/helppc/bios_data_area.html
    */
   *(unsigned short*)((char*)mem + 0x410) = 0x22;  /* BIOS equipment flags. https://stanislavs.org/helppc/int_11.html */
+  ((char*)mem)[(INT_HLT_PARA << 4) - 1] = (char)0xcb;  /* `retf' opcode used by country case map.. */
 
   if ((kvm_fds.vcpu_fd = ioctl(kvm_fds.vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
     perror("fatal: can not create KVM vcpu");
@@ -1033,6 +1049,7 @@ int main(int argc, char **argv) {
   dta_seg_ofs = 0x80 | PSP_PARA << 16;
   ongoing_set_int = 0;  /* No set_int operation ongoing. */
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
+  { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
 
   if (DEBUG) dump_regs("debug", &regs, &sregs);
 
@@ -1575,6 +1592,17 @@ int main(int argc, char **argv) {
           } else if (ah == 0x63) {  /* Get lead byte table. Multibyte support in MS-DOS 2.25. */
             *(unsigned short*)&regs.rax = 1;  /* Invalid function number. */
             goto error_on_21;
+          } else if (ah == 0x38) {  /* Get/set country dependent information. */
+            const unsigned char al = (unsigned char)regs.rax;
+            char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            if (al == 0x00) {  /* Get. */
+              memcpy(p, &country_info, 0x18);
+              *(unsigned short*)&regs.rax = *(unsigned short*)&regs.rbx = 1;
+            } else {
+              fprintf(stderr, "fatal: unsupported subcall for country: 0x%02x\n", al);
+              goto fatal;
+            }
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else {
             goto fatal_int;
           }
