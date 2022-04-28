@@ -3,6 +3,14 @@
  * by pts@fazekas.hu at 2022-04-20
  *
  * This is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.
+ *
+ * TODO(pts): Detect filenames in lower case (still simpler than DOSBox).
+ * TODO(pts): DOS STDERR to Linux fd 1 (stdout) mapping.
+ * TODO(pts): Turbo C, Turbo C++ and Borland C++ compatibility.
+ * TODO(pts): udosrun integration.
+ * TODO(pts): udosrun command-line flag compatibility.
+ * TODO(pts): Run Linux ELF programs and scripts (#!), for convenience.
+ * TODO(pts): Add support for .bat batch files (at least a subset).
  */
 
 #define _GNU_SOURCE 1  /* For MAP_ANONYMOUS and memmem(). */
