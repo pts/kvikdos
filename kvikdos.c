@@ -1271,7 +1271,7 @@ int main(int argc, char **argv) {
             char *p, *p0, *pend;
             const char *s;
             /* Input: DL: 0 = current drive, 1: A: */
-            if (*(unsigned char*)&regs.rdx != 0) {
+            if (*(unsigned char*)&regs.rdx != 0) { error_invalid_drive:
               *(unsigned short*)&regs.rax = 0xf;  /* Invalid drive specified. */
               goto error_on_21;
             }
@@ -1402,13 +1402,20 @@ int main(int argc, char **argv) {
             }
           } else if (ah == 0x44) {  /* I/O control (ioctl). */
             const unsigned char al = (unsigned char)regs.rax;
-            if (al == 0) {  /* Get device information. */
+            if (al == 1 && (*(unsigned short*)&regs.rdx >> 8)) goto error_invalid_parameter;
+            if (al < 2) {  /* Get device information (1), set device information (2). */
               const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
               struct stat st;
               if (fd < 0) goto error_invalid_handle;
               if (fstat(fd, &st) != 0) goto error_from_linux;
-              *(unsigned short*)&regs.rdx = 1 << 5  /* binary */ | (S_ISCHR(st.st_mode) ? 1 : 0) << 7  /* character device */;
-              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+              if (al == 0) {  /* Get. */
+                *(unsigned short*)&regs.rdx = 1 << 5  /* binary */ | (S_ISCHR(st.st_mode) ? 1 : 0) << 7  /* character device */;
+                *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+              } else {
+                if (!S_ISCHR(st.st_mode)) goto error_invalid_drive;  /* We want to indicate that it's not a character device. */
+                /* TLIB 3.01 sets (dx & 0x80) to zero, to disable binary mode (and enable translation). */
+                /* We just ignore the setting. */
+              }
             } else {
               fprintf(stderr, "fatal: unsupported DOS ioctl call: 0x%02x\n", al);
               goto fatal;
