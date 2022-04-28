@@ -1022,6 +1022,7 @@ int main(int argc, char **argv) {
               fprintf(stderr, "fatal: unsupported DOS ioctl call: 0x%02x\n", al);
               goto fatal;
             }
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x4a) {  /* Modify allocated memory block (inplace_realloc()). */
             const unsigned new_size_para = *(unsigned short*)&regs.rbx;
             const unsigned short block_para = sregs.es.selector;
