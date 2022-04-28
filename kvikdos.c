@@ -745,7 +745,7 @@ static const char *find_program(const char *prog_filename, const DirState *dir_s
 /* Sets interrupt vector for int_num to value_seg_ofs in IVT. Does some
  * checks. Returns 0 on success.
  */
-static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, char had_get_int0) {
+static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, char had_get_ints) {
   unsigned * const p = (unsigned*)mem + int_num;
   if (DEBUG) {
     fprintf(stderr, "debug: set interrupt vector int:%02x to cs:%04x ip:%04x\n",
@@ -754,8 +754,9 @@ static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, ch
   if (int_num - 0x22 + 0U <= 0x24 - 022 +0U ||  /* Application Ctrl-<Break> handler == 0x23. We allow 0x22..0x24. */
       value_seg_ofs == *p ||  /* Unchanged. */
       value_seg_ofs == MAGIC_INT_VALUE(int_num) ||  /* Set back to original. */
-      (had_get_int0 && (int_num == 0x00 || int_num == 0x24 || int_num == 0x3f))  /* Turbo Pascal 7.0. */ ||
-      (had_get_int0 && (int_num == 0x00 || int_num == 0x02 || int_num - 0x35 + 0U <= 0x3f - 0x35 + 0U))  /* Microsoft BASIC Professional Development System 7.1 compiler pbc.exe. */) {
+      ((had_get_ints & 2) && int_num == 0x18) ||  /* TASM 3.2. */
+      ((had_get_ints & 1) && (int_num == 0x00 || int_num == 0x24 || int_num == 0x3f))  /* Turbo Pascal 7.0. */ ||
+      ((had_get_ints & 1) && (int_num == 0x00 || int_num == 0x02 || int_num - 0x35 + 0U <= 0x3f - 0x35 + 0U))  /* Microsoft BASIC Professional Development System 7.1 compiler pbc.exe. */) {
     /* FYI kvikdos never sends Ctrl-<Break>. */
   } else {
     fprintf(stderr, "fatal: unsupported set interrupt vector int:%02x to cs:%04x ip:%04x\n",
@@ -790,7 +791,7 @@ int main(int argc, char **argv) {
   const char *prog_filename;
   char header[PROGRAM_HEADER_SIZE];
   unsigned header_size;
-  char had_get_int0;
+  char had_get_ints;
   char **envp, **envp0;
   const char *dos_prog_abs = NULL;  /* Owned externally. */
   unsigned tick_count;
@@ -1041,7 +1042,7 @@ int main(int argc, char **argv) {
   FIX_SREG(fs);
   FIX_SREG(gs);
 
-  had_get_int0 = 0;
+  had_get_ints = 0;  /* 1 << 0: int 0x00; 1 << 1: int 0x18. */
   tick_count = 0;
   sphinx_cmm_flags = 0;
   ctrl_break_checking = 0;
@@ -1280,12 +1281,15 @@ int main(int argc, char **argv) {
             if (fd < 0) goto error_from_linux;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x25) {  /* Set interrupt vector. */
-            if (set_int((unsigned char)regs.rax, *(unsigned short*)&regs.rdx | sregs.ds.selector << 16, mem, had_get_int0)) goto fatal;
+            if (set_int((unsigned char)regs.rax, *(unsigned short*)&regs.rdx | sregs.ds.selector << 16, mem, had_get_ints)) goto fatal;
           } else if (ah == 0x35) {  /* Get interrupt vector. */
             /* !! Implement this. */
             const unsigned char get_int_num = (unsigned char)regs.rax;
-            if (get_int_num == 0) had_get_int0 = 1;  /* Turbo Pascal 7.0 programs start with this. */
-            if (had_get_int0 || get_int_num - 0x22 + 0U <= 0x24 - 0x22 + 0U) {  /* Microsoft BASIC Professional Development System 7.1 linker pblink.exe gets interrupt vector 0x24. */
+            if (get_int_num == 0) had_get_ints |= 1;  /* Turbo Pascal 7.0 programs start with this. */
+            if (get_int_num == 0x18) had_get_ints |= 2;  /* TASM 3.2, for memory allocation. */
+            if (had_get_ints & 1 ||
+                get_int_num - 0x22 + 0U <= 0x24 - 0x22 + 0U ||  /* Microsoft BASIC Professional Development System 7.1 linker pblink.exe gets interrupt vector 0x24. */
+                get_int_num == 0x18) {  /* TASM 3.2, used for memory allocation. */
               const unsigned short *pp = (const unsigned short*)((char*)mem + (get_int_num << 2));
               if (DEBUG) fprintf(stderr, "debug: get interrupt vector int:%02x is cs:%04x ip:%04x\n", get_int_num, pp[1], pp[0]);
               (*(unsigned short*)&regs.rbx) = pp[0];
@@ -1711,7 +1715,7 @@ int main(int argc, char **argv) {
               }
             }
           } else { do_set_int:
-            if (set_int(set_int_num, *(unsigned*)run->mmio.data, mem, had_get_int0)) goto fatal;
+            if (set_int(set_int_num, *(unsigned*)run->mmio.data, mem, had_get_ints)) goto fatal;
           }
         } else {
           highmsg[0] = '\0';
