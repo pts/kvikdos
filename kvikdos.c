@@ -24,6 +24,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <termios.h>
 #include <unistd.h>
 
 #ifdef USE_MINI_KVM  /* For systems with a broken linux/kvm.h. */
@@ -984,6 +985,8 @@ int main(int argc, char **argv) {
   unsigned dta_seg_ofs;  /* Disk transfer address (DTA). */
   unsigned ongoing_set_int;
   unsigned short last_dos_error_code;
+  int tty_in_fd;
+  char is_tty_in_error;
 
   (void)argc;
   if (!argv[0] || !argv[1] || 0 == strcmp(argv[1], "--help")) {
@@ -1007,6 +1010,8 @@ int main(int argc, char **argv) {
   dir_state.linux_mount_dir[3] = NULL;
 
   envp = envp0 = ++argv;
+  tty_in_fd = -1;
+  is_tty_in_error = 0;
   while (argv[0]) {
     char *arg = *argv++;
     if (arg[0] != '-' || arg[1] == '\0') {
@@ -1070,6 +1075,20 @@ int main(int argc, char **argv) {
     } else if (0 == strncmp(arg, "--drive=", 8)) {
       arg += 8;
       goto do_drive;
+    } else if (0 == strcmp(arg, "--tty-in")) {
+      int char_count;
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+     do_tty_in:
+      if (sscanf(arg, "%d%n", &tty_in_fd, &char_count) < 1 || char_count + 0U != strlen(arg) || tty_in_fd < -2) {
+        /* -1: use /dev/tty; -2: use 0 (stdin), but don't try to disable buffering. */
+        fprintf(stderr, "fatal: tty-in argument must be nonnegative integer or -1 or -2: %s\n", arg);
+        exit(1);
+      }
+      /* Now we've set tty_in_fd. */
+    } else if (0 == strncmp(arg, "--tty-in=", 8)) {
+      arg += 8;
+      goto do_tty_in;
     } else {
       fprintf(stderr, "fatal: unknown command-line flag: %s\n", arg);
       exit(1);
@@ -1942,8 +1961,36 @@ int main(int argc, char **argv) {
           } else if (ah == 0x00) {  /* Wait for keystroke and read. */
             char c;
             /* TODO(pts): Disable line buffering if isatty(0). Enable it again at exit if needed. */
-            int got = read(0, &c, 1);
-            if (got < 1) c = 26;  /* Ctrl-<Z>, simulate EOF. Most programs won't recognize it. */
+            int got;
+            struct termios tio;
+            tcflag_t old_lflag = 0;
+            if (tty_in_fd == -1) {
+              if ((tty_in_fd = open("/dev/tty", O_RDWR)) < 0) {  /* Current controlling terminal. */
+                tty_in_fd = -2;
+              } else {
+                tty_in_fd = ensure_fd_is_at_least(tty_in_fd, 5);
+              }
+            }
+            if (!is_tty_in_error) {
+              if (tcgetattr(tty_in_fd, &tio) != 0) {
+                is_tty_in_error = 1;
+              } else {
+                old_lflag = tio.c_lflag;
+                /* TODO(pts): Handle Ctrl-<C> and other signals. */
+                tio.c_lflag &= ~(ICANON | ECHO);  /* As a side effect, ECHOCTL is also disabled, so Ctrl-<C> won't show up as ^C, but it will still send SIGINT. */
+                if (tcsetattr(tty_in_fd, 0, &tio) != 0) {
+                  is_tty_in_error = 1;
+                }
+              }
+            }
+            if ((got = read(tty_in_fd == -2 ? 0 : tty_in_fd, &c, 1)) < 1) c = 26;  /* Ctrl-<Z>, simulate EOF. Most programs won't recognize it. */
+            if (!is_tty_in_error) {
+              tio.c_lflag = old_lflag;
+              /* TODO(pts): Also change it back upon exit. Even if it's a signal exit. */
+              if (tcsetattr(tty_in_fd, 0, &tio) != 0) {
+                is_tty_in_error = 1;
+              }
+            }
             *(unsigned short*)&regs.rax = (c & ~0x7f ? 0x3f : scancodes[(int)c]) << 8 | (c & 0xff);
           } else {
             goto fatal_int;
