@@ -556,12 +556,25 @@ static void copy_args_to_dos_args(char *p, char **args) {
   *p = --size;
 }
 
+/* Returns an fd for which min_fd >= fd (except if fd was negative).
+ * As a side effect, if it returns a different fd, then it closes the original fd.
+ */
 static int ensure_fd_is_at_least(int fd, int min_fd) {
-  if (fd + 0U < min_fd + 0U) {
-    int fd2 = dup(fd);
+  if (fd >= 0 && fd + 0U < min_fd + 0U) {
+    int fd2 = dup(fd), fd3;
     if (fd2 < 0) { perror("dup"); exit(252); }
     if (fd2 + 0U < min_fd + 0U) fd2 = ensure_fd_is_at_least(fd2, min_fd);
-    close(fd);  /* !! TODO(pts): Keep /dev/null open, for faster operation of many open() + close() calls. */
+    if ((fd3 = open("/dev/null", O_RDWR)) >= 0) {
+      if (fd3 == fd) {  /* Usually doesn't happen. */
+        return fd2;  /* Keep /dev/null open as fd (see below). */
+      } else if (dup2(fd3, fd) == fd) {
+        close(fd3);
+        return fd2;  /* Keep /dev/null open as fd (for which fd < min_fd), for faster operation subsequent many open() + close() calls with ensure_fd_is_at_least(). */
+      } else {
+        close(fd3);
+      }
+    }
+    close(fd);
     fd = fd2;
   }
   return fd;
