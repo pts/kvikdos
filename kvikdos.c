@@ -633,28 +633,94 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
   if (in_linux) {
     const size_t size = strlen(in_linux);
     if (size > (size_t)(out_pend - out_p)) { too_long:  /* Pathname too long. !! Handle this error. !! Report error 0x3 (Path not found) or 0x44 (Network name limit exceeded). */
-      goto error;
+     error:
+      out_p = out_buf;
+      goto done;
     }
     memcpy(out_p, in_linux, size);
     out_p += size;
   }
   {  /* Convert pathnames in in_dos */
     const char * const *in_dosi;
+    unsigned cc = 0;  /* Component count. */
+    for (in_dosi = in_dos; in_dosi != in_dos + 2; ++in_dosi) {
+      p = *in_dosi;
+      for (; *p != '\0';) {
+        if (p[0] == '.' && (p[1] == '\0' || p[1] == '\\' || p[1] == '/' || (p[1] == '.' && (p[2] == '\0' || p[2] == '\\' || p[2] == '/')))) {
+          if (p[1] == '.') {
+            /* Security: Too many levels up, outside linux_mount_dir with `..'. It's still possible to escape up if one of the pathname components is a symlink. */
+            if (cc-- == 0) goto error;
+          }
+        } else {
+          ++cc;
+        }
+        for (; *p != '\0';) {
+          const char c = *p++;
+          if (out_p == out_pend) goto too_long;
+          if (c == '\\' || c == '/') {
+            *out_p++ = '/';  /* Convert '\\' to '/'. */
+            break;
+          }
+          *out_p++ = (c - 'a' + 0U <= 'z' - 'a' + 0U) ? c & ~32 : c;  /* Convert to uppercase. */
+          /* TODO(pts) Truncate each component to 8.3 characters? */
+        }
+        for (; *p == '\\' || *p == '/'; ++p) {}
+      }
+    }
+  }
+ done:
+  *out_p = '\0';
+  if (strcmp(out_buf, "NUL") == 0) strcpy(out_buf, "/dev/null");
+  return out_buf;
+}
+
+static void get_dos_abspath_r(const char *p, const DirState *dir_state, char *out_buf, unsigned out_size) {
+  char *out_p = out_buf, *out_pend = out_buf + out_size;
+  char drive_idx;
+  const char *in_dos[2];
+  if (DEBUG) fprintf(stderr, "debug: get_dos_abspath_r (%s)\n", p);
+  if (*p == '\0' || out_size < 5) goto done;  /* Empty pathname is an error. */
+  if (p[0] != '\0' && p[1] == ':') {
+    drive_idx = (p[0] & ~32) - 'A';
+    if ((unsigned char)drive_idx >= 4) {  /* Bad or unknown drive letter. */  /* !! Report error 0x3 (Path not found) */
+      /*fprintf(stderr, "fatal: DOS filename on wrong drive: 0x%02x\n", (unsigned char)p[0]);*/  /* !! Report error 0x3 (Path not found) */
+      /*exit(252);*/
+      goto done;
+    }
+    p += 2;
+  } else {
+    drive_idx = dir_state->drive - 'A';
+  }
+  if (*p == '\\' || *p == '/') {
+    for (++p; *p == '\\' || *p == '/'; ++p) {}
+    in_dos[0] = "";
+  } else {
+    in_dos[0] = dir_state->current_dir[(int)drive_idx];
+  }
+  in_dos[1] = p;
+  {  /* Convert pathnames in in_dos */
+    const char * const *in_dosi;
+    *out_p++ = drive_idx + 'A';
+    *out_p++ = ':';
+    *out_p++ = '\\';
     for (in_dosi = in_dos; in_dosi != in_dos + 2; ++in_dosi) {
       p = *in_dosi;
       for (; *p != '\0';) {
         const char c = *p++;
-        if (out_p == out_pend) goto too_long;
-        /* !! Security: don't allow too many ..s, e.g. C:\..\..\..\..\..\..\..\MY\FILE */
-        *out_p++ = (c == '\\') ? '/'  /* Convert '\\' to '/'. */
-                 : (c - 'a' + 0U <= 'z' - 'a' + 0U) ? c & ~32 : c;  /* Convert to uppercase. */
+        if (out_p == out_pend) { out_p = out_buf; goto done; }
+        if (c == '\\' || c == '/') {
+          *out_p++ = '\\';  /* Convert '/' to '\\'. */
+          for (++p; *p == '\\' || *p == '/'; ++p) {}
+        } else {
+          *out_p++ = (c - 'a' + 0U <= 'z' - 'a' + 0U) ? c & ~32 : c;  /* Convert to uppercase. */
+          /* TODO(pts) Truncate each component to 8.3 characters? */
+        }
       }
     }
   }
- error:
+ done:
   *out_p = '\0';
-  if (strcmp(out_buf, "NUL") == 0) strcpy(out_buf, "/dev/null");
-  return out_buf;
+  if (DEBUG) fprintf(stderr, "debug: get_dos_abspath_r=(%s)\n", out_buf);
 }
 
 static char fnbuf[LINUX_PATH_SIZE], fnbuf2[LINUX_PATH_SIZE];
@@ -1805,6 +1871,15 @@ int main(int argc, char **argv) {
               *(unsigned short*)&regs.rbx = 6 << 8  /* error class: system failure */ | 4  /* abort with cleanup */;
               *(unsigned short*)&regs.rcx = *(unsigned char*)&regs.rcx | 2 << 8;  /* CH: Locus: block device. */
             }
+          } else if (ah == 0x60) {  /* Get fully qualified filename. */
+            const char * const fn = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rsi);  /* !! Security: check bounds. */
+            char * const path_out = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rdi);  /* 128 bytes of buffer. */  /* !! Security: check bounds. */
+            get_dos_abspath_r(fn, &dir_state, path_out, 128);
+            if (*path_out == '\0') {
+              *(unsigned short*)&regs.rax = 0x100;  /* We set AH to some arbitrary error code. */
+              goto error_on_21;
+            }
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else {
             goto fatal_int;
           }
