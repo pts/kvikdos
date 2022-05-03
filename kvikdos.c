@@ -598,11 +598,13 @@ typedef struct DirState {
 
 #define LINUX_PATH_SIZE 1024
 
+/* out_buf is LINUX_PATH_SIZE bytes. */
 static const char *get_linux_filename_r(const char *p, const DirState *dir_state, char *out_buf) {
   char *out_p = out_buf, *out_pend;
   const char *in_linux;
   const char *in_dos[2] = { "", "" };
   char drive_idx;
+  if (*p == '\0') goto done;  /* Empty pathname is an error. */
   if (dir_state->dos_prog_abs && strcmp(p, dir_state->dos_prog_abs) == 0) {
     in_linux = dir_state->linux_prog;
   } else {
@@ -611,17 +613,17 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
       if ((unsigned char)drive_idx >= 4) {  /* Bad or unknown drive letter. */  /* !! Report error 0x3 (Path not found) */
         /*fprintf(stderr, "fatal: DOS filename on wrong drive: 0x%02x\n", (unsigned char)p[0]);*/  /* !! Report error 0x3 (Path not found) */
         /*exit(252);*/
-        goto error;
+        goto done;
       }
       in_linux = dir_state->linux_mount_dir[(int)drive_idx];
-      if (!in_linux) goto error;  /* !! Report error 0x3 (Path not found) */
+      if (!in_linux) goto done;  /* !! Report error 0x3 (Path not found) */
       p += 2;
     } else {
       in_linux = NULL;
       drive_idx = dir_state->drive - 'A';
     }
-    if (*p == '\\') {
-      for (; *p == '\\'; ++p) {}
+    if (*p == '\\' || *p == '/') {
+      for (++p; *p == '\\' || *p == '/'; ++p) {}
     } else {
       in_dos[0] = dir_state->current_dir[(int)drive_idx];
     }
@@ -998,6 +1000,14 @@ int main(int argc, char **argv) {
     fprintf(stderr, "fatal: no mount point for default drive (specify --mount=...): %c:\n", dir_state.drive);
     exit(1);
   }
+#if 0  /* Tests for replacing the output with "" */
+  fprintf(stderr, "!!! (%s)\n", get_linux_filename("C:\\foo\\.\\.\\\\bar\\."));
+  fprintf(stderr, "!!! (%s)\n", get_linux_filename(".\\.\\."));
+  fprintf(stderr, "!!! (%s)\n", get_linux_filename(".\\aaa\\..\\..\\.."));  /* "" */
+  fprintf(stderr, "!!! (%s)\n", get_linux_filename(".\\aaa\\..\\.."));  /* "" */
+  fprintf(stderr, "!!! (%s)\n", get_linux_filename(".\\aaa\\.."));
+  fprintf(stderr, "!!! (%s)\n", get_linux_filename("C:\\foo\\.\\\\\\.\\bar\\.\\..\\.\\bazzzz\\.."));
+#endif
   prog_filename = *argv++;  /* This is a Linux filename. */
   /* Remaining arguments in argv will be passed to the DOS program in PSP:0x80. */
 
