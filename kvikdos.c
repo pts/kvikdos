@@ -2016,6 +2016,15 @@ int main(int argc, char **argv) {
           }
         } else if (int_num == 0x11) {  /* Get BIOS equipment flags. */
           *(unsigned short*)&regs.rax = *(const unsigned short*)((const char*)mem + 0x410);
+        } else if (int_num == 0x2f) {  /* Installation checks. */
+          const unsigned char al = (unsigned char)regs.rax;
+          if (al == 0x00) {  /* Installation check. */
+            if (ah < 2 || ah == 0x15) goto fatal_uic;  /* Doesn't follow the standard format. */
+            *(unsigned char*)&regs.rax = 0;  /* Not installed, OK to install. */
+          } else { fatal_uic:
+            fprintf(stderr, "fatal: unsupported int 0x%02x ax:%04x", int_num, *(const unsigned short*)&regs.rax);
+            goto fatal;
+          }
         } else if (int_num == 0x00) {  /* Division by zero. */
           /* This is called only if the program doesn't override the interrupt vector.
            * Example instructions: `xor ax, ax', `div ax'.
