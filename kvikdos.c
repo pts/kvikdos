@@ -174,7 +174,7 @@
 
 #define MAX_DOS_COM_SIZE 0xfee0  /* size + 0x100 bytes of PSP + 0x20 bytes of stack <= 0x10000 bytes. */
 
-#define PROGRAM_HEADER_SIZE 28  /* Large enough for .exe header (28 bytes). */
+#define PROGRAM_HEADER_SIZE 26  /* Large enough for .exe header (prefix of 26 bytes) and other header detection. */
 
 /* Returns true iff the byte at the specified DOS linear address is
  * user-writable (i.e. the program is allowed to write it).
@@ -306,7 +306,7 @@ static int detect_dos_executable_program(int img_fd, const char *filename, char 
     exit(252);
   }
   if (r >= 2 && (('M' | 'Z' << 8) == *(unsigned short*)p || ('M' << 8 | 'Z') == *(unsigned short*)p)) {
-    if (r < PROGRAM_HEADER_SIZE) {
+    if (r < 26) {
       fprintf(stderr, "fatal: DOS .exe program too short: %s\n", filename);
       exit(252);
     }
@@ -365,7 +365,7 @@ static const unsigned char fixed_exepack_stub[283] = {
 #define EXE_IP 10
 #define EXE_CS 11
 #define EXE_RELOCPOS 12
-#define EXE_NOVERLAY 13  /* Ignored by kvikdos. */
+#define EXE_NOVERLAY 13  /* Ignored and not even loaded by kvikdos. */
 
 /* r is the total number of header bytes alreday read from img_fd by
  * detect_dos_executable_program. Returns the psp (Program Segment Prefix)
@@ -382,7 +382,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     char * const image_addr = (char*)mem + (PSP_PARA << 4) + 0x100;
     const unsigned image_para = PSP_PARA + 0x10;
     unsigned reloc_count = exehdr[EXE_NRELOC];
-    const unsigned stack_end = ((unsigned)exehdr[EXE_SS] << 4) + exehdr[EXE_SP];
+    const unsigned stack_end_plus_0x100 = ((unsigned)(unsigned short)(exehdr[EXE_SS] + 0x10) << 4) + (exehdr[EXE_SP] ? exehdr[EXE_SP] : 0x10000);
     if (exehdr[EXE_MINALLOC] == 0 && exehdr[EXE_MAXALLOC] == 0) {  /* min_memory == max_memory == 0. */
       fprintf(stderr, "fatal: loading DOS .exe to upper part of memory not supported: %s\n", filename);
       exit(252);
@@ -391,16 +391,17 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
       fprintf(stderr, "fatal: DOS .exe image smaller than header: %s\n", filename);
       exit(252);
     }
-    if (stack_end > memsize) {  /* Some .exe files have it. */
-      fprintf(stderr, "fatal: DOS .exe stack pointer after end of program memory: %s\n", filename);
+    if (stack_end_plus_0x100 > memsize + 0x100) {  /* Some .exe files have it. */
+      fprintf(stderr, "fatal: DOS .exe stack pointer after end of program memory (0x%x - 0x100 > 0x%x): %s\n", stack_end_plus_0x100, memsize, filename);
       exit(252);
     }
     if ((PSP_PARA << 4) + 0x100 + memsize > DOS_MEM_LIMIT) {
       fprintf(stderr, "fatal: DOS .exe uses too much conventional memory: %s\n", filename);
       exit(252);
     }
-    if (((unsigned)exehdr[EXE_CS] << 4) + exehdr[EXE_IP] >= image_size) {
-      fprintf(stderr, "fatal: DOS .exe entry point after end of image: %s\n", filename);
+    /* 0x10 and 0x100: Allow EXE_CS value of 0xfff0 to wrap around, and then cs would point to the PSP. */
+    if (((unsigned)(unsigned short)(exehdr[EXE_CS] + 0x10) << 4) + exehdr[EXE_IP] >= image_size + 0x100) {
+      fprintf(stderr, "fatal: DOS .exe entry point after end of image (0x%x >= 0x%x): %s\n", ((unsigned)exehdr[EXE_CS] << 4) + exehdr[EXE_IP], image_size, filename);
       exit(252);
     }
     if ((unsigned)lseek(img_fd, headsize, SEEK_SET) != headsize) {
