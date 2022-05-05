@@ -439,7 +439,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     sregs->ss.selector = exehdr[EXE_SS] + image_para;
     *(unsigned*)(psp + 6) = 0xc0;  /* CP/M far call 5 service request address. Obsolete. */
     *block_size_para_out = (memsize >> 4) + 0x10;  /* Including PSP. */
-    if (exehdr[EXE_IP] == 16 || exehdr[EXE_IP] == 18) {  /* Detect exepack, find decompression stub within it, replace stub with fixed stub to avoid ``Packed file is corrupt'' error. DOS 5.0 does a similar fix. */
+    if (exehdr[EXE_IP] == 16 || exehdr[EXE_IP] == 18 || exehdr[EXE_IP] == 20) {  /* Detect exepack, find decompression stub within it, replace stub with fixed stub to avoid ``Packed file is corrupt'' error. DOS 5.0 does a similar fix. */
       /* More info about the A20 bug in the exepack stubs: https://github.com/joncampbell123/dosbox-x/issues/7#issuecomment-667653041
        * More info about the exepack file format: https://www.bamsoftware.com/software/exepack/
        * Example error with buggy (unfixed) stubs: fatal: KVM memory access denied phys_addr=00101103 value=0000000000000000 size=1 is_write=0
@@ -461,10 +461,21 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
              */
             memmove((char*)packhdr + 18 + sizeof(fixed_exepack_stub), after_packhdr + exepack_stub_size, exepack_stub_plus_reloc_size - exepack_stub_size);  /* Move packed reloc. */
             memcpy((char*)packhdr + 18, fixed_exepack_stub, sizeof(fixed_exepack_stub));  /* Copy fixed stub. */
-            if (exehdr[EXE_IP] == 16) {  /* Make it longer, because fixed_exepack_stub works only with an 18-byte header (it has org 18 in stub.asm). */
-              *(unsigned*)&regs->rip = 18;  /* Update DOS .exe entry point. */
+            if (exehdr[EXE_IP] != 18) {
+              if (exehdr[EXE_IP] == 16) {  /* Make it longer, because fixed_exepack_stub works only with an 18-byte header (it has org 18 in stub.asm). */
+                *(unsigned*)&regs->rip = 18;  /* Update DOS .exe entry point. */
+                packhdr[7] = 1;  /* skip_len. */
+              } else {  /* (exehdr[EXE_IP] == 20) */  /* Microsoft Macro Assembler 5.10A linker link.exe. */
+                if (packhdr[4] != 0) {
+                  fprintf(stderr, "fatal: unexpected packhdr[4] in 20-byte exepack header: 0x%04x\n", packhdr[4]);
+                  exit(252);
+                }
+                packhdr[4] = packhdr[5];
+                packhdr[5] = packhdr[6];
+                packhdr[6] = packhdr[7];
+                packhdr[7] = packhdr[8];
+              }
               packhdr[8] = ('R' | 'B' << 8);  /* exepack signature. */
-              packhdr[7] = 1;  /* skip_len. */
             }
           }
         }
