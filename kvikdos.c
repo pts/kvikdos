@@ -2091,6 +2091,9 @@ int main(int argc, char **argv) {
           } else { do_set_int:
             if (set_int(set_int_num, *(unsigned*)run->mmio.data, mem, had_get_ints)) goto fatal;
           }
+        } else if (addr == 0xa003e && mmio_len == 2 && !run->mmio.is_write) {
+          /* Microsoft Macro Assembler 6.00B driver masm.exe. */
+          *(unsigned short*)run->mmio.data = 0;
         } else {
           highmsg[0] = '\0';
          bad_memory_access:
