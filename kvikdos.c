@@ -1575,6 +1575,11 @@ int main(int argc, char **argv) {
                 /* TLIB 3.01 sets (dx & 0x80) to zero, to disable binary mode (and enable translation). */
                 /* We just ignore the setting. */
               }
+            } else if (al == 8) {  /* Get whether drive is removable. */
+              unsigned char bl = (unsigned char)regs.rax;
+              if (bl == 0) bl = dir_state.drive - 'A' + 1;
+              if (bl > 4 || !dir_state.linux_mount_dir[(int)bl - 1]) goto error_invalid_drive;
+              *(unsigned char*)&regs.rax = bl > 2;  /* A: (1) and B: (2) are removable (0), C: (3) etc. aren't (1). */
             } else {
               fprintf(stderr, "fatal: unsupported DOS ioctl call: 0x%02x\n", al);
               goto fatal;
