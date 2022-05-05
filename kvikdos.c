@@ -1931,6 +1931,9 @@ int main(int argc, char **argv) {
               goto error_on_21;
             }
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x67) {  /* Set handle count. */
+            /* https://stanislavs.org/helppc/int_21-67.html Says that only the first 20 handles are copied to the child process. */
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else {
             goto fatal_int;
           }
