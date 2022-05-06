@@ -383,6 +383,10 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     const unsigned image_para = PSP_PARA + 0x10;
     unsigned reloc_count = exehdr[EXE_NRELOC];
     const unsigned stack_end_plus_0x100 = ((unsigned)(unsigned short)(exehdr[EXE_SS] + 0x10) << 4) + (exehdr[EXE_SP] ? exehdr[EXE_SP] : 0x10000);
+    if (exehdr[EXE_LASTSIZE] > 0x200) {
+      fprintf(stderr, "fatal: DOS .exe last block size too large (0x%04x > 0x200): %s\n", exehdr[EXE_LASTSIZE], filename);
+      exit(252);
+    }
     if (exehdr[EXE_MINALLOC] == 0 && exehdr[EXE_MAXALLOC] == 0) {  /* min_memory == max_memory == 0. */
       fprintf(stderr, "fatal: loading DOS .exe to upper part of memory not supported: %s\n", filename);
       exit(252);
