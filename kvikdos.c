@@ -375,7 +375,8 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
   char *psp;
   if (header_size >= PROGRAM_HEADER_SIZE && (('M' | 'Z' << 8) == ((unsigned short*)header)[EXE_SIGNATURE] || ('M' << 8 | 'Z') == ((unsigned short*)header)[EXE_SIGNATURE])) {
     const unsigned short * const exehdr = (const unsigned short*)header;
-    const unsigned exesize = exehdr[EXE_LASTSIZE] ? ((exehdr[EXE_NBLOCKS] - 1) << 9) + exehdr[EXE_LASTSIZE] : exehdr[EXE_NBLOCKS] << 9;
+    const unsigned short nblocks = exehdr[EXE_NBLOCKS] & 0x7ff;  /* Turbo C++ 3 BOSS NE stub. Mask to 1 MiB. */
+    const unsigned exesize = exehdr[EXE_LASTSIZE] ? ((nblocks - 1) << 9) + exehdr[EXE_LASTSIZE] : nblocks << 9;
     const unsigned headsize = (unsigned)exehdr[EXE_HDRSIZE] << 4;
     const unsigned image_size = exesize - headsize;
     unsigned memsize = ((unsigned)exehdr[EXE_MINALLOC] << 4) + image_size;  /* Minimum size of .bss in exehdr[EXE_MINALLOC]. */
