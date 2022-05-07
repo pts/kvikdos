@@ -388,7 +388,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     const unsigned exesize = exehdr[EXE_LASTSIZE] ? ((nblocks - 1) << 9) + exehdr[EXE_LASTSIZE] : nblocks << 9;
     const unsigned headsize = (unsigned)exehdr[EXE_HDRSIZE] << 4;
     const unsigned image_size = exesize - headsize;
-    unsigned memsize = ((unsigned)exehdr[EXE_MINALLOC] << 4) + image_size;  /* Minimum size of .bss in exehdr[EXE_MINALLOC]. */
+    const unsigned memsize_min_para = (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MINALLOC];  /* This includes .bss after the image. Please note that this doesn't depend on exehdr[EXE_LASTSIZE]. Formula is same as in MS-DOS 6.22, FREEDOS 1.2, DOSBox 0.74-4. */
     char * const image_addr = (char*)mem + (PSP_PARA << 4) + 0x100;
     const unsigned image_para = PSP_PARA + 0x10;
     unsigned reloc_count = exehdr[EXE_NRELOC];
@@ -405,11 +405,11 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
       fprintf(stderr, "fatal: DOS .exe image smaller than header: %s\n", filename);
       exit(252);
     }
-    if (stack_end_plus_0x100 > memsize + 0x100) {  /* Some .exe files have it. */
-      fprintf(stderr, "fatal: DOS .exe stack pointer after end of program memory (0x%x - 0x100 > 0x%x): %s\n", stack_end_plus_0x100, memsize, filename);
+    if (stack_end_plus_0x100 > (memsize_min_para << 4) + 0x100) {  /* Some .exe files have it. */
+      fprintf(stderr, "fatal: DOS .exe stack pointer after end of program memory (0x%x - 0x100 > 0x%x): %s\n", stack_end_plus_0x100, memsize_min_para << 4, filename);
       exit(252);
     }
-    if ((PSP_PARA << 4) + 0x100 + memsize > DOS_MEM_LIMIT) {
+    if ((PSP_PARA << 4) + 0x100 + (memsize_min_para << 4) > DOS_MEM_LIMIT) {
       fprintf(stderr, "fatal: DOS .exe uses too much conventional memory: %s\n", filename);
       exit(252);
     }
@@ -453,7 +453,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     *(unsigned*)&regs->rsp = exehdr[EXE_SP];
     sregs->ss.selector = exehdr[EXE_SS] + image_para;
     *(unsigned*)(psp + 6) = 0xc0;  /* CP/M far call 5 service request address. Obsolete. */
-    *block_size_para_out = (memsize >> 4) + 0x10;  /* Including PSP. */
+    *block_size_para_out = memsize_min_para + 0x10;  /* Including PSP. */
     if (exehdr[EXE_IP] == 16 || exehdr[EXE_IP] == 18 || exehdr[EXE_IP] == 20) {  /* Detect exepack, find decompression stub within it, replace stub with fixed stub to avoid ``Packed file is corrupt'' error. DOS 5.0 does a similar fix. */
       /* More info about the A20 bug in the exepack stubs: https://github.com/joncampbell123/dosbox-x/issues/7#issuecomment-667653041
        * More info about the exepack file format: https://www.bamsoftware.com/software/exepack/
