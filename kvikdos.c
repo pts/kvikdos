@@ -11,6 +11,15 @@
  * TODO(pts): udosrun command-line flag compatibility.
  * TODO(pts): Run Linux ELF programs and scripts (#!), for convenience.
  * TODO(pts): Add support for .bat batch files (at least a subset).
+ *
+ * Since many parts of the DOS ABI is undocumented, the specific behavior of
+ * kvikdos in corner cases is matched to:
+ *
+ * * FREEDOS 1.2
+ *   (https://github.com/FDOS/kernel/blob/8c8d21311974e3274b3c03306f3113ee77ff2f45/kernel/task.c)
+ * * DOSBox 0.74-4
+ *   (https://github.com/svn2github/dosbox/blob/acd380bcde72db74f3b476253899016f686bc0ef/src/dos/dos_execute.cpp)
+ * * MS-DOS 6.22 (source code not available).
  */
 
 #define _GNU_SOURCE 1  /* For MAP_ANONYMOUS and memmem(). */
