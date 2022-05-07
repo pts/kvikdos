@@ -389,6 +389,8 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     const unsigned headsize = (unsigned)exehdr[EXE_HDRSIZE] << 4;
     const unsigned image_size = exesize - headsize;
     const unsigned memsize_min_para = (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MINALLOC];  /* This includes .bss after the image. Please note that this doesn't depend on exehdr[EXE_LASTSIZE]. Formula is same as in MS-DOS 6.22, FREEDOS 1.2, DOSBox 0.74-4. */
+    const unsigned memsize_max_para = (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MAXALLOC];
+    const unsigned memsize_available_para = (DOS_MEM_LIMIT >> 4) - PSP_PARA - 0x10 /* PSP */;
     char * const image_addr = (char*)mem + (PSP_PARA << 4) + 0x100;
     const unsigned image_para = PSP_PARA + 0x10;
     unsigned reloc_count = exehdr[EXE_NRELOC];
@@ -397,7 +399,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
       fprintf(stderr, "fatal: DOS .exe last block size too large (0x%04x > 0x200): %s\n", exehdr[EXE_LASTSIZE], filename);
       exit(252);
     }
-    if (exehdr[EXE_MINALLOC] == 0 && exehdr[EXE_MAXALLOC] == 0) {  /* min_memory == max_memory == 0. */
+    if (exehdr[EXE_MINALLOC] == 0 && exehdr[EXE_MAXALLOC] == 0) {
       fprintf(stderr, "fatal: loading DOS .exe to upper part of memory not supported: %s\n", filename);
       exit(252);
     }
@@ -409,10 +411,15 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
       fprintf(stderr, "fatal: DOS .exe stack pointer after end of program memory (0x%x - 0x100 > 0x%x): %s\n", stack_end_plus_0x100, memsize_min_para << 4, filename);
       exit(252);
     }
-    if ((PSP_PARA << 4) + 0x100 + (memsize_min_para << 4) > DOS_MEM_LIMIT) {
+    if (memsize_min_para > memsize_max_para) {
+      fprintf(stderr, "fatal: DOS .exe minimum memory larger than maximum: %s\n", filename);
+      exit(252);
+    }
+    if (memsize_min_para > memsize_available_para) {
       fprintf(stderr, "fatal: DOS .exe uses too much conventional memory: %s\n", filename);
       exit(252);
     }
+    if (memsize_max_para > memsize_available_para)
     /* 0x10 and 0x100: Allow EXE_CS value of 0xfff0 to wrap around, and then cs would point to the PSP. */
     if (((unsigned)(unsigned short)(exehdr[EXE_CS] + 0x10) << 4) + exehdr[EXE_IP] >= image_size + 0x100) {
       fprintf(stderr, "fatal: DOS .exe entry point after end of image (0x%x >= 0x%x): %s\n", ((unsigned)exehdr[EXE_CS] << 4) + exehdr[EXE_IP], image_size, filename);
@@ -453,7 +460,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     *(unsigned*)&regs->rsp = exehdr[EXE_SP];
     sregs->ss.selector = exehdr[EXE_SS] + image_para;
     *(unsigned*)(psp + 6) = 0xc0;  /* CP/M far call 5 service request address. Obsolete. */
-    *block_size_para_out = memsize_min_para + 0x10;  /* Including PSP. */
+    *block_size_para_out = ((memsize_max_para > memsize_available_para) ? memsize_available_para : memsize_max_para) + 0x10 /* PSP */;
     if (exehdr[EXE_IP] == 16 || exehdr[EXE_IP] == 18 || exehdr[EXE_IP] == 20) {  /* Detect exepack, find decompression stub within it, replace stub with fixed stub to avoid ``Packed file is corrupt'' error. DOS 5.0 does a similar fix. */
       /* More info about the A20 bug in the exepack stubs: https://github.com/joncampbell123/dosbox-x/issues/7#issuecomment-667653041
        * More info about the exepack file format: https://www.bamsoftware.com/software/exepack/
