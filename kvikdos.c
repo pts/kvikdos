@@ -381,6 +381,8 @@ static const unsigned char fixed_exepack_stub[283] = {
  * address.
  */
 static char *load_dos_executable_program(int img_fd, const char *filename, void *mem, const char *header, int header_size, struct kvm_regs *regs, struct kvm_sregs *sregs, unsigned short *block_size_para_out) {
+#define MEMSIZE_AVAILABLE_PARA ((DOS_MEM_LIMIT >> 4) - PSP_PARA - 0x10 /* PSP */)
+  const unsigned memsize_available_para = MEMSIZE_AVAILABLE_PARA;
   char *psp;
   if (header_size >= PROGRAM_HEADER_SIZE && (('M' | 'Z' << 8) == ((unsigned short*)header)[EXE_SIGNATURE] || ('M' << 8 | 'Z') == ((unsigned short*)header)[EXE_SIGNATURE])) {
     const unsigned short * const exehdr = (const unsigned short*)header;
@@ -390,7 +392,6 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     const unsigned image_size = exesize - headsize;
     const unsigned memsize_min_para = (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MINALLOC];  /* This includes .bss after the image. Please note that this doesn't depend on exehdr[EXE_LASTSIZE]. Formula is same as in MS-DOS 6.22, FREEDOS 1.2, DOSBox 0.74-4. */
     const unsigned memsize_max_para = (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MAXALLOC];
-    const unsigned memsize_available_para = (DOS_MEM_LIMIT >> 4) - PSP_PARA - 0x10 /* PSP */;
     char * const image_addr = (char*)mem + (PSP_PARA << 4) + 0x100;
     const unsigned image_para = PSP_PARA + 0x10;
     unsigned reloc_count = exehdr[EXE_NRELOC];
@@ -505,7 +506,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     }
   } else {
     /* Load DOS .com program. */
-    char * const p = (char *)mem + (PSP_PARA << 4) + 0x100;  /* !! Security: check bounds (of mem). */
+    char * const p = (char *)mem + (PSP_PARA << 4) + 0x100;
     unsigned sp;
     int r;
     memcpy(p, header, header_size);
@@ -527,7 +528,8 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     *(unsigned short*)(psp + 6) = MAX_DOS_COM_SIZE + 0x100;  /* .COM bytes available in segment (CP/M). DOSBox doesn't initialize it. */
     /*memset(psp, 0, 0x100);*/  /* Not needed, mmap MAP_ANONYMOUS has done it. */
     *(unsigned*)&regs->rip = 0x100;  /* DOS .com entry point. */
-    *block_size_para_out = 0x1000;  /* 65536 bytes, including PSP. */
+    { struct SA { int StaticAssert_MinimumComMemory : MEMSIZE_AVAILABLE_PARA + 0x10 >= 0x1000; }; }
+    *block_size_para_out = memsize_available_para + 0x10 /* PSP */;  /* Minimum would be 0x1000 paras (65536 bytes), including PSP. */
   }
   /* https://stanislavs.org/helppc/program_segment_prefix.html */
   *(unsigned short*)(psp + 2) = DOS_MEM_LIMIT >> 4;  /* Top of memory. */
