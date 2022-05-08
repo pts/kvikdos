@@ -459,7 +459,6 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
       }
     }
     psp = image_addr - 0x100;
-    sregs->ds.selector = sregs->es.selector = image_para - 0x10; /* DS and ES point to PSP. */
     *(unsigned short*)&regs->rip = exehdr[EXE_IP];  /* DOS .exe entry point. */
     sregs->cs.selector = exehdr[EXE_CS] + image_para;
     *(unsigned short*)&regs->rsp = exehdr[EXE_SP];
@@ -523,17 +522,35 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
       fprintf(stderr, "fatal: DOS executable program too long: %s\n", filename);
       exit(252);
     }
-    /* No need to check for DOS_MEM_LIMIT, because (PSP_PARA << 4) + 0x100 + MAX_DOS_COM_SIZE + 0x10 < DOS_MEM_LIMIT. */
-    sregs->cs.selector = sregs->ds.selector = sregs->es.selector = sregs->ss.selector = PSP_PARA;
+    sregs->cs.selector = sregs->ss.selector = PSP_PARA;
     psp = (char*)mem + (PSP_PARA << 4);  /* Program Segment Prefix. */
     *(unsigned short*)&regs->rsp = 0xfffe;
     *(unsigned short*)(psp + *(unsigned short*)&regs->rsp) = 0;  /* Push a 0 byte. */
     *(unsigned short*)(psp + 6) = MAX_DOS_COM_SIZE + 0x100;  /* .COM bytes available in segment (CP/M). DOSBox doesn't initialize it. */
     /*memset(psp, 0, 0x100);*/  /* Not needed, mmap MAP_ANONYMOUS has done it. */
     *(unsigned short*)&regs->rip = 0x100;  /* DOS .com entry point. */
+    /* No need to check for DOS_MEM_LIMIT at runtime, because (PSP_PARA << 4) + 0x100 + MAX_DOS_COM_SIZE + 0x10 < DOS_MEM_LIMIT. */
     { struct SA { int StaticAssert_MinimumComMemory : MEMSIZE_AVAILABLE_PARA + 0x10 >= 0x1000; }; }
     *block_size_para_out = memsize_available_para + 0x10 /* PSP */;  /* Minimum would be 0x1000 paras (65536 bytes), including PSP. */
   }
+
+  /* https://github.com/svn2github/dosbox/blob/acd380bcde72db74f3b476253899016f686bc0ef/src/dos/dos_execute.cpp#L501-L506 */
+  *(unsigned short*)&regs->rax = 0;  /* FREEDOS 1.2 sets AH and AL to 0xff or 0x00 according to some FCB value (fcbcode) (https://github.com/FDOS/kernel/blob/8c8d21311974e3274b3c03306f3113ee77ff2f45/kernel/task.c#L339-L341), but most of the time they end up as 0. */
+  *(unsigned short*)&regs->rbx = 0;  /* fREEDOS 1.2 and DOSBox 0.74-4 sets BX the same way as AX, i.e. based on some FCB values. */
+  *(unsigned short*)&regs->rcx = 0xff;
+  *(unsigned short*)&regs->rdx = PSP_PARA;
+  *(unsigned short*)&regs->rsi = *(unsigned short*)&regs->rip;
+  *(unsigned short*)&regs->rdi = *(unsigned short*)&regs->rsp;
+  /**(unsigned short*)&regs->rsp = ...;*/  /* Set above. */
+  *(unsigned short*)&regs->rbp = 0x91c;
+  /* EFLAGS https://en.wikipedia.org/wiki/FLAGS_register */
+  *(unsigned short*)&regs->rflags = 0x7202;  /* DOSBox 0.74-4 sets it to 0x7202 == (reserved|IF|IOPL3|NT) (and so do we), MS-DOS 6.22 sets it to 0x7246 == (reserved|AF|ZF|IF|IOPL3|NT). */
+  /**(unsigned short*)&regs->rip = ...;*/  /* Set above. */
+  /*sregs->cs.selector = ...;*/  /* Set above. */
+  sregs->ds.selector = PSP_PARA;  /* Set above. */
+  sregs->es.selector = PSP_PARA;  /* Set above. */
+  /*sregs->ss.selector = ...;*/  /* Set above. */
+
   /* https://stanislavs.org/helppc/program_segment_prefix.html */
   *(unsigned short*)(psp + 2) = DOS_MEM_LIMIT >> 4;  /* Top of memory. */
   psp[5] = (char)0xf4;  /* hlt instruction; this is machine code to jump to the CP/M dispatcher. */
@@ -568,7 +585,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
 
 static void dump_regs(const char *prefix, const struct kvm_regs *regs, const struct kvm_sregs *sregs) {
 #define R16(name) (*(unsigned short*)&regs->r##name)
-#define S16(name) (*(unsigned short*)&sregs->name.selector)
+#define S16(name) (sregs->name.selector)  /* 16 bits. */
   fprintf(stderr, "%s: regs: cs:%04x ip:%04x ax:%04x bx:%04x cx:%04x dx:%04x si:%04x di:%04x sp:%04x bp:%04x flags:%08x ds:%04x es:%04x fs:%04x gs:%04x ss:%04x\n",
           prefix, S16(cs), R16(ip),
           R16(ax), R16(bx), R16(cx), R16(dx), R16(si), R16(di), R16(sp), R16(bp), *(unsigned*)&regs->rflags,
@@ -1305,8 +1322,7 @@ int main(int argc, char **argv) {
   FIX_SREG(fs);
   FIX_SREG(gs);
 
-  /* EFLAGS https://en.wikipedia.org/wiki/FLAGS_register */
-  *(unsigned short*)&regs.rflags = 1 << 1;  /* Reserved bit. */
+  *(unsigned short*)&regs.rflags |= 1 << 1;  /* Reserved bit in EFLAGS. */
   /**(unsigned short*)&regs.rflags |= 1 << 9;*/  /* IF=1, enable interrupts. */
 
   had_get_ints = 0;  /* 1 << 0: int 0x00; 1 << 1: int 0x18. */
@@ -1774,7 +1790,7 @@ int main(int argc, char **argv) {
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             }
           } else if (ah == 0x49) {  /* Free allocated memory (free()). */
-            const unsigned block_para = *(unsigned short*)&sregs.es.selector;
+            const unsigned block_para = (unsigned short)sregs.es.selector;
             char *mcb = (char*)mem + (block_para << 4) - 16;
             if (DEBUG) fprintf(stderr, "debug: free(0x%04x)\n", block_para);
             DEBUG_CHECK_ALL_MCBS(mem);
