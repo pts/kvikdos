@@ -1086,7 +1086,11 @@ int main(int argc, char **argv) {
                     "This is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.\n"
                     "Flags:\n"
                     "--env=<NAME>=<value>: Adds environment variable.\n"
-                    "--prog=<dos-pathname>: Sets DOS pathname of program.\n",
+                    "--prog=<dos-pathname>: Sets DOS pathname of program.\n"
+                    "--mount=<drive>:<dirname>: Makes Linux dir visible as drive for DOS program.\n"
+                    "--drive=<drive>: Sets initial current drive for DOS program.\n"
+                    "--tty-in=<fd>: Selects Linux file descriptor for keyboard input.\n"
+                    "    -2: stdin buffered; -1: /dev/tty; 0: stdin etc.\n",
                     argv[0]);
     exit(1);
   }
