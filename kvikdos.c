@@ -181,7 +181,27 @@
 /* Points after last paragraph which can be allocated by DOS, conventional memory. 640 KiB. */
 #define DOS_ALLOC_PARA_LIMIT 0xa000
 
-#define MAX_DOS_COM_SIZE 0xfee0  /* size + 0x100 bytes of PSP + 0x20 bytes of stack <= 0x10000 bytes. */
+/* .com size + 0x100 bytes of PSP + stack must be at most 0x10000 bytes. The
+ * absolute minimum stack size for kvikdos is 8 bytes (2 bytes for the
+ * return address and 6 bytest for interrupt return (iret), but we play it
+ * safe and require at least 0x20 bytes for stack.
+ *
+ * * We (kvikdos) checks < 0xfee0, leaving 0x20 bytes for stack,
+ *   which is not enough for MS-DOS 6.22, for which 0x80 is
+ *   enough, but 0x40 isn't in some cases.
+ * * FREEDOS 1.2
+ *   (https://github.com/FDOS/kernel/blob/8c8d21311974e3274b3c03306f3113ee77ff2f45/kernel/task.c#L457-L459)
+ *   silently truncates to 0xfe00.
+ * * DOSBox 0.74-4
+ *   (https://github.com/svn2github/dosbox/blob/acd380bcde72db74f3b476253899016f686bc0ef/src/dos/dos_execute.cpp#L372)
+ *   silently truncates to 0xfeff (which is too little, because
+ *   0 is pushed to the stack).
+ * * MS-DOS 6.22 (source code not available) can do 0xfee6 (0x1a bytes of stack)
+ *   (tested with hello-world, it in some other, more complex cases it fails
+ *   with 0x40 bytes of stack, but succeeds with 0x80 bytes of stack and
+ *   starts misbehaving (infinite loop, memory corruption), with 0xfee7.
+ */
+#define MAX_DOS_COM_SIZE 0xfee0
 
 #define PROGRAM_HEADER_SIZE 26  /* Large enough for .exe header (prefix of 26 bytes) and other header detection. */
 
