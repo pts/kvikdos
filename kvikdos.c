@@ -376,7 +376,11 @@ static const unsigned char fixed_exepack_stub[283] = {
 #define EXE_RELOCPOS 12
 #define EXE_NOVERLAY 13  /* Ignored and not even loaded by kvikdos. */
 
-/* r is the total number of header bytes alreday read from img_fd by
+/* Load DOS executable program from (img_fd, filename, header, header_size)
+ * to (mem, regs and sregs), return the size (para count) of the memory
+ * block allocated in *block_size_para_out.
+ *
+ * r is the total number of header bytes alreday read from img_fd by
  * detect_dos_executable_program. Returns the psp (Program Segment Prefix)
  * address.
  */
