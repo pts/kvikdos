@@ -1092,7 +1092,7 @@ int main(int argc, char **argv) {
                     "--tty-in=<fd>: Selects Linux file descriptor for keyboard input.\n"
                     "    -2: stdin buffered; -1: /dev/tty; 0: stdin etc.\n",
                     argv[0]);
-    exit(1);
+    exit(argv[0] && argv[1] ? 0 : 1);
   }
 
   dir_state.drive = 'C';
