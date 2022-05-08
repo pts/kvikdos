@@ -15,7 +15,7 @@
  * Since many parts of the DOS ABI is undocumented, the specific behavior of
  * kvikdos in corner cases is matched to:
  *
- * * FREEDOS 1.2
+ * * FreeDOS 1.2
  *   (https://github.com/FDOS/kernel/blob/8c8d21311974e3274b3c03306f3113ee77ff2f45/kernel/task.c)
  * * DOSBox 0.74-4
  *   (https://github.com/svn2github/dosbox/blob/acd380bcde72db74f3b476253899016f686bc0ef/src/dos/dos_execute.cpp)
@@ -188,7 +188,7 @@
  *
  * * We (kvikdos) checks < 0xfef0, leaving 0x10 bytes for stack,
  *   which seems to work for some programs.
- * * FREEDOS 1.2
+ * * FreeDOS 1.2
  *   (https://github.com/FDOS/kernel/blob/8c8d21311974e3274b3c03306f3113ee77ff2f45/kernel/task.c#L457-L459)
  *   silently truncates to 0xfe00.
  * * DOSBox 0.74-4
@@ -412,7 +412,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     const unsigned exesize = exehdr[EXE_LASTSIZE] ? ((nblocks - 1) << 9) + exehdr[EXE_LASTSIZE] : nblocks << 9;
     const unsigned headsize = (unsigned)exehdr[EXE_HDRSIZE] << 4;
     const unsigned image_size = exesize - headsize;
-    const unsigned memsize_min_para = (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MINALLOC];  /* This includes .bss after the image. Please note that this doesn't depend on exehdr[EXE_LASTSIZE]. Formula is same as in MS-DOS 6.22, FREEDOS 1.2, DOSBox 0.74-4. */
+    const unsigned memsize_min_para = (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MINALLOC];  /* This includes .bss after the image. Please note that this doesn't depend on exehdr[EXE_LASTSIZE]. Formula is same as in MS-DOS 6.22, FreeDOS 1.2, DOSBox 0.74-4. */
     const unsigned memsize_max_para = (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MAXALLOC];
     char * const image_addr = (char*)mem + (PSP_PARA << 4) + 0x100;
     const unsigned image_para = PSP_PARA + 0x10;
@@ -557,8 +557,8 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
   }
 
   /* https://github.com/svn2github/dosbox/blob/acd380bcde72db74f3b476253899016f686bc0ef/src/dos/dos_execute.cpp#L501-L506 */
-  *(unsigned short*)&regs->rax = 0;  /* FREEDOS 1.2 sets AH and AL to 0xff or 0x00 according to some FCB value (fcbcode) (https://github.com/FDOS/kernel/blob/8c8d21311974e3274b3c03306f3113ee77ff2f45/kernel/task.c#L339-L341), but most of the time they end up as 0. */
-  *(unsigned short*)&regs->rbx = 0;  /* fREEDOS 1.2 and DOSBox 0.74-4 sets BX the same way as AX, i.e. based on some FCB values. */
+  *(unsigned short*)&regs->rax = 0;  /* FreeDOS 1.2 sets AH and AL to 0xff or 0x00 according to some FCB value (fcbcode) (https://github.com/FDOS/kernel/blob/8c8d21311974e3274b3c03306f3113ee77ff2f45/kernel/task.c#L339-L341), but most of the time they end up as 0. */
+  *(unsigned short*)&regs->rbx = 0;  /* FreeDOS 1.2 and DOSBox 0.74-4 sets BX the same way as AX, i.e. based on some FCB values. */
   *(unsigned short*)&regs->rcx = 0xff;
   *(unsigned short*)&regs->rdx = PSP_PARA;
   *(unsigned short*)&regs->rsi = *(unsigned short*)&regs->rip;
@@ -566,7 +566,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
   /**(unsigned short*)&regs->rsp = ...;*/  /* Set above. */
   *(unsigned short*)&regs->rbp = 0x91c;
   /* EFLAGS https://en.wikipedia.org/wiki/FLAGS_register */
-  *(unsigned short*)&regs->rflags = 0x7202;  /* DOSBox 0.74-4 sets it to 0x7202 == (reserved|IF|IOPL3|NT) (and so do we), MS-DOS 6.22 sets it to 0x7246 == (reserved|AF|ZF|IF|IOPL3|NT). */
+  *(unsigned short*)&regs->rflags = 0x7202;  /* DOSBox 0.74-4 sets it to 0x7202 == (reserved|IF|IOPL3|NT) (and so do we), MS-DOS 6.22 sets it to 0x7246 == (reserved|AF|ZF|IF|IOPL3|NT), FreeDOS 1.2 sets it to 0x0200, but will be changed to 0x0202 (reserved|IF). */
   /**(unsigned short*)&regs->rip = ...;*/  /* Set above. */
   /*sregs->cs.selector = ...;*/  /* Set above. */
   sregs->ds.selector = PSP_PARA;  /* Set above. */
