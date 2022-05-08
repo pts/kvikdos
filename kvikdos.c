@@ -335,7 +335,7 @@ static int detect_dos_executable_program(int img_fd, const char *filename, char 
     exit(252);
   }
   if (r >= 2 && (('M' | 'Z' << 8) == *(unsigned short*)p || ('M' << 8 | 'Z') == *(unsigned short*)p)) {
-    if (r < 26) {
+    if (r < 24) {
       fprintf(stderr, "fatal: DOS .exe program too short: %s\n", filename);
       exit(252);
     }
@@ -408,7 +408,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
 #define MEMSIZE_AVAILABLE_PARA ((DOS_MEM_LIMIT >> 4) - PSP_PARA - 0x10 /* PSP */)
   const unsigned memsize_available_para = MEMSIZE_AVAILABLE_PARA;
   char *psp;
-  if (header_size >= PROGRAM_HEADER_SIZE && (('M' | 'Z' << 8) == ((unsigned short*)header)[EXE_SIGNATURE] || ('M' << 8 | 'Z') == ((unsigned short*)header)[EXE_SIGNATURE])) {
+  if (header_size >= 24 && (('M' | 'Z' << 8) == ((unsigned short*)header)[EXE_SIGNATURE] || ('M' << 8 | 'Z') == ((unsigned short*)header)[EXE_SIGNATURE])) {
     const unsigned short * const exehdr = (const unsigned short*)header;
     const unsigned short nblocks = exehdr[EXE_NBLOCKS] & 0x7ff;  /* Turbo C++ 3 BOSS NE stub. Mask to 1 MiB. */
     const unsigned exesize = exehdr[EXE_LASTSIZE] ? ((nblocks - 1) << 9) + exehdr[EXE_LASTSIZE] : nblocks << 9;
@@ -460,6 +460,10 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     }
     if (reloc_count) {  /* Process relocations. */
       unsigned short reloc[1024]; /* 2048 bytes on the stack. */
+      if (header_size < 26) {  /* exehdr[EXE_RELOCPOS] is not available. */
+        fprintf(stderr, "fatal: DOS .exe too short for relocpos: %s\n", filename);
+        exit(252);
+      }
       if ((unsigned)lseek(img_fd, exehdr[EXE_RELOCPOS], SEEK_SET) != exehdr[EXE_RELOCPOS]) {
         fprintf(stderr, "fatal: error seeking to image relocations: %s\n", filename);
         exit(252);
