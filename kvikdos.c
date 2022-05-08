@@ -460,9 +460,9 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     }
     psp = image_addr - 0x100;
     sregs->ds.selector = sregs->es.selector = image_para - 0x10; /* DS and ES point to PSP. */
-    *(unsigned*)&regs->rip = exehdr[EXE_IP];  /* DOS .exe entry point. */
+    *(unsigned short*)&regs->rip = exehdr[EXE_IP];  /* DOS .exe entry point. */
     sregs->cs.selector = exehdr[EXE_CS] + image_para;
-    *(unsigned*)&regs->rsp = exehdr[EXE_SP];
+    *(unsigned short*)&regs->rsp = exehdr[EXE_SP];
     sregs->ss.selector = exehdr[EXE_SS] + image_para;
     *(unsigned*)(psp + 6) = 0xc0;  /* CP/M far call 5 service request address. Obsolete. */
     *block_size_para_out = ((memsize_max_para > memsize_available_para) ? memsize_available_para : memsize_max_para) + 0x10 /* PSP */;
@@ -490,7 +490,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
             memcpy((char*)packhdr + 18, fixed_exepack_stub, sizeof(fixed_exepack_stub));  /* Copy fixed stub. */
             if (exehdr[EXE_IP] != 18) {
               if (exehdr[EXE_IP] == 16) {  /* Make it longer, because fixed_exepack_stub works only with an 18-byte header (it has org 18 in stub.asm). */
-                *(unsigned*)&regs->rip = 18;  /* Update DOS .exe entry point. */
+                *(unsigned short*)&regs->rip = 18;  /* Update DOS .exe entry point. */
                 packhdr[7] = 1;  /* skip_len. */
               } else {  /* (exehdr[EXE_IP] == 20) */  /* Microsoft Macro Assembler 5.10A linker link.exe. */
                 if (packhdr[4] != 0) {
@@ -511,7 +511,6 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
   } else {
     /* Load DOS .com program. */
     char * const p = (char *)mem + (PSP_PARA << 4) + 0x100;
-    unsigned sp;
     int r;
     memcpy(p, header, header_size);
     r = read(img_fd, p + header_size, MAX_DOS_COM_SIZE + 1 - header_size);
@@ -527,17 +526,16 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     /* No need to check for DOS_MEM_LIMIT, because (PSP_PARA << 4) + 0x100 + MAX_DOS_COM_SIZE + 0x10 < DOS_MEM_LIMIT. */
     sregs->cs.selector = sregs->ds.selector = sregs->es.selector = sregs->ss.selector = PSP_PARA;
     psp = (char*)mem + (PSP_PARA << 4);  /* Program Segment Prefix. */
-    *(unsigned*)&regs->rsp = sp = 0xfffe;
-    *(short*)(psp + sp) = 0;  /* Push a 0 byte. */
+    *(unsigned short*)&regs->rsp = 0xfffe;
+    *(unsigned short*)(psp + *(unsigned short*)&regs->rsp) = 0;  /* Push a 0 byte. */
     *(unsigned short*)(psp + 6) = MAX_DOS_COM_SIZE + 0x100;  /* .COM bytes available in segment (CP/M). DOSBox doesn't initialize it. */
     /*memset(psp, 0, 0x100);*/  /* Not needed, mmap MAP_ANONYMOUS has done it. */
-    *(unsigned*)&regs->rip = 0x100;  /* DOS .com entry point. */
+    *(unsigned short*)&regs->rip = 0x100;  /* DOS .com entry point. */
     { struct SA { int StaticAssert_MinimumComMemory : MEMSIZE_AVAILABLE_PARA + 0x10 >= 0x1000; }; }
     *block_size_para_out = memsize_available_para + 0x10 /* PSP */;  /* Minimum would be 0x1000 paras (65536 bytes), including PSP. */
   }
   /* https://stanislavs.org/helppc/program_segment_prefix.html */
   *(unsigned short*)(psp + 2) = DOS_MEM_LIMIT >> 4;  /* Top of memory. */
-  /* https://stanislavs.org/helppc/program_segment_prefix.html */
   psp[5] = (char)0xf4;  /* hlt instruction; this is machine code to jump to the CP/M dispatcher. */
   *(unsigned short*)(psp + 0x2c) = ENV_PARA;
   *(unsigned short*)(psp) = 0x20cd;  /* `int 0x20' opcode. */
@@ -554,7 +552,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
   /* These are the PSP fields we don't fill (but keep as 0 as returned by mmap MAP_ANONYMOUS):
    * 0x18 20 bytes  file handle array (Undocumented DOS 2.x+); if handle array element is FF then handle is available. Network redirectors often indicate remotes files by setting these to values between 80-FE. DOS 2+ Job File Table JFT), one byte per file handle, FFh = closed. https://en.wikipedia.org/wiki/Job_File_Table
    * 0x2e dword     SS:SP on entry to last INT 21 call (Undoc. 2.x+)
-   * 0x38 dword     pointer to previous PSP (default FFFF:FFFF, Undoc. 3.x+), used by SHARE in DOS 3.3 !!
+   * 0x38 dword     pointer to previous PSP (default FFFF:FFFF, Undoc. 3.x+), used by SHARE in DOS 3.3
    * 0x3c byte      DOS 4+ (DBCS) interim console flag (see AX=6301h) Novell DOS 7 DBCS interim flag as set with AX=6301h (possibly also used by Far East MS-DOS 3.2-3.3)
    * 0x3d byte      (APPEND) TrueName flag (see INT 2F/AX=B711h)
    * 0x3e byte      (Novell NetWare) flag: next byte initialized if CEh (OS/2) capabilities flag
@@ -1040,6 +1038,9 @@ int main(int argc, char **argv) {
   int tty_in_fd;
   char is_tty_in_error;
 
+  { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
+  { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
+
   (void)argc;
   if (!argv[0] || !argv[1] || 0 == strcmp(argv[1], "--help")) {
     fprintf(stderr, "Usage: %s [<flag> ...] <dos-com-or-exe-file> [<dos-arg> ...]\n"
@@ -1256,18 +1257,17 @@ int main(int argc, char **argv) {
     perror("fatal: mmap kvm_run: %d\n");
     exit(252);
   }
-  if (ioctl(kvm_fds.vcpu_fd, KVM_GET_REGS, &regs) < 0) {
+  if (ioctl(kvm_fds.vcpu_fd, KVM_GET_REGS, &regs) < 0) {  /* We don't use the result; but we just check here that ioctl KVM_GET_REGS works. */
     perror("fatal: KVM_GET_REGS");
     exit(252);
   }
-  if (ioctl(kvm_fds.vcpu_fd, KVM_GET_SREGS, &(sregs)) < 0) {
+  if (ioctl(kvm_fds.vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
     perror("fatal: KVM_GET_SREGS");
     exit(252);
   }
-  sregs.fs.selector = sregs.gs.selector = 0x50;  /* Random value after magic interrupt table. */
-  /* EFLAGS https://en.wikipedia.org/wiki/FLAGS_register */
-  regs.rflags = 1 << 1;  /* Reserved bit. */
-  /*regs.rflags |= 1 << 9;*/  /* IF=1, enable interrupts. */
+  memset(&regs, '\0', sizeof(regs));
+  /*memcpy(initial_sregs, &sregs, sizeof(sregs));*/  /* Not completely 0, but sregs.Xs.selector is 0. */
+  sregs.fs.selector = sregs.gs.selector = ENV_PARA;  /* Random value after magic interrupt table. */
 
   memcpy((char*)mem + (PROGRAM_MCB_PARA << 4), default_program_mcb, 16);
   { char *psp = load_dos_executable_program(img_fd, prog_filename, mem, header, header_size, &regs, &sregs, &MCB_SIZE_PARA((char*)mem + (PROGRAM_MCB_PARA << 4)));
@@ -1305,6 +1305,10 @@ int main(int argc, char **argv) {
   FIX_SREG(fs);
   FIX_SREG(gs);
 
+  /* EFLAGS https://en.wikipedia.org/wiki/FLAGS_register */
+  *(unsigned short*)&regs.rflags = 1 << 1;  /* Reserved bit. */
+  /**(unsigned short*)&regs.rflags |= 1 << 9;*/  /* IF=1, enable interrupts. */
+
   had_get_ints = 0;  /* 1 << 0: int 0x00; 1 << 1: int 0x18. */
   tick_count = 0;
   sphinx_cmm_flags = 0;
@@ -1313,8 +1317,6 @@ int main(int argc, char **argv) {
   dta_seg_ofs = 0x80 | PSP_PARA << 16;
   ongoing_set_int = 0;  /* No set_int operation ongoing. */
   last_dos_error_code = 0;
-  { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
-  { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
 
   if (DEBUG) dump_regs("debug", &regs, &sregs);
 
