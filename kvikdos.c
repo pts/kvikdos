@@ -1087,7 +1087,7 @@ int main(int argc, char **argv) {
                     "--env=<NAME>=<value>: Adds environment variable.\n"
                     "--prog=<dos-pathname>: Sets DOS pathname of program.\n",
                     argv[0]);
-    exit(252);
+    exit(1);
   }
 
   dir_state.drive = 'C';
