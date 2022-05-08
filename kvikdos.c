@@ -1083,6 +1083,7 @@ int main(int argc, char **argv) {
   (void)argc;
   if (!argv[0] || !argv[1] || 0 == strcmp(argv[1], "--help")) {
     fprintf(stderr, "Usage: %s [<flag> ...] <dos-com-or-exe-file> [<dos-arg> ...]\n"
+                    "This is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.\n"
                     "Flags:\n"
                     "--env=<NAME>=<value>: Adds environment variable.\n"
                     "--prog=<dos-pathname>: Sets DOS pathname of program.\n",
