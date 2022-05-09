@@ -162,7 +162,7 @@
 
 /* Environment starts at this paragraph. */
 #define ENV_PARA 0x64
-/* How long the environment can be. */
+/* How long the environment can extend (in bytes). */
 #define ENV_LIMIT (PROGRAM_MCB_PARA << 4)
 
 /* Must be a multiple of the Linux page size (0x1000), minimum value is
@@ -1055,6 +1055,35 @@ static const unsigned char scancodes[128] = {
     0x26, 0x32, 0x31, 0x18, 0x19, 0x10, 0x13, 0x1f, 0x14, 0x16, 0x2f, 0x11,
     0x2d, 0x15, 0x2c, 0x1a, 0x2b, 0x1b, 0x29, 0x35 };
 
+/* It's unclear whether running the new program and discarding the current
+ * one is the right approach in the general case (especially with al == 3).
+ * So we just whitelist a few programs where we do that.
+ */
+static char should_skip_exec_program(char const *dos_filename, const char *args, const char *env, const char *env_end, char had_get_first_mcb) {
+  size_t dos_filename_size;
+  char had_ml_env = 0;
+  const char *p;
+  /* Detect Microsoft Macro Assembler 6.00B driver masm.exe. */
+  if (!had_get_first_mcb || *args != '\0') return 1;
+  dos_filename_size = strlen(dos_filename);
+  for (p = dos_filename + dos_filename_size; p != dos_filename && p[-1] != '\\'; --p) {}
+  if (strcmp(p, "ML.EXE") != 0) return 2;
+  for (p = env; *p != '\0';) {
+    char *q = memchr(p, '\0', env_end - p);
+    if (!q) return 3;  /* env too long. */
+    if (DEBUG) fprintf(stderr, "debug: load env line: (%s)\n", p);
+    if (strncmp(p, "ML= ", 4) == 0) had_ml_env = 1;
+    p = q + 1;
+  }
+  if (!had_ml_env) return 4;
+  if (++p + 4 > env_end) return 5;
+  if (*(const unsigned short*)p != 1) return 6;
+  p += 2;
+  if (p + dos_filename_size >= env_end) return 7;
+  if (strcmp(p, dos_filename) != 0) return 8;
+  return 0;
+}
+
 int main(int argc, char **argv) {
   struct kvm_fds kvm_fds;
   void *mem;
@@ -1066,7 +1095,7 @@ int main(int argc, char **argv) {
   const char *prog_filename;
   char header[PROGRAM_HEADER_SIZE];
   unsigned header_size;
-  char had_get_ints;
+  char had_get_ints, had_get_first_mcb;
   char **envp, **envp0;
   const char *dos_prog_abs = NULL;  /* Owned externally. */
   unsigned tick_count;
@@ -1129,7 +1158,7 @@ int main(int argc, char **argv) {
       if (!argv[0]) goto missing_argument;
       arg = *argv++;
      do_prog:
-      dos_prog_abs = arg;  /* !! autopopulate it based on prog_filename and dir_state.linux_mount_dir[...]. */
+      dos_prog_abs = arg;
     } else if (0 == strncmp(arg, "--prog=", 7)) {
       arg += 7;
       goto do_prog;
@@ -1355,7 +1384,8 @@ int main(int argc, char **argv) {
   *(unsigned short*)&regs.rflags |= 1 << 1;  /* Reserved bit in EFLAGS. */
   /**(unsigned short*)&regs.rflags |= 1 << 9;*/  /* IF=1, enable interrupts. */
 
-  had_get_ints = 0;  /* 1 << 0: int 0x00; 1 << 1: int 0x18. */
+  had_get_ints = 0;  /* 1 << 0: int 0x00; 1 << 1: int 0x18; 1 << 2: int 0x06. */
+  had_get_first_mcb = 0;
   tick_count = 0;
   sphinx_cmm_flags = 0;
   ctrl_break_checking = 0;
@@ -2029,6 +2059,51 @@ int main(int argc, char **argv) {
             /* Microsoft Macro Assembler 6.00B driver masm.exe. */
             (*(unsigned short*)&regs.rbx) = 0x80;
             SET_SREG(es, 0xfff0);
+          } else if (ah == 0x29) {  /* Parse filename for FCB. */
+            /* Microsoft Macro Assembler 6.00B driver masm.exe. */
+            const unsigned char al = (unsigned char)regs.rax;
+            const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rsi);  /* !! Security: check bounds. */
+            if (al == 1) {
+              if (*p != '\0' && *p != '\r') goto error_parse_filename;
+              /* Just do nothing. Returning al == 1 is fine. */
+            } else { error_parse_filename:
+              fprintf(stderr, "fatal: unsupported parsing of filename: %s\n", p);  /* For ml.exe, this filename is completely broken, it starts with \r. !!! what about DosBox? */
+              goto fatal_int;
+            }
+          } else if (ah == 0x4b) {  /* Load or execute program (exec). */
+            const unsigned char al = (unsigned char)regs.rax;
+            const char * const dos_filename = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            if (al == 0 || al == 3) {  /* Microsoft Macro Assembler 6.00B driver masm.exe uses it with al == 3. */
+              const char * const params = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rbx);  /* !! Security: check bounds. */
+              const unsigned short load_para = *(unsigned short*)params;
+              /*const unsigned short relocation_factor = *(unsigned short*)(params + 2);*/
+              char * const psp = (load_para >= PSP_PARA + 0x10 && load_para < DOS_ALLOC_PARA_LIMIT) ? (char*)mem + ((unsigned)(load_para - 0x10) << 4) : NULL;
+              const unsigned short env_para = psp ? *(const unsigned short*)(psp + 0x2c) : 0;
+              const char * const env = (env_para >= PSP_PARA + 0x10 && env_para < DOS_ALLOC_PARA_LIMIT) ? (char*)mem + (env_para << 4) : NULL;
+              const char * const env_end = env ? env + (((PROGRAM_MCB_PARA - ENV_PARA < DOS_ALLOC_PARA_LIMIT - env_para) ? PROGRAM_MCB_PARA - ENV_PARA : DOS_ALLOC_PARA_LIMIT - env_para) << 4) : NULL;
+              const unsigned char args_size = psp ? (unsigned char)psp[0x80] : 0;
+              char * const args = psp ? psp + 0x81 : NULL;
+              int reason, fd;
+              const char *linux_filename;
+              if (!(env && args && args_size < 0x7f && args[args_size] == '\r')) {
+                fprintf(stderr, "fatal: bounds check failed when loading program: %s\n", dos_filename);
+                goto fatal_int;
+              }
+              args[args_size] = '\0';  /* It was '\r'. */
+              if ((reason = should_skip_exec_program(dos_filename, args, env, env_end, had_get_first_mcb)) != 0) {
+                fprintf(stderr, "fatal: unsupported program to load with al:%02d reason=%d: %s\n", al, reason, dos_filename);
+                goto fatal_int;
+              }
+              dir_state.dos_prog_abs = dos_prog_abs;  /* For loading the overlay from prog_filename, even if not mounted. */
+              linux_filename = get_linux_filename(dos_filename);
+              dir_state.dos_prog_abs = NULL;  /* For security. */
+              if ((fd = open(linux_filename, O_RDONLY)) < 0) goto error_from_linux;
+              fprintf(stderr, "fatal: known program loading not implemented: filename=(%s) args=(%s)\n", dos_filename, psp + 0x81);
+              goto fatal_int;
+            } else {
+              fprintf(stderr, "fatal: unsupported loading of program with al:%02x: %s\n", al, dos_filename);
+              goto fatal_int;
+            }
           } else {
             goto fatal_int;
           }
@@ -2160,6 +2235,7 @@ int main(int argc, char **argv) {
           run->mmio.data[0] = 0xfc;  /* Machine ID is regular OC (0xfc). Same as default in src/ints/bios.cpp in DOSBox 0.74. */
         } else if (addr == 0xfff7e && !run->mmio.is_write && mmio_len == 2) {  /* Reading the first MCB pointer in INVARS (see int 0x21 call with ah == 0x52). Used by Microsoft Macro Assembler 6.00B driver masm.exe. */
           *(unsigned short*)run->mmio.data = PROGRAM_MCB_PARA;
+          had_get_first_mcb = 1;
         } else if (addr < 0x400 && run->mmio.is_write && addr + mmio_len <= 0x400 && ((mmio_len == 2 && (addr & 1) == 0) || (mmio_len == 4 && (addr & 3) == 0))) {  /* Set interrupt vector directly (not via int 0x21 call with ah == 0x25). */
           /* Microsoft BASIC Professional Development System 7.10 compiler pbc.exe */
           const unsigned char set_int_num = addr >> 2;
