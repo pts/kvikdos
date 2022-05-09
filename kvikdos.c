@@ -60,7 +60,7 @@
  * 0x00540...0x00640    +0x100  INT_HLT_PARA. hlt instructions for interrupt entry points. Needed for getting the interrupt number in KVM_EXIT_HLT.
  * 0x00640...0x00ff0    +0xabc  ENV_PARA. Environment variables and program pathname.
  * 0x00ff0...0x01000     +0x10  PROGRAM_MCB_PARA. Memory Control Block (MCB) of PSP.
- * 0x01000...0x01100    +0x100  PSP_PARA. Program Segment Prefix (PSP).
+ * 0x01000...0x01100    +0x100  PSP_PARA. Program Segment Prefix (PSP). https://stanislavs.org/helppc/program_segment_prefix.html
  * 0x01100...0xa0000  +0x9ef00  Loaded program image, .bss and stack. This region is called ``conventional memory''.
  * 0xa0000                  +0  DOS_ALLOC_PARA_LIMIT and DOS_MEM_LIMIT.
  *
@@ -149,6 +149,8 @@
 /* Start of Program Segment Prefix (PSP) in paragraphs (unit of 16 bytes).
  * It must be at leasge GUEST_MEM_MODULE_START >> 4, otherwise it isn't
  * writable by the program.
+ *
+ * https://stanislavs.org/helppc/program_segment_prefix.html
  *
  * Minimum value is 0x50, after the magic interrupt table (first 0x500 bytes
  * of DOS memory). Also there is the environment (up to ENV_LIMIT >> 4)
@@ -399,7 +401,7 @@ static const unsigned char fixed_exepack_stub[283] = {
  * block allocated in *block_size_para_out.
  *
  * r is the total number of header bytes alreday read from img_fd by
- * detect_dos_executable_program. Returns the psp (Program Segment Prefix)
+ * detect_dos_executable_program. Returns the Program Segment Prefix (PSP)
  * address.
  */
 static char *load_dos_executable_program(int img_fd, const char *filename, void *mem, const char *header, int header_size, struct kvm_regs *regs, struct kvm_sregs *sregs, unsigned short *block_size_para_out) {
