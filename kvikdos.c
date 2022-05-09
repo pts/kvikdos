@@ -1342,6 +1342,7 @@ int main(int argc, char **argv) {
  * ds, ax' instruction in the 16-bit KVM guest will set both.
  */
 #define FIX_SREG(name) do { sregs.name.base = sregs.name.selector << 4; } while(0)
+#define SET_SREG(name, value) do { sregs.name.base = (sregs.name.selector = (value)) << 4; } while(0)
   FIX_SREG(cs);
   FIX_SREG(ds);
   FIX_SREG(es);
@@ -1607,7 +1608,7 @@ int main(int argc, char **argv) {
               const unsigned short *pp = (const unsigned short*)((char*)mem + (get_int_num << 2));
               if (DEBUG) fprintf(stderr, "debug: get interrupt vector int:%02x is cs:%04x ip:%04x\n", get_int_num, pp[1], pp[0]);
               (*(unsigned short*)&regs.rbx) = pp[0];
-              sregs.es.selector = pp[1];
+              SET_SREG(es, pp[1]);
             } else {
               fprintf(stderr, "fatal: unsupported get interrupt vector int:%02x\n", get_int_num);
               goto fatal;
@@ -1914,8 +1915,7 @@ int main(int argc, char **argv) {
             if (dl < 4 && dir_state.linux_mount_dir[dl]) dir_state.drive = dl + 'A';
             *(unsigned char*)&regs.rax = 26;  /* 26 drives: 'A' .. 'Z'. */
           } else if (ah == 0x2f) {  /* Get disk transfer address (DTA). */
-            sregs.es.selector = dta_seg_ofs >> 16;
-            sregs.es.selector = PSP_PARA;
+            SET_SREG(es, dta_seg_ofs >> 16);
             *(unsigned short*)&regs.rbx = dta_seg_ofs;
           } else if (ah == 0x1a) {  /* Set disk transfer address (DTA). */
             dta_seg_ofs = *(unsigned short*)&regs.rdx | sregs.ds.selector << 16 ;
@@ -2026,7 +2026,7 @@ int main(int argc, char **argv) {
           } else if (ah == 0x52) {  /* Get pointer to INVARS. */
             /* Microsoft Macro Assembler 6.00B driver masm.exe. */
             (*(unsigned short*)&regs.rbx) = 0x80;
-            sregs.es.selector = 0xfff0;
+            SET_SREG(es, 0xfff0);
           } else {
             goto fatal_int;
           }
@@ -2132,7 +2132,7 @@ int main(int argc, char **argv) {
           goto fatal;
         }
         /* Return from the interrupt. */
-        sregs.cs.base = (sregs.cs.selector = int_cs) << 4;
+        SET_SREG(cs, int_cs);
         regs.rip = int_ip;
         *(unsigned short*)&regs.rsp += 6;  /* pop ip, pop cs, pop flags. */
         goto set_sregs_regs_and_continue;
