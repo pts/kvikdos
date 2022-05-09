@@ -1233,17 +1233,19 @@ int main(int argc, char **argv) {
     exit(1);
   }
 #if 0  /* Tests for replacing the output with "" */
-  fprintf(stderr, "!!! (%s)\n", get_linux_filename("C:\\foo\\.\\.\\\\bar\\."));
-  fprintf(stderr, "!!! (%s)\n", get_linux_filename(".\\.\\."));
-  fprintf(stderr, "!!! (%s)\n", get_linux_filename(".\\aaa\\..\\..\\.."));  /* "" */
-  fprintf(stderr, "!!! (%s)\n", get_linux_filename(".\\aaa\\..\\.."));  /* "" */
-  fprintf(stderr, "!!! (%s)\n", get_linux_filename(".\\aaa\\.."));
-  fprintf(stderr, "!!! (%s)\n", get_linux_filename("C:\\foo\\.\\\\\\.\\bar\\.\\..\\.\\bazzzz\\.."));
+  fprintf(stderr, "GLF (%s)\n", get_linux_filename("C:\\foo\\.\\.\\\\bar\\."));
+  fprintf(stderr, "GLF (%s)\n", get_linux_filename(".\\.\\."));
+  fprintf(stderr, "GLF (%s)\n", get_linux_filename(".\\aaa\\..\\..\\.."));  /* "" */
+  fprintf(stderr, "GLF (%s)\n", get_linux_filename(".\\aaa\\..\\.."));  /* "" */
+  fprintf(stderr, "GLF (%s)\n", get_linux_filename(".\\aaa\\.."));
+  fprintf(stderr, "GLF (%s)\n", get_linux_filename("C:\\foo\\.\\\\\\.\\bar\\.\\..\\.\\bazzzz\\.."));
 #endif
   prog_filename = *argv++;  /* This is a Linux filename. */
   /* Remaining arguments in argv will be passed to the DOS program in PSP:0x80. */
 
   prog_filename = find_program(prog_filename, &dir_state, getenv_prefix("PATH=", (char const**)envp0, (char const**)envp));
+
+ do_exec:
   if (dos_prog_abs == NULL) {
     /* TODO(pts): Use pathnames in the DOS %PATH% instead to convert prog_filename back to DOS. */
     dos_prog_abs = get_dos_abs_filename_r(prog_filename, &dir_state, dosfnbuf);
@@ -2067,7 +2069,7 @@ int main(int argc, char **argv) {
               if (*p != '\0' && *p != '\r') goto error_parse_filename;
               /* Just do nothing. Returning al == 1 is fine. */
             } else { error_parse_filename:
-              fprintf(stderr, "fatal: unsupported parsing of filename: %s\n", p);  /* For ml.exe, this filename is completely broken, it starts with \r. !!! what about DosBox? */
+              fprintf(stderr, "fatal: unsupported parsing of filename: %s\n", p);  /* For ml.exe, this filename is completely broken, it starts with \r, also in DOSBox. */
               goto fatal_int;
             }
           } else if (ah == 0x4b) {  /* Load or execute program (exec). */
