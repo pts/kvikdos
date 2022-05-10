@@ -791,6 +791,7 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
         for (; *p == '\\' || *p == '/'; ++p) {}
       }
     }
+    if (p[-1] == '/' || p[-1] == '\\') goto error;  /* If pathname ends with a slash, that's an error. It's safe to check since we've checked already that it's not empty. */
   }
  done:
   *out_p = '\0';
