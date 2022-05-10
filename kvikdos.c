@@ -26,6 +26,7 @@
 #define _GNU_SOURCE 1  /* For MAP_ANONYMOUS and memmem(). */
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>  /* For stdin availability check. */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1142,6 +1143,7 @@ int main(int argc, char **argv) {
   unsigned short last_dos_error_code;
   int tty_in_fd;
   char is_tty_in_error;
+  struct pollfd pollfd0;
 
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
   { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
@@ -1286,6 +1288,8 @@ int main(int argc, char **argv) {
   kvm_fds.kvm_fd = -1;
   run = NULL; mem = NULL;  /* Pacify GCC. */
   is_exec = 0;
+  pollfd0.fd = 0;
+  pollfd0.events = POLLIN;
 
  do_exec:
   if (dos_prog_abs == NULL) {
@@ -2263,6 +2267,17 @@ int main(int argc, char **argv) {
             *(unsigned short*)&regs.rax = *(const unsigned short*)((const char*)mem + 0x417);  /* In BDA, 0 by default, no modifier keys pressed. */
           } else if (ah == 0x02) {  /* Get keyboard status. */
             *(unsigned char*)&regs.rax = *(const unsigned char*)((const char*)mem + 0x417);  /* In BDA, 0 by default, no modifier keys pressed. */
+          } else if (ah == 0x01 || ah == 0x11) {  /* Check buffer, do not clear. */
+            const int got = poll(&pollfd0, 1  /* pollfd count */, -1 /* timeout */);  /* Like select(2), but faster. Easier to setup than epoll(2). */
+            if (got < 0) {
+              perror("poll stdin");
+              exit(252);
+            } else if (got) {
+              *(unsigned short*)&regs.rax =  0x011b;  /* Fake <Esc> in keyboard buffer. */
+              *(unsigned short*)&regs.rflags &= ~(1 << 6);  /* ZF=0. */
+            } else {
+              *(unsigned short*)&regs.rflags |= (1 << 6);  /* ZF=1. */
+            }
           } else if (ah == 0x00) {  /* Wait for keystroke and read. */
             char c;
             /* TODO(pts): Disable line buffering if isatty(0). Enable it again at exit if needed. */
