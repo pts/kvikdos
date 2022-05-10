@@ -1649,7 +1649,9 @@ int main(int argc, char **argv) {
              * recognize foo\aux.bar as aux. DOSBox 0.74-4 and MS-DOS 6.22
              * do the same, but they also fail if directory foo doesn't exist.
              */
-            if (is_same_ascii_nocase(linux_lastc, "aux", 3) && (linux_lastc[3] == '\0' || linux_lastc[3] == '.')) {
+            if (is_same_ascii_nocase(linux_lastc, "nul", 3) && (linux_lastc[3] == '.' || linux_lastc[3] == '\0')) {
+              strcpy(fnbuf, "/dev/null");
+            } else if (is_same_ascii_nocase(linux_lastc, "aux", 3) && (linux_lastc[3] == '\0' || linux_lastc[3] == '.')) {
               if (flags3 != O_WRONLY) { /* Don't let the user open aux for non-writing. This is for (partial) comaptibility with `pts-fast-dosbox. */
                 error_access_denied:
                 *(unsigned short*)&regs.rax = 5;  /* Access denied. */
