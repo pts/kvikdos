@@ -736,27 +736,44 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
   }
   {  /* Convert pathnames in in_dos */
     const char * const *in_dosi;
-    unsigned cc = 0;  /* Component count. */
+    unsigned component_count = 0;
     for (in_dosi = in_dos; in_dosi != in_dos + 2; ++in_dosi) {
       p = *in_dosi;
       for (; *p != '\0';) {
+        unsigned dot_count = 0;
+        char *out_limit83 = out_p + 8;
+        if (DEBUG && !(p[0] != '\0' && p[0] != '/' && p[0] != '\\')) {
+          fprintf(stderr, "assert: pathname component empty or  starts with / or \\: %s\n", p);
+          exit(252);
+        }
         if (p[0] == '.' && (p[1] == '\0' || p[1] == '\\' || p[1] == '/' || (p[1] == '.' && (p[2] == '\0' || p[2] == '\\' || p[2] == '/')))) {
           if (p[1] == '.') {
             /* Security: Too many levels up, outside linux_mount_dir with `..'. It's still possible to escape up if one of the pathname components is a symlink. */
-            if (cc-- == 0) goto error;
+            if (component_count-- == 0) goto error;
           }
+          dot_count = LINUX_PATH_SIZE + 2;
         } else {
-          ++cc;
+          ++component_count;
         }
         for (; *p != '\0';) {
-          const char c = *p++;
+          const char c = *p;
           if (out_p == out_pend) goto too_long;
           if (c == '\\' || c == '/') {
             *out_p++ = '/';  /* Convert '\\' to '/'. */
             break;
+          } else if (c == '.') {
+            if (dot_count == 0) out_limit83 = out_p + (1 + 3);
+            ++dot_count;
           }
-          *out_p++ = (c - 'a' + 0U <= 'z' - 'a' + 0U) ? c & ~32 : c;  /* Convert to uppercase. */
+          ++p;
+          if (out_p != out_limit83) {  /* Truncate the basename to 8 characters, and the extension to 3 characters. DOSBox does the same. */
+            *out_p++ = (c - 'a' + 0U <= 'z' - 'a' + 0U) ? c & ~32 : c;  /* Convert to uppercase. */
+          }
           /* TODO(pts) Truncate each component to 8.3 characters? */
+        }
+        if (dot_count <= LINUX_PATH_SIZE) {
+          if (dot_count > 1) goto error;  /* More than 1 '.' in component. DOSBox doesn't allow it either. */
+          if (p[-1] == '.') goto error;  /* Last character in component is '.'. DOSBox doesn't allow it either. It's safe to check here because of the assertion above. */
         }
         for (; *p == '\\' || *p == '/'; ++p) {}
       }
