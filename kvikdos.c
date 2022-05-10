@@ -2261,6 +2261,8 @@ int main(int argc, char **argv) {
         } else if (int_num == 0x16) {  /* Keyboard. */
           if (ah == 0x12) {  /* Get extended keyboard status. */
             *(unsigned short*)&regs.rax = *(const unsigned short*)((const char*)mem + 0x417);  /* In BDA, 0 by default, no modifier keys pressed. */
+          } else if (ah == 0x02) {  /* Get keyboard status. */
+            *(unsigned char*)&regs.rax = *(const unsigned char*)((const char*)mem + 0x417);  /* In BDA, 0 by default, no modifier keys pressed. */
           } else if (ah == 0x00) {  /* Wait for keystroke and read. */
             char c;
             /* TODO(pts): Disable line buffering if isatty(0). Enable it again at exit if needed. */
