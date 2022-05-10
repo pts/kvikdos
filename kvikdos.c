@@ -2242,7 +2242,7 @@ int main(int argc, char **argv) {
             if (ah < 2 || ah == 0x15) goto fatal_uic;  /* Doesn't follow the standard format. */
             *(unsigned char*)&regs.rax = 0;  /* Not installed, OK to install. */
           } else { fatal_uic:
-            fprintf(stderr, "fatal: unsupported int 0x%02x ax:%04x", int_num, *(const unsigned short*)&regs.rax);
+            fprintf(stderr, "fatal: unsupported int 0x%02x ax:%04x\n", int_num, *(const unsigned short*)&regs.rax);
             goto fatal;
           }
         } else if (int_num == 0x00) {  /* Division by zero. */
