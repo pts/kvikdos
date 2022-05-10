@@ -1658,7 +1658,8 @@ int main(int argc, char **argv) {
                 if ((fd = dup(2)) < 0) goto error_from_linux;
               }
               goto after_open;
-            } else if ((is_same_ascii_nocase(linux_lastc, "prn", 3) && (linux_lastc[3] == '\0' || linux_lastc[3] == '.')) ||
+            } else if ((is_same_ascii_nocase(linux_lastc, "con", 3) && (linux_lastc[3] == '\0' || linux_lastc[3] == '.')) ||
+                       (is_same_ascii_nocase(linux_lastc, "prn", 3) && (linux_lastc[3] == '\0' || linux_lastc[3] == '.')) ||
                        (is_same_ascii_nocase(linux_lastc, "lpt1", 4) && (linux_lastc[4] == '\0' || linux_lastc[4] == '.'))) {
               if (flags3 == O_RDONLY) {
                 if ((fd = dup(0)) < 0) goto error_from_linux;
