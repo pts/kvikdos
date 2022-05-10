@@ -269,7 +269,7 @@ error2:		jmp strict near error
 _exit:		mov ah, 9
 		mov dx, message
 		int 0x21
-		ret			; Exit to DOS with EXIT_SUCCESS.
+		ret			; Exit to DOS with EXIT_SUCCESS (0).
 
 
 message:	db 'malloct OK.', 13, 10, '$'
