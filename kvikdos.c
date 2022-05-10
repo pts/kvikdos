@@ -1630,6 +1630,7 @@ int main(int argc, char **argv) {
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             const int flags = (ah == 0x3c) ? O_RDWR | O_CREAT | O_TRUNC :
                 *(unsigned char*)&regs.rax & 3;  /* O_RDONLY == 0, O_WRONLY == 1, O_RDWR == 2 same in DOS and Linux. */
+            const unsigned char flags3 = (flags & 3);
             /* For create, CX contains attributes (read-only, hidden, system, archive), we just ignore it.
              * https://stanislavs.org/helppc/file_attributes.html
              */
@@ -1639,10 +1640,30 @@ int main(int argc, char **argv) {
             dir_state.dos_prog_abs = flags == O_RDONLY ? dos_prog_abs : NULL;  /* For loading the overlay from prog_filename, even if not mounted. */
             linux_filename = get_linux_filename(p);
             dir_state.dos_prog_abs = NULL;  /* For security. */
+            if (is_same_ascii_nocase(linux_filename, "aux", 4)) {
+              if (flags3 != O_WRONLY) { /* Don't let the user open aux for non-writing. This is for (partial) comaptibility with `pts-fast-dosbox. */
+                error_access_denied:
+                *(unsigned short*)&regs.rax = 5;  /* Access denied. */
+                goto error_on_21;
+              } else {
+                if ((fd = dup(2)) < 0) goto error_from_linux;
+              }
+              goto after_open;
+            } else if (is_same_ascii_nocase(linux_filename, "prn", 4) || is_same_ascii_nocase(linux_filename, "lpt1", 5)) {
+              if (flags3 == O_RDONLY) {
+                if ((fd = dup(0)) < 0) goto error_from_linux;
+              } else if (flags3 == O_WRONLY) {
+                if ((fd = dup(1)) < 0) goto error_from_linux;
+              } else {
+                goto error_access_denied;  /* Don't let the user open prn for both reading and writing. This is for (partial) comaptibility with `pts-fast-dosbox. */
+              }
+              goto after_open;
+            }
             if ((fd = open(linux_filename, flags, 0644)) < 0) { error_from_linux:
               *(unsigned short*)&regs.rax = get_dos_error_code(errno, 0x1f);  /* By default: General failure. */
               goto error_on_21;
             }
+           after_open:
             if (fd < 5) fd = ensure_fd_is_at_least(fd, 5);  /* Skip the first 5 DOS standard handles. */
             if ((fd + 0U) >> 16) {
               *(unsigned short*)&regs.rax = 4;  /* Too many open files. */
