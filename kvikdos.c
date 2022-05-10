@@ -815,7 +815,7 @@ static void get_dos_abspath_r(const char *p, const DirState *dir_state, char *ou
   if (DEBUG) fprintf(stderr, "debug: get_dos_abspath_r=(%s)\n", out_buf);
 }
 
-static char fnbuf[LINUX_PATH_SIZE], fnbuf2[LINUX_PATH_SIZE];
+static char fnbuf[LINUX_PATH_SIZE], fnbuf2[LINUX_PATH_SIZE], exec_fnbuf[LINUX_PATH_SIZE];
 
 #define get_linux_filename(p) get_linux_filename_r((p), &dir_state, fnbuf)
 
@@ -1059,10 +1059,10 @@ static const unsigned char scancodes[128] = {
  * one is the right approach in the general case (especially with al == 3).
  * So we just whitelist a few programs where we do that.
  */
-static char should_skip_exec_program(char const *dos_filename, const char *args, const char *env, const char *env_end, char had_get_first_mcb) {
+static char should_skip_exec_program(char const *dos_filename, const char *args, const char *env, const char **env_end_inout, char had_get_first_mcb) {
   size_t dos_filename_size;
   char had_ml_env = 0;
-  const char *p;
+  const char *p, *env_end = *env_end_inout;
   /* Detect Microsoft Macro Assembler 6.00B driver masm.exe. */
   if (!had_get_first_mcb || *args != '\0') return 1;
   dos_filename_size = strlen(dos_filename);
@@ -1081,6 +1081,7 @@ static char should_skip_exec_program(char const *dos_filename, const char *args,
   p += 2;
   if (p + dos_filename_size >= env_end) return 7;
   if (strcmp(p, dos_filename) != 0) return 8;
+  *env_end_inout = p + dos_filename_size + 1;
   return 0;
 }
 
@@ -1088,14 +1089,14 @@ int main(int argc, char **argv) {
   struct kvm_fds kvm_fds;
   void *mem;
   struct kvm_userspace_memory_region region;
-  int kvm_run_mmap_size, api_version, img_fd;
+  int kvm_run_mmap_size, api_version, img_fd = -1;
   struct kvm_run *run;
   struct kvm_regs regs;
-  struct kvm_sregs sregs;
+  struct kvm_sregs sregs, initial_sregs;
   const char *prog_filename;
   char header[PROGRAM_HEADER_SIZE];
   unsigned header_size;
-  char had_get_ints, had_get_first_mcb;
+  char had_get_ints, had_get_first_mcb, is_exec;
   char **envp, **envp0;
   const char *dos_prog_abs = NULL;  /* Owned externally. */
   unsigned tick_count;
@@ -1244,6 +1245,9 @@ int main(int argc, char **argv) {
   /* Remaining arguments in argv will be passed to the DOS program in PSP:0x80. */
 
   prog_filename = find_program(prog_filename, &dir_state, getenv_prefix("PATH=", (char const**)envp0, (char const**)envp));
+  kvm_fds.kvm_fd = -1;
+  run = NULL; mem = NULL;  /* Pacify GCC. */
+  is_exec = 0;
 
  do_exec:
   if (dos_prog_abs == NULL) {
@@ -1252,61 +1256,98 @@ int main(int argc, char **argv) {
     if (DEBUG) fprintf(stderr, "debug: dos_prog_abs=%s\n", dos_prog_abs);
     if (dos_prog_abs[0] == '\0') dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
   }
-  img_fd = open(prog_filename, O_RDONLY);
   if (img_fd < 0) {
-    fprintf(stderr, "fatal: can not open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
-    exit(252);
+    if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
+      fprintf(stderr, "fatal: can not open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
+      exit(252);
+    }
   }
   header_size = detect_dos_executable_program(img_fd, prog_filename, header);
 
-  if ((kvm_fds.kvm_fd = open("/dev/kvm", O_RDWR)) < 0) {
-    perror("fatal: failed to open /dev/kvm");
-    exit(252);
-  }
+  if (kvm_fds.kvm_fd < 0) {
+    if ((kvm_fds.kvm_fd = open("/dev/kvm", O_RDWR)) < 0) {
+      perror("fatal: failed to open /dev/kvm");
+      exit(252);
+    }
+    if ((api_version = ioctl(kvm_fds.kvm_fd, KVM_GET_API_VERSION, 0)) < 0) {
+      perror("fatal: failed to create KVM vm");
+      exit(252);
+    }
+    if (api_version != KVM_API_VERSION) {
+      fprintf(stderr, "fatal: KVM API version mismatch: kernel=%d user=%d\n",
+              api_version, KVM_API_VERSION);
+    }
+    if ((kvm_fds.vm_fd = ioctl(kvm_fds.kvm_fd, KVM_CREATE_VM, 0)) < 0) {
+      perror("fatal: failed to create KVM vm");
+      exit(252);
+    }
+    if ((mem = mmap(NULL, DOS_MEM_LIMIT, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)) ==
+        NULL) {
+      perror("fatal: mmap");
+      exit(252);
+    }
 
-  if ((api_version = ioctl(kvm_fds.kvm_fd, KVM_GET_API_VERSION, 0)) < 0) {
-    perror("fatal: failed to create KVM vm");
-    exit(252);
-  }
-  if (api_version != KVM_API_VERSION) {
-    fprintf(stderr, "fatal: KVM API version mismatch: kernel=%d user=%d\n",
-            api_version, KVM_API_VERSION);
-  }
-
-  if ((kvm_fds.vm_fd = ioctl(kvm_fds.kvm_fd, KVM_CREATE_VM, 0)) < 0) {
-    perror("fatal: failed to create KVM vm");
-    exit(252);
-  }
-
-  if ((mem = mmap(NULL, DOS_MEM_LIMIT, PROT_READ | PROT_WRITE,
-                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)) ==
-      NULL) {
-    perror("fatal: mmap");
-    exit(252);
-  }
-
-  memset(&region, 0, sizeof(region));
-  region.slot = 0;
-  region.guest_phys_addr = GUEST_MEM_MODULE_START;  /* Must be a multiple of the Linux page size (0x1000), otherwise KVM_SET_USER_MEMORY_REGION returns EINVAL. */
-  region.memory_size = DOS_MEM_LIMIT - GUEST_MEM_MODULE_START;
-  region.userspace_addr = (uintptr_t)mem + GUEST_MEM_MODULE_START;
-  /*region.flags = KVM_MEM_READONLY;*/  /* Not needed, read-write is default. */
-  if (ioctl(kvm_fds.vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-    perror("fatal: ioctl KVM_SET_USER_MEMORY_REGION");
-    exit(252);
-  }
-  if (GUEST_MEM_MODULE_START != 0) {
     memset(&region, 0, sizeof(region));
-    region.slot = 1;
-    region.guest_phys_addr = 0;
-    region.memory_size = 0x1000;  /* Magic interrupt table: 0x500 bytes, rounded up to page boundary. */
-    region.userspace_addr = (uintptr_t)mem;
-    region.flags = KVM_MEM_READONLY;
+    region.slot = 0;
+    region.guest_phys_addr = GUEST_MEM_MODULE_START;  /* Must be a multiple of the Linux page size (0x1000), otherwise KVM_SET_USER_MEMORY_REGION returns EINVAL. */
+    region.memory_size = DOS_MEM_LIMIT - GUEST_MEM_MODULE_START;
+    region.userspace_addr = (uintptr_t)mem + GUEST_MEM_MODULE_START;
+    /*region.flags = KVM_MEM_READONLY;*/  /* Not needed, read-write is default. */
     if (ioctl(kvm_fds.vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
       perror("fatal: ioctl KVM_SET_USER_MEMORY_REGION");
       exit(252);
     }
+    if (GUEST_MEM_MODULE_START != 0) {
+      memset(&region, 0, sizeof(region));
+      region.slot = 1;
+      region.guest_phys_addr = 0;
+      region.memory_size = 0x1000;  /* Magic interrupt table: 0x500 bytes, rounded up to page boundary. */
+      region.userspace_addr = (uintptr_t)mem;
+      region.flags = KVM_MEM_READONLY;
+      if (ioctl(kvm_fds.vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+        perror("fatal: ioctl KVM_SET_USER_MEMORY_REGION");
+        exit(252);
+      }
+    }
+    if ((kvm_fds.vcpu_fd = ioctl(kvm_fds.vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
+      perror("fatal: can not create KVM vcpu");
+      exit(252);
+    }
+    kvm_run_mmap_size = ioctl(kvm_fds.kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
+    if (kvm_run_mmap_size < 0) {
+      perror("fatal: ioctl KVM_GET_VCPU_MMAP_SIZE");
+      exit(252);
+    }
+    run = (struct kvm_run *)mmap(
+        NULL, kvm_run_mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, kvm_fds.vcpu_fd, 0);
+    if (run == NULL) {
+      perror("fatal: mmap kvm_run: %d\n");
+      exit(252);
+    }
+    if (ioctl(kvm_fds.vcpu_fd, KVM_GET_REGS, &regs) < 0) {  /* We don't use the result; but we just check here that ioctl KVM_GET_REGS works. */
+      perror("fatal: KVM_GET_REGS");
+      exit(252);
+    }
+    if (ioctl(kvm_fds.vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
+      perror("fatal: KVM_GET_SREGS");
+      exit(252);
+    }
+    initial_sregs = sregs;  /* Will be reused by exec. */
+  } else {
+    sregs = initial_sregs;
+    if (madvise((char*)mem + (PSP_PARA << 4), DOS_MEM_LIMIT - (PSP_PARA << 4), MADV_DONTNEED) != 0) {
+      perror("fatal: madvise MADV_DONTNEED\n");
+      exit(252);
+    }
+    if (*(const unsigned*)((char*)mem + (PSP_PARA << 4)) != 0) {
+      fprintf(stderr, "madvise failed to zero PSP\n");
+      exit(252);
+    }
+    memset(mem, '\0', ENV_PARA << 4);
+    memset((char*)mem + ENV_LIMIT, '\0', (PSP_PARA << 4) - ENV_LIMIT);
   }
+
   /* Any read/write outside the regions above will trigger a KVM_EXIT_MMIO. */
   /* Fill magic interrupt table. */
   { unsigned u;
@@ -1317,58 +1358,58 @@ int main(int argc, char **argv) {
    * https://stanislavs.org/helppc/bios_data_area.html
    */
   *(unsigned short*)((char*)mem + 0x410) = 0x22;  /* BIOS equipment flags. https://stanislavs.org/helppc/int_11.html */
-  ((char*)mem)[(INT_HLT_PARA << 4) - 1] = (char)0xcb;  /* `retf' opcode used by country case map.. */
+  ((char*)mem)[(INT_HLT_PARA << 4) - 1] = (char)0xcb;  /* `retf' opcode used by country case map. */
 
-  if ((kvm_fds.vcpu_fd = ioctl(kvm_fds.vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
-    perror("fatal: can not create KVM vcpu");
-    exit(252);
-  }
-  kvm_run_mmap_size = ioctl(kvm_fds.kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
-  if (kvm_run_mmap_size < 0) {
-    perror("fatal: ioctl KVM_GET_VCPU_MMAP_SIZE");
-    exit(252);
-  }
-  run = (struct kvm_run *)mmap(
-      NULL, kvm_run_mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, kvm_fds.vcpu_fd, 0);
-  if (run == NULL) {
-    perror("fatal: mmap kvm_run: %d\n");
-    exit(252);
-  }
-  if (ioctl(kvm_fds.vcpu_fd, KVM_GET_REGS, &regs) < 0) {  /* We don't use the result; but we just check here that ioctl KVM_GET_REGS works. */
-    perror("fatal: KVM_GET_REGS");
-    exit(252);
-  }
-  if (ioctl(kvm_fds.vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
-    perror("fatal: KVM_GET_SREGS");
-    exit(252);
-  }
   memset(&regs, '\0', sizeof(regs));
   /*memcpy(initial_sregs, &sregs, sizeof(sregs));*/  /* Not completely 0, but sregs.Xs.selector is 0. */
   sregs.fs.selector = sregs.gs.selector = ENV_PARA;  /* Random value after magic interrupt table. */
 
   memcpy((char*)mem + (PROGRAM_MCB_PARA << 4), default_program_mcb, 16);
   { char *psp = load_dos_executable_program(img_fd, prog_filename, mem, header, header_size, &regs, &sregs, &MCB_SIZE_PARA((char*)mem + (PROGRAM_MCB_PARA << 4)));
-    copy_args_to_dos_args(psp + 0x80, argv);
+    if (is_exec) {
+      const unsigned size = strlen(fnbuf2);
+      if (size > 0x7e) {  /* This shouldn't happen, that was checked before. */
+        fprintf(stderr, "fatal: exec command-line args too long\n");
+        exit(252);
+      }
+      psp[0x80] = (char)size;
+      memcpy(psp + 0x81, fnbuf2, size);
+      psp[0x81 + size] = '\r';
+    } else {
+      copy_args_to_dos_args(psp + 0x80, argv);
+    }
   }
   close(img_fd);
 
   /* http://www.techhelpmanual.com/346-dos_environment.html */
   { char *env = (char*)mem + (ENV_PARA << 4), *env0 = env;
     char * const env_end = (char*)mem + ENV_LIMIT;
+    if (is_exec) {
+      while (*env++ != '\0') {
+        if (DEBUG) fprintf(stderr, "debug: reusing env var (%s)\n", env - 1);
+        if (!(env = memchr(env, '\0', env_end - env))) {
+          fprintf(stderr, "fatal: exec env too large\n");
+          exit(252);
+        }
+        ++env;
+      }
+    } else {
 #if 0
-    env = add_env(env, env_end, "PATH=D:\\foo;C:\\bar", 1);
-    env = add_env(env, env_end, "heLLo=World!", 1);
+      env = add_env(env, env_end, "PATH=D:\\foo;C:\\bar", 1);
+      env = add_env(env, env_end, "heLLo=World!", 1);
 #endif
-    while (envp0 != envp) {
-      /* No attempt is made to deduplicate environment variables by name.
-       * The user should supply unique names.
-       */
-      env = add_env(env, env_end, *envp0++, 1);
+      while (envp0 != envp) {
+        /* No attempt is made to deduplicate environment variables by name.
+         * The user should supply unique names.
+         */
+        env = add_env(env, env_end, *envp0++, 1);
+      }
     }
     if (env == env0) env = add_env(env, env_end, "$=", 1);  /* Some programs such as pbc.exe would fail with an empty environment, so we create a fake variable. */
     env = add_env(env, env_end, "", 0);  /* Empty var marks end of env. */
     env = add_env(env, env_end, "\1", 0);  /* Number of subsequent variables (1). */
     env = add_env(env, env_end, dos_prog_abs, 0);  /* Full program pathname. */
+    if (is_exec) memset(env, '\0', env_end - env);
   }
 
 /* We have to set both selector and base, otherwise it won't work. A `mov
@@ -2082,26 +2123,28 @@ int main(int argc, char **argv) {
               char * const psp = (load_para >= PSP_PARA + 0x10 && load_para < DOS_ALLOC_PARA_LIMIT) ? (char*)mem + ((unsigned)(load_para - 0x10) << 4) : NULL;
               const unsigned short env_para = psp ? *(const unsigned short*)(psp + 0x2c) : 0;
               const char * const env = (env_para >= PSP_PARA + 0x10 && env_para < DOS_ALLOC_PARA_LIMIT) ? (char*)mem + (env_para << 4) : NULL;
-              const char * const env_end = env ? env + (((PROGRAM_MCB_PARA - ENV_PARA < DOS_ALLOC_PARA_LIMIT - env_para) ? PROGRAM_MCB_PARA - ENV_PARA : DOS_ALLOC_PARA_LIMIT - env_para) << 4) : NULL;
+              const char *env_end = env ? env + (((PROGRAM_MCB_PARA - ENV_PARA < DOS_ALLOC_PARA_LIMIT - env_para) ? PROGRAM_MCB_PARA - ENV_PARA : DOS_ALLOC_PARA_LIMIT - env_para) << 4) : NULL;
               const unsigned char args_size = psp ? (unsigned char)psp[0x80] : 0;
               char * const args = psp ? psp + 0x81 : NULL;
-              int reason, fd;
-              const char *linux_filename;
+              int reason;
               if (!(env && args && args_size < 0x7f && args[args_size] == '\r')) {
                 fprintf(stderr, "fatal: bounds check failed when loading program: %s\n", dos_filename);
                 goto fatal_int;
               }
               args[args_size] = '\0';  /* It was '\r'. */
-              if ((reason = should_skip_exec_program(dos_filename, args, env, env_end, had_get_first_mcb)) != 0) {
+              if ((reason = should_skip_exec_program(dos_filename, args, env, &env_end, had_get_first_mcb)) != 0) {
                 fprintf(stderr, "fatal: unsupported program to load with al:%02d reason=%d: %s\n", al, reason, dos_filename);
                 goto fatal_int;
               }
               dir_state.dos_prog_abs = dos_prog_abs;  /* For loading the overlay from prog_filename, even if not mounted. */
-              linux_filename = get_linux_filename(dos_filename);
+              prog_filename = get_linux_filename_r(dos_filename, &dir_state, exec_fnbuf);
               dir_state.dos_prog_abs = NULL;  /* For security. */
-              if ((fd = open(linux_filename, O_RDONLY)) < 0) goto error_from_linux;
-              fprintf(stderr, "fatal: known program loading not implemented: filename=(%s) args=(%s)\n", dos_filename, psp + 0x81);
-              goto fatal_int;
+              if ((img_fd = open(prog_filename, O_RDONLY)) < 0) goto error_from_linux;
+              dos_prog_abs = NULL;
+              memcpy((char*)mem + (ENV_PARA << 4), env, env_end - env);
+              strcpy(fnbuf2, args);  /* Large enough to hold 0x7f bytes. */
+              is_exec = 1;
+              goto do_exec;
             } else {
               fprintf(stderr, "fatal: unsupported loading of program with al:%02x: %s\n", al, dos_filename);
               goto fatal_int;
