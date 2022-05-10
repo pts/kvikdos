@@ -2241,6 +2241,11 @@ int main(int argc, char **argv) {
           if (al == 0x00) {  /* Installation check. */
             if (ah < 2 || ah == 0x15) goto fatal_uic;  /* Doesn't follow the standard format. */
             *(unsigned char*)&regs.rax = 0;  /* Not installed, OK to install. */
+#if 0  /* TLINK 5.1 tlink.exe loading dpmi16bi.ovl */
+          } else if (*(unsigned short*)&regs.rax == 0xfb42) {
+          } else if (*(unsigned short*)&regs.rax == 0xfb43) {
+          } else if (*(unsigned short*)&regs.rax == 0x1687) {
+#endif
           } else { fatal_uic:
             fprintf(stderr, "fatal: unsupported int 0x%02x ax:%04x\n", int_num, *(const unsigned short*)&regs.rax);
             goto fatal;
