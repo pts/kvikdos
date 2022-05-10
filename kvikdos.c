@@ -1142,7 +1142,7 @@ int main(int argc, char **argv) {
   unsigned ongoing_set_int;
   unsigned short last_dos_error_code;
   int tty_in_fd;
-  char is_tty_in_error;
+  char is_tty_in_error, is_hlt_ok;
   struct pollfd pollfd0;
 
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
@@ -1178,13 +1178,15 @@ int main(int argc, char **argv) {
 
   envp = envp0 = ++argv;
   tty_in_fd = -1;
-  is_tty_in_error = 0;
+  is_tty_in_error = is_hlt_ok = 0;
   while (argv[0]) {
     char *arg = *argv++;
     if (arg[0] != '-' || arg[1] == '\0') {
       --argv; break;
     } else if (arg[1] == '-' && arg[2] == '\0') {
       break;
+    } else if (0 == strcmp(arg, "--hlt-ok")) {
+      is_hlt_ok = 1;
     } else if (0 == strcmp(arg, "--env")) {
       if (!argv[0]) { missing_argument:
         fprintf(stderr, "fatal: missing argument for flag: %s\n", arg);
@@ -1519,7 +1521,7 @@ int main(int argc, char **argv) {
       fprintf(stderr, "fatal: shutdown\n");
       exit(252);
      case KVM_EXIT_HLT:
-      if ((unsigned)sregs.cs.selector == INT_HLT_PARA && (unsigned)((unsigned)regs.rip - 1) < 0x100) {  /* hlt caused by int through our magic interrupt table. */
+      if (sregs.cs.selector == INT_HLT_PARA && (unsigned)((unsigned)regs.rip - 1) < 0x100) {  /* hlt caused by int through our magic interrupt table. */
         const unsigned char int_num = ((unsigned)regs.rip - 1) & 0xff;
         const unsigned short *csip_ptr = (const unsigned short*)((char*)mem + ((unsigned)sregs.ss.selector << 4) + (*(unsigned short*)&regs.rsp));  /* !! What if rsp wraps around 64 KiB boundary? Test it. Also calculate int_cs again. */
         const unsigned short int_ip = csip_ptr[0], int_cs = csip_ptr[1];  /* Return address. */  /* !! Security: check bounds, also check that rsp <= 0xfffe. */
@@ -2267,19 +2269,8 @@ int main(int argc, char **argv) {
             *(unsigned short*)&regs.rax = *(const unsigned short*)((const char*)mem + 0x417);  /* In BDA, 0 by default, no modifier keys pressed. */
           } else if (ah == 0x02) {  /* Get keyboard status. */
             *(unsigned char*)&regs.rax = *(const unsigned char*)((const char*)mem + 0x417);  /* In BDA, 0 by default, no modifier keys pressed. */
-          } else if (ah == 0x01 || ah == 0x11) {  /* Check buffer, do not clear. */
-            const int got = poll(&pollfd0, 1  /* pollfd count */, -1 /* timeout */);  /* Like select(2), but faster. Easier to setup than epoll(2). */
-            if (got < 0) {
-              perror("poll stdin");
-              exit(252);
-            } else if (got) {
-              *(unsigned short*)&regs.rax =  0x011b;  /* Fake <Esc> in keyboard buffer. */
-              *(unsigned short*)&regs.rflags &= ~(1 << 6);  /* ZF=0. */
-            } else {
-              *(unsigned short*)&regs.rflags |= (1 << 6);  /* ZF=1. */
-            }
-          } else if (ah == 0x00) {  /* Wait for keystroke and read. */
-            char c;
+          } else if (ah == 0x01 || ah == 0x11 ||  /* Check buffer, do not clear. */
+                     ah == 0x00 || ah == 0x00) {  /* Wait for keystroke and read. */
             /* TODO(pts): Disable line buffering if isatty(0). Enable it again at exit if needed. */
             int got;
             struct termios tio;
@@ -2303,15 +2294,35 @@ int main(int argc, char **argv) {
                 }
               }
             }
-            if ((got = read(tty_in_fd == -2 ? 0 : tty_in_fd, &c, 1)) < 1) c = 26;  /* Ctrl-<Z>, simulate EOF. Most programs won't recognize it. */
+            if (ah & 1) {
+              const int got = poll(&pollfd0, 1  /* pollfd count */, 0 /* timeout */);  /* Like select(2), but faster. Easier to setup than epoll(2). */
+              if (got < 0) {
+                perror("poll stdin");
+                exit(252);
+              } else if (got) {
+                *(unsigned short*)&regs.rax =  0x011b;  /* Fake <Esc> in keyboard buffer. */
+                *(unsigned short*)&regs.rflags &= ~(1 << 6);  /* ZF=0. */
+              } else {
+                *(unsigned short*)&regs.rflags |= (1 << 6);  /* ZF=1. */
+              }
+            } else {
+              char c;
+              if ((got = read(tty_in_fd == -2 ? 0 : tty_in_fd, &c, 1)) < 1) c = 26;  /* Ctrl-<Z>, simulate EOF. Most programs won't recognize it. */
+              *(unsigned short*)&regs.rax = (c & ~0x7f ? 0x3f : scancodes[(int)c]) << 8 | (c & 0xff);
+            }
             if (!is_tty_in_error) {
               tio.c_lflag = old_lflag;
+              /* Since we set ECHO back here, a call with ah == 0x01
+               * followed by a call with ah == 0x00 will echo the character
+               * to the Linux terminal.
+               *
+               * TODO(pts): Fix it by not setting ECHO back here, only at exit.
+               */
               /* TODO(pts): Also change it back upon exit. Even if it's a signal exit. */
               if (tcsetattr(tty_in_fd, 0, &tio) != 0) {
                 is_tty_in_error = 1;
               }
             }
-            *(unsigned short*)&regs.rax = (c & ~0x7f ? 0x3f : scancodes[(int)c]) << 8 | (c & 0xff);
           } else {
             goto fatal_int;
           }
@@ -2350,8 +2361,18 @@ int main(int argc, char **argv) {
         /* Return from the interrupt. */
         SET_SREG(cs, int_cs);
         regs.rip = int_ip;
+        if (csip_ptr[2] & (1 << 9)) *(unsigned short*)&regs.rflags |= (1 << 9);  /* Set IF back to 1 if it was 1. */
         *(unsigned short*)&regs.rsp += 6;  /* pop ip, pop cs, pop flags. */
         goto set_sregs_regs_and_continue;
+      } else if (is_hlt_ok && sregs.cs.selector >= PSP_PARA && (*(unsigned short*)&regs.rflags & (1 << 9))) {  /* IF == 1. */
+        /* The 8253 timer chip increments the counter in each 1 / 1193182s
+         * causing IRQ0 at each 65536th increment. kvikdos doesn't implement
+         * any of this, but now we wait that approximate amount for `hlt' to
+         * wake up.
+         */
+        /* This is not precise enough: poll(&pollfd0, 0, 55);. */
+        usleep(54925);  /* 54925 =~= 1000000.0 / (1193182.0 / 65536). */
+        break;
       } else {
         fprintf(stderr, "fatal: unexpected hlt\n");
         goto fatal;
