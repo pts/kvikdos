@@ -673,6 +673,13 @@ struct kvm_fds {
 };
 
 static int get_linux_handle(unsigned short handle, const struct kvm_fds *kvm_fds) {
+  /* Redirection (`./kvikdos prog >prog.out') just works and redirects DOS
+   * STDOUT (not DOS STDERR), and because of the conditions below, STDPRN as
+   * well. This matches the behavior of `pts-fast-dosbox noscreenprn'. In
+   * MS-DOS 6.22, STDAUX and STDPRN redirect to nothing by default. In both
+   * DOSBox and MS-DOS 6.22, running `prog >prog.out' in the DOS command line
+   * redirects DOS STDOUT only (not DOS STDERR or others).
+   */
   return handle < 5 ? (
                handle == 3 ? 2  /* Emulate STDAUX with stderr. */
              : handle == 4 ? 1  /* Emulate STDPRN with stdout. */
