@@ -1702,9 +1702,12 @@ int main(int argc, char **argv) {
               goto error_on_21;
             }
           } else if (ah == 0x3e) {  /* Close using handle. */
-            const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
-            if (fd < 0) goto error_invalid_handle;  /* Not strictly needed, close(...) would check. */
-            if (close(fd) != 0) goto error_from_linux;
+            const unsigned dos_handle = *(unsigned short*)&regs.rbx;
+            if (dos_handle >= 5) {  /* Don't close the standard handles, just pretend. */
+              const int fd = get_linux_handle(dos_handle, &kvm_fds);
+              if (fd < 0) goto error_invalid_handle;  /* Not strictly needed, close(...) would check. */
+              if (close(fd) != 0) goto error_from_linux;
+            }
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x45) {  /* Duplicate handle (dup()). */
             const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
