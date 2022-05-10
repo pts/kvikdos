@@ -703,8 +703,8 @@ typedef struct DirState {
 #define LINUX_PATH_SIZE 1024
 
 /* out_buf is LINUX_PATH_SIZE bytes. */
-static const char *get_linux_filename_r(const char *p, const DirState *dir_state, char *out_buf) {
-  char *out_p = out_buf, *out_pend;
+static const char *get_linux_filename_r(const char *p, const DirState *dir_state, char *out_buf, char **out_lastc_out) {
+  char *out_p = out_buf, *out_pend, *out_lastc = out_buf;
   const char *in_linux;
   const char *in_dos[2] = { "", "" };
   char drive_idx, case_flip = 0;
@@ -753,8 +753,9 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
       for (; *p != '\0';) {
         unsigned dot_count = 0;
         char *out_limit83 = out_p + 8;
+        out_lastc = out_p;
         if (DEBUG && !(p[0] != '\0' && p[0] != '/' && p[0] != '\\')) {
-          fprintf(stderr, "assert: pathname component empty or  starts with / or \\: %s\n", p);
+          fprintf(stderr, "assert: pathname component empty or starts with / or \\: %s\n", p);
           exit(252);
         }
         if (p[0] == '.' && (p[1] == '\0' || p[1] == '\\' || p[1] == '/' || (p[1] == '.' && (p[2] == '\0' || p[2] == '\\' || p[2] == '/')))) {
@@ -793,7 +794,8 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
   }
  done:
   *out_p = '\0';
-  if (is_same_ascii_nocase(out_buf, "nul", 4)) strcpy(out_buf, "/dev/null");
+  if (is_same_ascii_nocase(out_lastc, "nul", 3) && (out_lastc[3] == '.' || out_lastc[3] == '\0')) strcpy(out_buf, "/dev/null");
+  if (out_lastc_out) *out_lastc_out = out_lastc;
   return out_buf;
 }
 
@@ -848,7 +850,7 @@ static void get_dos_abspath_r(const char *p, const DirState *dir_state, char *ou
 
 static char fnbuf[LINUX_PATH_SIZE], fnbuf2[LINUX_PATH_SIZE], exec_fnbuf[LINUX_PATH_SIZE];
 
-#define get_linux_filename(p) get_linux_filename_r((p), &dir_state, fnbuf)
+#define get_linux_filename(p) get_linux_filename_r((p), &dir_state, fnbuf, NULL)
 
 #define DOS_PATH_SIZE 64  /* See int 0x21 ah == 0x47 (get current directory) */
 static char dosfnbuf[DOS_PATH_SIZE];
@@ -964,7 +966,7 @@ static const char *find_program(const char *prog_filename, const DirState *dir_s
       char c;
       for (pq = pp; (c = *pp) != ';' && c != '\0'; ++pp) {}
       *(char*)pp = '\0';  /* Temporary terminator within dos_path, for get_linux_filename_r. */
-      get_linux_filename_r(pq, dir_state, fnbuf);
+      get_linux_filename_r(pq, dir_state, fnbuf, NULL);
       if (*fnbuf == '\0') goto end_of_pp;  /* TODO(pts): `return prog_filename' on too long. */
       *(char*)pp = c;
       r = fnbuf + strlen(fnbuf);
@@ -1636,11 +1638,16 @@ int main(int argc, char **argv) {
              */
             int fd;
             const char *linux_filename;
+            char *linux_lastc;  /* Last component of linux_filename. */
             if (DEBUG) fprintf(stderr, "debug: dos_open(%s)\n", p);
             dir_state.dos_prog_abs = flags == O_RDONLY ? dos_prog_abs : NULL;  /* For loading the overlay from prog_filename, even if not mounted. */
-            linux_filename = get_linux_filename(p);
+            linux_filename = get_linux_filename_r(p, &dir_state, fnbuf, &linux_lastc);
             dir_state.dos_prog_abs = NULL;  /* For security. */
-            if (is_same_ascii_nocase(linux_filename, "aux", 4)) {
+            /* Since we check linux_lastc rather than linux_filename, we
+             * recognize foo\aux.bar as aux. DOSBox 0.74-4 and MS-DOS 6.22
+             * do the same, but they also fail if directory foo doesn't exist.
+             */
+            if (is_same_ascii_nocase(linux_lastc, "aux", 3) && (linux_lastc[3] == '\0' || linux_lastc[3] == '.')) {
               if (flags3 != O_WRONLY) { /* Don't let the user open aux for non-writing. This is for (partial) comaptibility with `pts-fast-dosbox. */
                 error_access_denied:
                 *(unsigned short*)&regs.rax = 5;  /* Access denied. */
@@ -1649,7 +1656,8 @@ int main(int argc, char **argv) {
                 if ((fd = dup(2)) < 0) goto error_from_linux;
               }
               goto after_open;
-            } else if (is_same_ascii_nocase(linux_filename, "prn", 4) || is_same_ascii_nocase(linux_filename, "lpt1", 5)) {
+            } else if ((is_same_ascii_nocase(linux_lastc, "prn", 3) && (linux_lastc[3] == '\0' || linux_lastc[3] == '.')) ||
+                       (is_same_ascii_nocase(linux_lastc, "lpt1", 4) && (linux_lastc[4] == '\0' || linux_lastc[4] == '.'))) {
               if (flags3 == O_RDONLY) {
                 if ((fd = dup(0)) < 0) goto error_from_linux;
               } else if (flags3 == O_WRONLY) {
@@ -1721,7 +1729,7 @@ int main(int argc, char **argv) {
           } else if (ah == 0x56) {  /* Rename file. */
             const char * const p_old = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             const char * const p_new = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rdi);  /* !! Security: check bounds. */
-            int fd = rename(get_linux_filename(p_old), get_linux_filename_r(p_new, &dir_state, fnbuf2));
+            int fd = rename(get_linux_filename(p_old), get_linux_filename_r(p_new, &dir_state, fnbuf2, NULL));
             if (fd < 0) goto error_from_linux;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x25) {  /* Set interrupt vector. */
@@ -2193,7 +2201,7 @@ int main(int argc, char **argv) {
                 goto fatal_int;
               }
               dir_state.dos_prog_abs = dos_prog_abs;  /* For loading the overlay from prog_filename, even if not mounted. */
-              prog_filename = get_linux_filename_r(dos_filename, &dir_state, exec_fnbuf);
+              prog_filename = get_linux_filename_r(dos_filename, &dir_state, exec_fnbuf, NULL);
               dir_state.dos_prog_abs = NULL;  /* For security. */
               if ((img_fd = open(prog_filename, O_RDONLY)) < 0) goto error_from_linux;
               dos_prog_abs = NULL;
