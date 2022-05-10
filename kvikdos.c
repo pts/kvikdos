@@ -4,6 +4,8 @@
  *
  * This is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.
  *
+ * TODO(pts): Optionally, find Linux filenames and the dirname in lowercase.
+ * TODO(pts): Make unp_4.11/unp.exe work.
  * TODO(pts): Detect filenames in lower case (still simpler than DOSBox).
  * TODO(pts): DOS STDERR to Linux fd 1 (stdout) mapping.
  * TODO(pts): Turbo C, Turbo C++ and Borland C++ compatibility.
