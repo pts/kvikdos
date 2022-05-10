@@ -4,9 +4,8 @@
  *
  * This is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.
  *
- * TODO(pts): Optionally, find Linux filenames and the dirname in lowercase.
+ * TODO(pts): Optionally, find Linux filenames and the dirname in both lowercase and uppercase.
  * TODO(pts): Make unp_4.11/unp.exe work.
- * TODO(pts): Detect filenames in lower case (still simpler than DOSBox).
  * TODO(pts): DOS STDERR to Linux fd 1 (stdout) mapping.
  * TODO(pts): Turbo C, Turbo C++ and Borland C++ compatibility.
  * TODO(pts): udosrun integration.
@@ -682,10 +681,14 @@ static int get_linux_handle(unsigned short handle, const struct kvm_fds *kvm_fds
        : handle;
 }
 
+#define CASE_MODE_UPPERCASE 0
+#define CASE_MODE_LOWERCASE 1
+
 typedef struct DirState {
   char drive;  /* 'A', 'B', 'C' or 'D'. */
   char current_dir[4][128];  /* In DOS syntax. If current_dir[2] is "FOO\BAR\", then it corresponds to C:\FOO\BAR. */
   const char *linux_mount_dir[4];  /* Linux directory to which the specific drive has been mounted, with '/' suffix, or NULL. Owned externally. linux_mount_dir[2] == "/tmp/foo/" maps DOS path C:\MY\FILE.TXT to Linux path /tmp/foo/MY/FILE.TXT .  */
+  char case_mode[4];  /* CASE_MODE_... indicating how letters in DOS filename characters should be converted to Linux (uppercase or lowercase). CASE_MODE_UPPERCASE (0) is the default. We could also call it case_fold. */
   const char *dos_prog_abs;  /* DOS absolute pathname of the program being run. Externally owned, can be NULL. */
   const char *linux_prog;  /* Linux pathname of the program being run. Externally owned, can be NULL. */
 } DirState;
@@ -697,7 +700,7 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
   char *out_p = out_buf, *out_pend;
   const char *in_linux;
   const char *in_dos[2] = { "", "" };
-  char drive_idx;
+  char drive_idx, case_flip = 0;
   if (*p == '\0') goto done;  /* Empty pathname is an error. */
   if (dir_state->dos_prog_abs && strcmp(p, dir_state->dos_prog_abs) == 0) {
     in_linux = dir_state->linux_prog;
@@ -716,6 +719,7 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
       in_linux = NULL;
       drive_idx = dir_state->drive - 'A';
     }
+    case_flip = dir_state->case_mode[(int)drive_idx] == CASE_MODE_LOWERCASE ? 32 : 0;
     if (*p == '\\' || *p == '/') {
       for (++p; *p == '\\' || *p == '/'; ++p) {}
     } else {
@@ -767,7 +771,8 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
           }
           ++p;
           if (out_p != out_limit83) {  /* Truncate the basename to 8 characters, and the extension to 3 characters. DOSBox does the same. */
-            *out_p++ = (c - 'a' + 0U <= 'z' - 'a' + 0U) ? c & ~32 : c;  /* Convert to uppercase. */
+            const char c_uc = c & ~32;
+            *out_p++ = !(c_uc - 'A' + 0U <= 'Z' - 'A' + 0U) ? c : c_uc ^ case_flip;
           }
           /* TODO(pts) Truncate each component to 8.3 characters? */
         }
@@ -781,7 +786,7 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
   }
  done:
   *out_p = '\0';
-  if (strcmp(out_buf, "NUL") == 0) strcpy(out_buf, "/dev/null");
+  if (is_same_ascii_nocase(out_buf, "nul", 4)) strcpy(out_buf, "/dev/null");
   return out_buf;
 }
 
@@ -1138,7 +1143,8 @@ int main(int argc, char **argv) {
                     "Flags:\n"
                     "--env=<NAME>=<value>: Adds environment variable.\n"
                     "--prog=<dos-pathname>: Sets DOS pathname of program.\n"
-                    "--mount=<drive>:<dirname>: Makes Linux dir visible as drive for DOS program.\n"
+                    "--mount=<drive><case><dirname>: Makes Linux dir visible as drive for DOS program.\n"
+                    "    If <case> is :, then mount uppercase. If <case> is -, then mount lowercase.\n"
                     "--drive=<drive>: Sets initial current drive for DOS program.\n"
                     "--tty-in=<fd>: Selects Linux file descriptor for keyboard input.\n"
                     "    -2: stdin buffered; -1: /dev/tty; 0: stdin etc.\n",
@@ -1154,8 +1160,9 @@ int main(int argc, char **argv) {
   dir_state.dos_prog_abs = NULL;  /* For security, use dos_prog_abs mapping only for read-only opens below. */
   dir_state.linux_mount_dir[0] = NULL;
   dir_state.linux_mount_dir[1] = NULL;
-  dir_state.linux_mount_dir[2] = "";  /* By default: --mount=C:. */
+  dir_state.linux_mount_dir[2] = "";  /* By default: --mount=C:. (uppercase), use --mount=C-. for lowercase. */
   dir_state.linux_mount_dir[3] = NULL;
+  memset(dir_state.case_mode, CASE_MODE_UPPERCASE, 4);
 
   envp = envp0 = ++argv;
   tty_in_fd = -1;
@@ -1186,11 +1193,12 @@ int main(int argc, char **argv) {
       if (!argv[0]) goto missing_argument;
       arg = *argv++;
      do_mount:  /* Default: --mount C:. */
-      if ((arg[0] & ~32) - 'A' + 0U > 'D' - 'A' + 0U || arg[1] != ':') {
-        fprintf(stderr, "fatal: mount argument must start with <drive>:, <drive> must be A, B, C or D: %s\n", arg);
+      if ((arg[0] & ~32) - 'A' + 0U > 'D' - 'A' + 0U || !(arg[1] == ':' || arg[1] == '-')) {
+        fprintf(stderr, "fatal: mount argument must start with <drive>: or <drive>-, <drive> must be A, B, C or D: %s\n", arg);
         exit(1);
       } else {
         const char drive_idx = (arg[0] & ~32) - 'A';
+        const char case_mode = arg[1] == '-' ? CASE_MODE_LOWERCASE : CASE_MODE_UPPERCASE;
         arg += 2;
         if (DEBUG) fprintf(stderr, "debug: mount %c: %s\n", drive_idx + 'A', arg);
         while (arg[0] == '.' && arg[1] == '/') {
@@ -1206,7 +1214,8 @@ int main(int argc, char **argv) {
             exit(1);
           }
         }
-        dir_state.linux_mount_dir[(unsigned)drive_idx] = arg;  /* argv retains ownership of arg. */
+        dir_state.linux_mount_dir[(int)drive_idx] = arg;  /* argv retains ownership of arg. */
+        dir_state.case_mode[(int)drive_idx] = case_mode;
       }
     } else if (0 == strncmp(arg, "--mount=", 8)) {
       arg += 8;

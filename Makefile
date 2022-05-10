@@ -4,7 +4,7 @@ MAKEFLAGS += -r
 
 ALL = kvikdos guest.com slowp.com malloct.com printenv.com cat.com
 
-CFLAGS = -ansi -pedantic -s -O2 -W -Wall -Wextra -Werror=implicit-function-declaration -Werror=int-conversion -fno-strict-aliasing $(XCFLAGS)
+CFLAGS = -ansi -pedantic -s -O2 -W -Wall -Wextra -Werror=implicit-function-declaration -Werror=int-conversion -fno-strict-aliasing -Wno-overlength-strings $(XCFLAGS)
 XCFLAGS =  # To be overridden from the command-line.
 
 SRCDEPS = kvikdos.c mini_kvm.h
