@@ -698,7 +698,7 @@ static int get_linux_handle(unsigned short handle, const struct kvm_fds *kvm_fds
 typedef struct DirState {
   char drive;  /* 'A', 'B', 'C', 'D', ... ('A' + DRIVE_COUNT - 1). */
   char current_dir[DRIVE_COUNT][128];  /* In DOS syntax. If current_dir[2] is "FOO\BAR\", then it corresponds to C:\FOO\BAR. */
-  const char *linux_mount_dir[DRIVE_COUNT];  /* Linux directory to which the specific drive has been mounted, with '/' suffix, or NULL. Owned externally. linux_mount_dir[2] == "/tmp/foo/" maps DOS path C:\MY\FILE.TXT to Linux path /tmp/foo/MY/FILE.TXT .  */
+  const char *linux_mount_dir[DRIVE_COUNT];  /* Linux directory to which the specific drive has been mounted, with '/' suffix (or empty), or NULL. Owned externally. linux_mount_dir[2] == "/tmp/foo/" maps DOS path C:\MY\FILE.TXT to Linux path /tmp/foo/MY/FILE.TXT .  */
   char case_mode[DRIVE_COUNT];  /* CASE_MODE_... indicating how letters in DOS filename characters should be converted to Linux (uppercase or lowercase). CASE_MODE_UPPERCASE (0) is the default. We could also call it case_fold. */
   const char *dos_prog_abs;  /* DOS absolute pathname of the program being run. Externally owned, can be NULL. */
   const char *linux_prog;  /* Linux pathname of the program being run. Externally owned, can be NULL. */
@@ -1237,8 +1237,9 @@ int main(int argc, char **argv) {
                     "Flags:\n"
                     "--env=<NAME>=<value>: Adds environment variable.\n"
                     "--prog=<dos-pathname>: Sets DOS pathname of program.\n"
-                    "--mount=<drive><case><dirname>: Makes Linux dir visible as drive for DOS program.\n"
+                    "--mount=<drive><case><dirname>/: Makes Linux dir visible as <drive> for DOS program.\n"
                     "    If <case> is :, then mount uppercase. If <case> is -, then mount lowercase.\n"
+                    "--mount=<drive>--: Makes sure that <drive>: is not visible in DOS.\n"
                     "--drive=<drive>: Sets initial current drive for DOS program.\n"
                     "--tty-in=<fd>: Selects Linux file descriptor for keyboard input.\n"
                     "    -3: fake keys; -2: stdin buffered; -1: /dev/tty; 0: stdin etc.\n",
@@ -1301,20 +1302,25 @@ int main(int argc, char **argv) {
         exit(1);
       } else {
         const char drive_idx = (arg[0] & ~32) - 'A';
-        const char case_mode = arg[1] == '-' ? CASE_MODE_LOWERCASE : CASE_MODE_UPPERCASE;
-        arg += 2;
-        if (DEBUG) fprintf(stderr, "debug: mount %c: %s\n", drive_idx + 'A', arg);
-        while (arg[0] == '.' && arg[1] == '/') {
-          for (arg += 2; arg[0] == '/'; ++arg) {}
-        }
-        if (arg[0] == '.' && arg[1] == '\0') {
-          ++arg;
-        } else if (arg[0] != '\0') {
-          char *p = arg + strlen(arg);
-          if (arg[1] != '\0' && p[-1] == '.' && p[-2] == '/') *--p = '\0';  /* Remove trailing . if it ends with /. */
-          if (p[-1] != '/') {
-            fprintf(stderr, "fatal: mount directory target must end with /: %s\n", arg);
-            exit(1);
+        char case_mode = arg[1] == '-' ? CASE_MODE_LOWERCASE : CASE_MODE_UPPERCASE;
+        if (arg[1] == '-' && arg[2] == '-' && arg[3] == '\0') {
+          arg = NULL;  /* Make sure not mounted. */
+          case_mode = CASE_MODE_UPPERCASE;
+        } else {
+          arg += 2;
+          if (DEBUG) fprintf(stderr, "debug: mount %c: %s\n", drive_idx + 'A', arg);
+          while (arg[0] == '.' && arg[1] == '/') {
+            for (arg += 2; arg[0] == '/'; ++arg) {}
+          }
+          if (arg[0] == '.' && arg[1] == '\0') {
+            ++arg;
+          } else if (arg[0] != '\0') {
+            char *p = arg + strlen(arg);
+            if (arg[1] != '\0' && p[-1] == '.' && p[-2] == '/') *--p = '\0';  /* Remove trailing . if it ends with /. */
+            if (p[-1] != '/') {
+              fprintf(stderr, "fatal: mount directory target must end with /: %s\n", arg);
+              exit(1);
+            }
           }
         }
         dir_state.linux_mount_dir[(int)drive_idx] = arg;  /* argv retains ownership of arg. */
