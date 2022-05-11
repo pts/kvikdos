@@ -717,18 +717,17 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
   } else {
     if (p[0] != '\0' && p[1] == ':') {
       drive_idx = (p[0] & ~32) - 'A';
-      if ((unsigned char)drive_idx >= DRIVE_COUNT) {  /* Bad or unknown drive letter. */  /* !! Report error 0x3 (Path not found) */
-        /*fprintf(stderr, "fatal: DOS filename on wrong drive: 0x%02x\n", (unsigned char)p[0]);*/  /* !! Report error 0x3 (Path not found) */
-        /*exit(252);*/
-        goto done;
-      }
-      in_linux = dir_state->linux_mount_dir[(int)drive_idx];
-      if (!in_linux) goto done;  /* !! Report error 0x3 (Path not found) */
       p += 2;
     } else {
-      in_linux = NULL;
       drive_idx = dir_state->drive - 'A';
     }
+    if ((unsigned char)drive_idx >= DRIVE_COUNT) {  /* Bad or unknown drive letter. */  /* !! Report error 0x3 (Path not found) */
+      /*fprintf(stderr, "fatal: DOS filename on wrong drive: 0x%02x\n", (unsigned char)p[0]);*/  /* !! Report error 0x3 (Path not found) */
+      /*exit(252);*/
+      goto done;
+    }
+    in_linux = dir_state->linux_mount_dir[(int)drive_idx];
+    if (!in_linux) goto done;  /* Drive not available. !! Report error 0x3 (Path not found) */
     case_flip = dir_state->case_mode[(int)drive_idx] == CASE_MODE_LOWERCASE ? 32 : 0;
     if (*p == '\\' || *p == '/') {
       for (++p; *p == '\\' || *p == '/'; ++p) {}
