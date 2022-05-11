@@ -969,15 +969,21 @@ static const char *find_program(const char *prog_filename, const DirState *dir_s
     const char * const * exts;
     r = fnbuf;
     if (pp) {
-      char c;
+      char c, *pt, ptc;
       for (pq = pp; (c = *pp) != ';' && c != '\0'; ++pp) {}
+      if ((pq[0] & ~32) - 'A' + 0U <= 'Z' - 'A' + 0U && pq[1] == ':' && pq[2] != '\\' && pq[2] != '/') goto end_of_pp;  /* Not an absolute pathname within a drive. */
       *(char*)pp = '\0';  /* Temporary terminator within dos_path, for get_linux_filename_r. */
+      for (pt = (char*)pp; pt != pq && ((ptc = pt[-1]) == '\\' || ptc == '/'); --pt) {}
+      if (pt != pq) { ptc = *pt; *pt = '\0'; }  /* Temporarily remove trailing backslashes. */
       get_linux_filename_r(pq, dir_state, fnbuf, NULL);
+      if (pt != pq) *pt = ptc;  /* Restore trailing backlashes, if any. */
+      *(char*)pp = c;  /* Restore the terminator. */
       if (*fnbuf == '\0') goto end_of_pp;  /* TODO(pts): `return prog_filename' on too long. */
-      *(char*)pp = c;
       r = fnbuf + strlen(fnbuf);
-      if ((unsigned)(r - fnbuf)  >= sizeof(fnbuf)) return prog_filename;  /* Too long. */
-      *r++ = '/';
+      if (fnbuf[0] != '\0' && r[-1] != '/') {  /* fnbuf ends with a slash if %PATH% component is just a drive letter, e.g. C: */
+        if ((unsigned)(r - fnbuf)  >= sizeof(fnbuf)) return prog_filename;  /* Too long. */
+        *r++ = '/';
+      }
     }
     if ((unsigned)(r - fnbuf) + size >= sizeof(fnbuf)) return prog_filename;  /* Too long. */
     memcpy(r, prog_filename, size);
