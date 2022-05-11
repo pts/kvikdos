@@ -1643,6 +1643,7 @@ int main(int argc, char **argv) {
             dir_state.dos_prog_abs = flags == O_RDONLY ? dos_prog_abs : NULL;  /* For loading the overlay from prog_filename, even if not mounted. */
             linux_filename = get_linux_filename_r(p, &dir_state, fnbuf, &linux_lastc);
             dir_state.dos_prog_abs = NULL;  /* For security. */
+            if (DEBUG) fprintf(stderr, "debug: dos_open(%s) linux_filename=(%s) current_drive=%c:\n", p, linux_filename, dir_state.drive);
             /* Since we check linux_lastc rather than linux_filename, we
              * recognize foo\aux.bar as aux. DOSBox 0.74-4 and MS-DOS 6.22
              * do the same, but they also fail if directory foo doesn't exist.
