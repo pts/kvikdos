@@ -11,7 +11,8 @@
  * TODO(pts): udosrun integration.
  * TODO(pts): udosrun command-line flag compatibility.
  * TODO(pts): Run Linux ELF programs and scripts (#!), for convenience.
- * TODO(pts): Add support for .bat batch files (at least a subset).
+ * TODO(pts): Add support for .bat batch files (at least a small subset).
+ * TODO(pts): Add support for 32-bit programs: more memory (easy), XMS (and maybe VCPI); make PMODE.INC and WDOSX work (WDOSX maybe works without XMS).
  *
  * Since many parts of the DOS ABI is undocumented, the specific behavior of
  * kvikdos in corner cases is matched to:
