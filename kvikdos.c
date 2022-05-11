@@ -731,7 +731,7 @@ static char get_dos_filename_drive(const char *p, const DirState *dir_state) {
 }
 
 /* p is a DOS pathname. out_buf is LINUX_PATH_SIZE bytes. */
-static const char *get_linux_filename_r(const char *p, const DirState *dir_state, char *out_buf, char **out_lastc_out) {
+static char *get_linux_filename_r(const char *p, const DirState *dir_state, char *out_buf, char **out_lastc_out) {
   char *out_p = out_buf, *out_pend, *out_lastc = out_buf;
   const char *in_linux;
   const char *in_dos[2] = { "", "" };
@@ -894,6 +894,20 @@ static const char *skip_dot_slash(const char *p) {
   return p;
 }
 
+/* Removes the duplicate slashes in place. */
+static void remove_duplicate_slashes(char *p) {
+  const char *q = p;
+  char c;
+  while ((c = *q) != '\0') {
+    *p++ = c;
+    ++q;
+    if (c == '/') {
+      for (; *q == '/'; ++q) {}
+    }
+  }
+  *p = '\0';
+}
+
 #define DOS_PATH_SIZE 64  /* See int 0x21 ah == 0x47 (get current directory) */
 static char dosfnbuf[DOS_PATH_SIZE];
 
@@ -1007,7 +1021,7 @@ static const char * const find_program_no_exts[] = { "", NULL };
  * Uses global variable fnbuf as temporary storage and possible return value.
  * Uses global variable fnbuf2 as temporary storage.
  */
-static const char *find_program(const char *prog_filename, const DirState *dir_state, const char *dos_path) {
+static char *find_program(char *prog_filename, const DirState *dir_state, const char *dos_path) {
   size_t size;
   const char *p, *pp, *pq;
   char *r;
@@ -1211,7 +1225,8 @@ int main(int argc, char **argv) {
   struct kvm_run *run;
   struct kvm_regs regs;
   struct kvm_sregs sregs, initial_sregs;
-  const char *prog_filename, *prog_name_arg;
+  char *prog_filename;
+  const char *prog_name_arg;
   char header[PROGRAM_HEADER_SIZE];
   unsigned header_size;
   char had_get_ints, had_get_first_mcb, is_exec;
@@ -1316,6 +1331,7 @@ int main(int argc, char **argv) {
           arg += 2;
           if (DEBUG) fprintf(stderr, "debug: mount %c: %s\n", drive_idx + 'A', arg);
           arg = (char*)skip_dot_slash(arg);
+          remove_duplicate_slashes(arg);
           if (arg[0] == '.' && arg[1] == '\0') {
             ++arg;
           } else if (arg[0] != '\0') {
@@ -1387,13 +1403,14 @@ int main(int argc, char **argv) {
   /* Remaining arguments in argv will be passed to the DOS program in PSP:0x80. */
 
   dos_path = getenv_prefix("PATH=", (char const**)envp0, (char const**)envp);
-  prog_filename = find_program(prog_name_arg, &dir_state, dos_path);
+  prog_filename = find_program((char*)prog_name_arg, &dir_state, dos_path);
   if (*prog_filename == '\0') {
     fprintf(stderr, "fatal: invalid <dos-com-or-exe-file> DOS program filename: %s\n", prog_name_arg);
     exit(252);
   }
   is_prog_filename_linux = (prog_filename == prog_name_arg);
-  prog_filename = skip_dot_slash(prog_filename);
+  prog_filename = (char*)skip_dot_slash(prog_filename);
+  remove_duplicate_slashes(prog_filename);
 
   if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
     fprintf(stderr, "fatal: cannot open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
