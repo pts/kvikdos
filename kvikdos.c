@@ -1203,7 +1203,7 @@ int main(int argc, char **argv) {
   struct kvm_fds kvm_fds;
   void *mem;
   struct kvm_userspace_memory_region region;
-  int kvm_run_mmap_size, api_version, img_fd = -1;
+  int kvm_run_mmap_size, api_version, img_fd;
   struct kvm_run *run;
   struct kvm_regs regs;
   struct kvm_sregs sregs, initial_sregs;
@@ -1212,8 +1212,8 @@ int main(int argc, char **argv) {
   unsigned header_size;
   char had_get_ints, had_get_first_mcb, is_exec;
   char **envp, **envp0;
-  const char *dos_prog_abs = NULL;  /* Owned externally: either in argv or in dosfnbuf or (after exec) within mem. */
-  char dos_prog_drive = '\0';
+  const char *dos_prog_abs;  /* Owned externally: either in argv or in dosfnbuf or (after exec) within mem. */
+  char dos_prog_drive;
   unsigned tick_count;
   unsigned char sphinx_cmm_flags;
   char ctrl_break_checking;  /* 0 or 1. Just a flag, doesn't have any use case. */
@@ -1224,6 +1224,7 @@ int main(int argc, char **argv) {
   const unsigned short *next_fake_key;
   int tty_in_fd;
   char is_tty_in_error, is_hlt_ok;
+  char is_drive_e_mount_specified, is_drive_specified;
   struct pollfd pollfd0;
   const char *dos_path;
 
@@ -1254,13 +1255,14 @@ int main(int argc, char **argv) {
     }
     dir_state.drive = 'C';
     dir_state.dos_prog_abs = NULL;  /* For security, use dos_prog_abs mapping only for read-only opens below. */
-    dir_state.linux_mount_dir[2] = "";  /* By default: --mount=C:. (uppercase), use --mount=C-. for lowercase. */
+    dir_state.linux_mount_dir['C' - 'A'] = "";  /* By default: --mount=C:. (uppercase), use --mount=C-. for lowercase. */
     memset(dir_state.case_mode, CASE_MODE_UPPERCASE, DRIVE_COUNT);
   }
 
   envp = envp0 = ++argv;
   tty_in_fd = -1;
-  is_tty_in_error = is_hlt_ok = 0;
+  is_drive_e_mount_specified = is_drive_specified = is_tty_in_error = is_hlt_ok = 0;
+  dos_prog_abs = NULL;
   while (argv[0]) {
     char *arg = *argv++;
     if (arg[0] != '-' || arg[1] == '\0') {
@@ -1309,7 +1311,7 @@ int main(int argc, char **argv) {
         } else {
           arg += 2;
           if (DEBUG) fprintf(stderr, "debug: mount %c: %s\n", drive_idx + 'A', arg);
-          while (arg[0] == '.' && arg[1] == '/') {
+          while (arg[0] == '.' && arg[1] == '/') {  /* Skip ./ at the beginning. */
             for (arg += 2; arg[0] == '/'; ++arg) {}
           }
           if (arg[0] == '.' && arg[1] == '\0') {
@@ -1325,6 +1327,7 @@ int main(int argc, char **argv) {
         }
         dir_state.linux_mount_dir[(int)drive_idx] = arg;  /* argv retains ownership of arg. */
         dir_state.case_mode[(int)drive_idx] = case_mode;
+        if (drive_idx == 'E' - 'A') is_drive_e_mount_specified = 1;
       }
     } else if (0 == strncmp(arg, "--mount=", 8)) {
       arg += 8;
@@ -1338,6 +1341,7 @@ int main(int argc, char **argv) {
         exit(1);
       }
       dir_state.drive = arg[0] & ~32;
+      is_drive_specified = 1;
     } else if (0 == strncmp(arg, "--drive=", 8)) {
       arg += 8;
       goto do_drive;
@@ -1365,11 +1369,6 @@ int main(int argc, char **argv) {
     fprintf(stderr, "fatal: missing <dos-com-or-exe-file> DOS program filename\n");
     exit(1);
   }
-  if (!dir_state.linux_mount_dir[dir_state.drive - 'A']) {
-    /*dir_state.drive = 'C';*/
-    fprintf(stderr, "fatal: no mount point for default drive (specify --mount=...): %c:\n", dir_state.drive);
-    exit(1);
-  }
 #if 0  /* Tests for replacing the output with "" */
   fprintf(stderr, "GLF (%s)\n", get_linux_filename("C:\\foo\\.\\.\\\\bar\\."));
   fprintf(stderr, "GLF (%s)\n", get_linux_filename(".\\.\\."));
@@ -1387,7 +1386,41 @@ int main(int argc, char **argv) {
     fprintf(stderr, "fatal: invalid <dos-com-or-exe-file> DOS program filename: %s\n", prog_name_arg);
     exit(252);
   }
-  prog_name_arg = NULL;
+  if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
+    fprintf(stderr, "fatal: cannot open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
+    exit(252);
+  }
+  if (!is_drive_e_mount_specified && prog_filename == prog_name_arg) {  /* If not explicitly mounted, mount E: to the directory of prog_filename.  */
+    const char *p = prog_name_arg + strlen(prog_name_arg), *q;
+    size_t q_size;
+    for (; p != prog_name_arg && p[-1] != '/'; --p) {}
+    for (q = p; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
+    dir_state.case_mode['E' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;  /* Mount as lowercase iff the executable program name has at least one lowercase character. */
+    q = prog_name_arg;
+    while (q != p && q[0] == '.' && q[1] == '/') {  /* Skip ./ at the beginning. */
+      for (q += 2; q != p && q[0] == '/'; ++q) {}
+    }
+    q_size = strlen(q) + 1;
+    if (q_size > sizeof(fnbuf)) {
+      fprintf(stderr, "fatal: Linux name of executable program too long: %s\n", q);
+      exit(252);
+    }
+    memcpy(fnbuf, q, q_size);  /* Including trailing '\0'. */
+    prog_filename = fnbuf;
+    *(char*)p = '\0';  /* Modify it in place in argv. */
+    dir_state.linux_mount_dir['E' - 'A'] = q;  /* Empty or ends with '/'. */
+    dos_prog_drive = 'E';
+    if (!is_drive_specified && !dir_state.linux_mount_dir[dir_state.drive - 'A']) dir_state.drive = 'E';
+  } else {
+    dos_prog_drive = '\0';
+  }
+  prog_name_arg = NULL;  /* Make sure we don't use it later, we've already modified it for dir_state.linux_mount_dir['E' - 'A']. */
+  if (!dir_state.linux_mount_dir[dir_state.drive - 'A']) {
+    /*dir_state.drive = 'C';*/
+    fprintf(stderr, "fatal: no mount point for default drive (specify --mount=...): %c:\n", dir_state.drive);
+    exit(1);
+  }
+
   kvm_fds.kvm_fd = -1;
   run = NULL; mem = NULL;  /* Pacify GCC. */
   is_exec = 0;
@@ -1402,12 +1435,6 @@ int main(int argc, char **argv) {
     if (dos_prog_abs[0] == '\0') dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
   }
   dos_prog_drive = dos_prog_abs[0];
-  if (img_fd < 0) {
-    if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
-      fprintf(stderr, "fatal: cannot open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
-      exit(252);
-    }
-  }
   header_size = detect_dos_executable_program(img_fd, prog_filename, header);
 
   if (kvm_fds.kvm_fd < 0) {
