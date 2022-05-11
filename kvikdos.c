@@ -692,11 +692,13 @@ static int get_linux_handle(unsigned short handle, const struct kvm_fds *kvm_fds
 #define CASE_MODE_UPPERCASE 0
 #define CASE_MODE_LOWERCASE 1
 
+#define DRIVE_COUNT 6
+
 typedef struct DirState {
-  char drive;  /* 'A', 'B', 'C' or 'D'. */
-  char current_dir[4][128];  /* In DOS syntax. If current_dir[2] is "FOO\BAR\", then it corresponds to C:\FOO\BAR. */
-  const char *linux_mount_dir[4];  /* Linux directory to which the specific drive has been mounted, with '/' suffix, or NULL. Owned externally. linux_mount_dir[2] == "/tmp/foo/" maps DOS path C:\MY\FILE.TXT to Linux path /tmp/foo/MY/FILE.TXT .  */
-  char case_mode[4];  /* CASE_MODE_... indicating how letters in DOS filename characters should be converted to Linux (uppercase or lowercase). CASE_MODE_UPPERCASE (0) is the default. We could also call it case_fold. */
+  char drive;  /* 'A', 'B', 'C', 'D', ... ('A' + DRIVE_COUNT - 1). */
+  char current_dir[DRIVE_COUNT][128];  /* In DOS syntax. If current_dir[2] is "FOO\BAR\", then it corresponds to C:\FOO\BAR. */
+  const char *linux_mount_dir[DRIVE_COUNT];  /* Linux directory to which the specific drive has been mounted, with '/' suffix, or NULL. Owned externally. linux_mount_dir[2] == "/tmp/foo/" maps DOS path C:\MY\FILE.TXT to Linux path /tmp/foo/MY/FILE.TXT .  */
+  char case_mode[DRIVE_COUNT];  /* CASE_MODE_... indicating how letters in DOS filename characters should be converted to Linux (uppercase or lowercase). CASE_MODE_UPPERCASE (0) is the default. We could also call it case_fold. */
   const char *dos_prog_abs;  /* DOS absolute pathname of the program being run. Externally owned, can be NULL. */
   const char *linux_prog;  /* Linux pathname of the program being run. Externally owned, can be NULL. */
 } DirState;
@@ -715,7 +717,7 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
   } else {
     if (p[0] != '\0' && p[1] == ':') {
       drive_idx = (p[0] & ~32) - 'A';
-      if ((unsigned char)drive_idx >= 4) {  /* Bad or unknown drive letter. */  /* !! Report error 0x3 (Path not found) */
+      if ((unsigned char)drive_idx >= DRIVE_COUNT) {  /* Bad or unknown drive letter. */  /* !! Report error 0x3 (Path not found) */
         /*fprintf(stderr, "fatal: DOS filename on wrong drive: 0x%02x\n", (unsigned char)p[0]);*/  /* !! Report error 0x3 (Path not found) */
         /*exit(252);*/
         goto done;
@@ -809,7 +811,7 @@ static void get_dos_abspath_r(const char *p, const DirState *dir_state, char *ou
   if (*p == '\0' || out_size < 5) goto done;  /* Empty pathname is an error. */
   if (p[0] != '\0' && p[1] == ':') {
     drive_idx = (p[0] & ~32) - 'A';
-    if ((unsigned char)drive_idx >= 4) {  /* Bad or unknown drive letter. */  /* !! Report error 0x3 (Path not found) */
+    if ((unsigned char)drive_idx >= DRIVE_COUNT) {  /* Bad or unknown drive letter. */  /* !! Report error 0x3 (Path not found) */
       /*fprintf(stderr, "fatal: DOS filename on wrong drive: 0x%02x\n", (unsigned char)p[0]);*/  /* !! Report error 0x3 (Path not found) */
       /*exit(252);*/
       goto done;
@@ -869,7 +871,7 @@ static const char *get_dos_abs_filename_r(const char *p, const DirState *dir_sta
   }
   p0 = p;
   best_drive = '\0'; best_mp_size = 0;
-  for (drive = 'A'; drive <= 'D'; ++drive) {  /* TODO(pts): Find the longest matching linux_mount_dir. */
+  for (drive = 'A'; drive < 'A' + DRIVE_COUNT; ++drive) {  /* TODO(pts): Find the longest matching linux_mount_dir. */
     const char *mp = dir_state->linux_mount_dir[drive - 'A'];
     if (mp) {
       const size_t mp_size = strlen(mp);
@@ -1164,17 +1166,16 @@ int main(int argc, char **argv) {
     exit(argv[0] && argv[1] ? 0 : 1);
   }
 
-  dir_state.drive = 'C';
-  dir_state.current_dir[0][0] = '\0';
-  dir_state.current_dir[1][0] = '\0';
-  dir_state.current_dir[2][0] = '\0';
-  dir_state.current_dir[3][0] = '\0';
-  dir_state.dos_prog_abs = NULL;  /* For security, use dos_prog_abs mapping only for read-only opens below. */
-  dir_state.linux_mount_dir[0] = NULL;
-  dir_state.linux_mount_dir[1] = NULL;
-  dir_state.linux_mount_dir[2] = "";  /* By default: --mount=C:. (uppercase), use --mount=C-. for lowercase. */
-  dir_state.linux_mount_dir[3] = NULL;
-  memset(dir_state.case_mode, CASE_MODE_UPPERCASE, 4);
+  { unsigned u;
+    for (u = 0; u < DRIVE_COUNT; ++u) {
+      dir_state.current_dir[u][0] = '\0';
+      dir_state.linux_mount_dir[u] = NULL;
+    }
+    dir_state.drive = 'C';
+    dir_state.dos_prog_abs = NULL;  /* For security, use dos_prog_abs mapping only for read-only opens below. */
+    dir_state.linux_mount_dir[2] = "";  /* By default: --mount=C:. (uppercase), use --mount=C-. for lowercase. */
+    memset(dir_state.case_mode, CASE_MODE_UPPERCASE, DRIVE_COUNT);
+  }
 
   envp = envp0 = ++argv;
   tty_in_fd = -1;
@@ -1207,8 +1208,8 @@ int main(int argc, char **argv) {
       if (!argv[0]) goto missing_argument;
       arg = *argv++;
      do_mount:  /* Default: --mount C:. */
-      if ((arg[0] & ~32) - 'A' + 0U > 'D' - 'A' + 0U || !(arg[1] == ':' || arg[1] == '-')) {
-        fprintf(stderr, "fatal: mount argument must start with <drive>: or <drive>-, <drive> must be A, B, C or D: %s\n", arg);
+      if ((arg[0] & ~32) - 'A' + 0U >= DRIVE_COUNT || !(arg[1] == ':' || arg[1] == '-')) {
+        fprintf(stderr, "fatal: mount argument must start with <drive>: or <drive>-, <drive> must be A .. %c: %s\n", 'A' + DRIVE_COUNT - 1, arg);
         exit(1);
       } else {
         const char drive_idx = (arg[0] & ~32) - 'A';
@@ -1238,8 +1239,8 @@ int main(int argc, char **argv) {
       if (!argv[0]) goto missing_argument;
       arg = *argv++;
      do_drive:  /* Default: --drive C: */
-      if ((arg[0] & ~32) - 'A' + 0U > 'D' - 'A' + 0U || !(arg[1] == '\0' || (arg[1] == ':' && arg[2] == '\0'))) {
-        fprintf(stderr, "fatal: drive argument must be <drive>:, <drive> must be A, B, C or D: %s\n", arg);
+      if ((arg[0] & ~32) - 'A' + 0U >= DRIVE_COUNT || !(arg[1] == '\0' || (arg[1] == ':' && arg[2] == '\0'))) {
+        fprintf(stderr, "fatal: drive argument must be <drive>:, <drive> must be A .. %c: %s\n", 'A' + DRIVE_COUNT - 1, arg);
         exit(1);
       }
       dir_state.drive = arg[0] & ~32;
@@ -1805,7 +1806,7 @@ int main(int argc, char **argv) {
             } else if (al == 8) {  /* Get whether drive is removable. */
               unsigned char bl = (unsigned char)regs.rax;
               if (bl == 0) bl = dir_state.drive - 'A' + 1;
-              if (bl > 4 || !dir_state.linux_mount_dir[(int)bl - 1]) goto error_invalid_drive;
+              if (bl > DRIVE_COUNT || !dir_state.linux_mount_dir[(int)bl - 1]) goto error_invalid_drive;
               *(unsigned char*)&regs.rax = bl > 2;  /* A: (1) and B: (2) are removable (0), C: (3) etc. aren't (1). */
             } else {
               fprintf(stderr, "fatal: unsupported DOS ioctl call: 0x%02x\n", al);
@@ -2065,7 +2066,7 @@ int main(int argc, char **argv) {
           } else if (ah == 0x0e) {  /* Select disk. */
             /* TODO(pts): Use the default drive specified here (dl + 'A') in get_linux_filename_r(...). */
             const unsigned char dl = (unsigned char)regs.rdx;
-            if (dl < 4 && dir_state.linux_mount_dir[dl]) dir_state.drive = dl + 'A';
+            if (dl < DRIVE_COUNT && dir_state.linux_mount_dir[dl]) dir_state.drive = dl + 'A';
             *(unsigned char*)&regs.rax = 26;  /* 26 drives: 'A' .. 'Z'. */
           } else if (ah == 0x2f) {  /* Get disk transfer address (DTA). */
             SET_SREG(es, dta_seg_ofs >> 16);
