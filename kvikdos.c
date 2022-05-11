@@ -1431,7 +1431,7 @@ int main(int argc, char **argv) {
   if (dos_prog_abs == NULL) {
     /* TODO(pts): Use pathnames in the DOS %PATH% instead to convert prog_filename back to DOS. */
     dos_prog_abs = get_dos_abs_filename_r(prog_filename, dos_prog_drive, &dir_state, dosfnbuf);
-    if (DEBUG) fprintf(stderr, "debug: dos_prog_abs=%s\n", dos_prog_abs);
+    if (DEBUG) fprintf(stderr, "debug: prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", prog_filename, dos_prog_abs, dos_prog_drive);
     if (dos_prog_abs[0] == '\0') dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
   }
   dos_prog_drive = dos_prog_abs[0];
