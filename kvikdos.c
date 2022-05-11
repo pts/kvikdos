@@ -1198,9 +1198,17 @@ int main(int argc, char **argv) {
         fprintf(stderr, "fatal: missing argument for flag: %s\n", arg);
         exit(1);
       }
-      *envp++ = *argv++;  /* Reuse the argv array. */
+      arg = *argv++;
+     do_env:
+      { char *p = arg, c;
+        for (; (c = *p) != '\0' && c != '='; ++p) {
+          if (c - 'a' + 0U <= 'z' - 'a' + 0U) c &= ~32;  /* Convert variable name to lowercase. */
+        }
+      }
+      *envp++ = arg;  /* Reuse the argv array. */
     } else if (0 == strncmp(arg, "--env=", 6)) {  /* Can be specified multiple times. */
-      *envp++ = arg + 6;  /* Reuse the argv array. */
+      arg += 6;
+      goto do_env;
     } else if (0 == strcmp(arg, "--prog")) {
       if (!argv[0]) goto missing_argument;
       arg = *argv++;
