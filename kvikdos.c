@@ -2203,6 +2203,7 @@ int main(int argc, char **argv) {
             const char * const pattern = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             const char *fn, *fnb;
             const unsigned dta_linear = (dta_seg_ofs & 0xffff) + (dta_seg_ofs >> 16 << 4);
+            if (DEBUG) fprintf(stderr, "debug: findfirst pattern=(%s) attrs=0x%04x\n", pattern, attrs);
             if (!is_linear_byte_user_writable(dta_linear) || !is_linear_byte_user_writable(dta_linear + 0x2b - 1)) goto error_invalid_parameter;
             if (attrs & 8) {  /* Volume label requested. */
              no_more_files:
