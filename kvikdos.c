@@ -1257,8 +1257,8 @@ int main(int argc, char **argv) {
         exit(1);
       }
       /* Now we've set tty_in_fd. */
-    } else if (0 == strncmp(arg, "--tty-in=", 8)) {
-      arg += 8;
+    } else if (0 == strncmp(arg, "--tty-in=", 9)) {
+      arg += 9;
       goto do_tty_in;
     } else {
       fprintf(stderr, "fatal: unknown command-line flag: %s\n", arg);
