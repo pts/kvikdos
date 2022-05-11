@@ -779,6 +779,8 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
           } else if (c == '.') {
             if (dot_count == 0) out_limit83 = out_p + (1 + 3);
             ++dot_count;
+          } else if (c + 0U <= ' ' + 0U || c =='"' || c == '*' || c == '?' || c == ':' || c == '[' || c == ']' || c == '=' || c == '|' || c == '<' || c == '>' || c == ',' || c == ';' || c == '\x7f') {
+            goto error; /* Character not allowed in DOS pathname. DOSBox allows '+'. */
           }
           ++p;
           if (out_p != out_limit83) {  /* Truncate the basename to 8 characters, and the extension to 3 characters. DOSBox does the same. */
