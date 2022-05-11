@@ -1588,6 +1588,21 @@ int main(int argc, char **argv) {
          */
         env = add_env(env, env_end, *envp0++, 1);
       }
+      if (!dos_path) {  /* Set %PATH% to the directory of dos_prog_abs. */
+        const char *p = dos_prog_abs + strlen(dos_prog_abs);
+        const char *p_base = dos_prog_abs + 3;
+        size_t size;
+        for (; p != p_base && p[-1] != '\\'; --p) {}
+        if (p != p_base) --p;
+        if ((size_t)(env_end - env) < (size = p - dos_prog_abs) + 1 + 5) {
+          fprintf(stderr, "fatal: DOS environment too long for PATH\n");
+          exit(252);
+        }
+        memcpy(env, "PATH=", 5);
+        memcpy(env += 5, dos_prog_abs, size);
+        env += size;
+        *env++ = '\0';
+      }
     }
     if (env == env0) env = add_env(env, env_end, "$=", 1);  /* Some programs such as pbc.exe would fail with an empty environment, so we create a fake variable. */
     env = add_env(env, env_end, "", 0);  /* Empty var marks end of env. */
