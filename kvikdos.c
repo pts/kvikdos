@@ -708,7 +708,7 @@ typedef struct DirState {
 
 static void case_fold_on_drive(char *p, char drive, const DirState *dir_state) {
   const char drive_idx = (drive & ~32) - 'A';
-  if ((unsigned char)drive_idx >= DRIVE_COUNT || !dir_state->linux_mount_dir[(int)drive_idx]) { /* Bad drive. */
+  if ((unsigned char)drive_idx >= DRIVE_COUNT || !dir_state->linux_mount_dir[(int)drive_idx]) {  /* Bad drive. */
     *p = '\0'; return;
   } else {
     char const case_flip = dir_state->case_mode[(int)drive_idx] == CASE_MODE_LOWERCASE ? 32 : 0;
@@ -720,7 +720,17 @@ static void case_fold_on_drive(char *p, char drive, const DirState *dir_state) {
   }
 }
 
-/* out_buf is LINUX_PATH_SIZE bytes. */
+/* p is a DOS pathname. Returns 'A' etc. or '\0' on error. */
+static char get_dos_filename_drive(const char *p, const DirState *dir_state) {
+  if (p[0] != '\0' && p[1] == ':') {
+    const char drive_idx = (p[0] & ~32) - 'A';
+    if ((unsigned char)drive_idx >= DRIVE_COUNT || !dir_state->linux_mount_dir[(int)drive_idx]) return '\0';  /* Bad drive. */
+    return drive_idx + 'A';
+  }
+  return dir_state->drive;
+}
+
+/* p is a DOS pathname. out_buf is LINUX_PATH_SIZE bytes. */
 static const char *get_linux_filename_r(const char *p, const DirState *dir_state, char *out_buf, char **out_lastc_out) {
   char *out_p = out_buf, *out_pend, *out_lastc = out_buf;
   const char *in_linux;
@@ -823,6 +833,7 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
   return out_buf;
 }
 
+/* Converts a DOS pathname to a fully qualified, absolute DOS pathname. */
 static void get_dos_abspath_r(const char *p, const DirState *dir_state, char *out_buf, unsigned out_size) {
   char *out_p = out_buf, *out_pend = out_buf + out_size;
   char drive_idx;
@@ -881,34 +892,45 @@ static char dosfnbuf[DOS_PATH_SIZE];
 
 /* Converts Linux pathname p to DOS absolute pathname into out_buf (of
  * DOS_PATH_SIZE bytes). Always returns out_buf. On error, sets out_buf to
- * the empty string. */
-static const char *get_dos_abs_filename_r(const char *p, const DirState *dir_state, char *out_buf) {
-  char drive, best_drive;
-  size_t best_mp_size;
+ * the empty string. If drive is '\0', then finds a matching drive.
+ */
+static const char *get_dos_abs_filename_r(const char *p, char drive, const DirState *dir_state, char *out_buf) {
   const char *p0;
   while (p[0] == '.' && p[1] == '/') {
     for (p += 2; p[0] == '/'; ++p) {}
   }
   p0 = p;
-  best_drive = '\0'; best_mp_size = 0;
-  for (drive = 'A'; drive < 'A' + DRIVE_COUNT; ++drive) {  /* TODO(pts): Find the longest matching linux_mount_dir. */
+  if (drive == '\0') {  /* Find the best drive, i.e. the drive with the longest matching linux_mount_dir. */
+    char best_drive = '\0';
+    size_t best_mp_size = 0;
+    for (drive = 'A'; drive < 'A' + DRIVE_COUNT; ++drive) {
+      const char *mp = dir_state->linux_mount_dir[drive - 'A'];
+      if (mp) {
+        const size_t mp_size = strlen(mp);
+        if (strncmp(p0, mp, mp_size) == 0 && mp_size >= best_mp_size) {  /* >= here ensures that we can find mp_size == 0 (default). */
+          best_drive = drive;
+          best_mp_size = best_mp_size;
+        }
+      }
+    }
+    if (best_drive == '\0') goto error;  /* No mounted drives. */
+    drive = best_drive;
+  } else {  /* Use the specified drive. */
     const char *mp = dir_state->linux_mount_dir[drive - 'A'];
     if (mp) {
       const size_t mp_size = strlen(mp);
-      if (0 == strncmp(p0, mp, mp_size) && mp_size >= best_mp_size) {  /* >= here ensures that we can find mp_size == 0 (default). */
-        best_drive = drive;
-        best_mp_size = best_mp_size;
-      }
+      if (strncmp(p0, mp, mp_size) != 0) goto error;  /* File not on the mount point of drive. */
+    } else {
+      goto error;  /* No such drive. */
     }
   }
-  if (best_drive == '\0') goto error;  /* No mounted drives. */
   {
-    const char *mp = dir_state->linux_mount_dir[best_drive - 'A'];
+    const char *mp = dir_state->linux_mount_dir[drive - 'A'];
     const size_t mp_size = strlen(mp);
     if (0 == strncmp(p0, mp, mp_size)) {
       char *r = out_buf;
       char *rend = out_buf + DOS_PATH_SIZE - 1;
-      *r++ = best_drive;
+      *r++ = drive;
       *r++ = ':';
       *r++ = '\\';
       for (p = p0 + mp_size; *p != '\0';) {
@@ -1191,6 +1213,7 @@ int main(int argc, char **argv) {
   char had_get_ints, had_get_first_mcb, is_exec;
   char **envp, **envp0;
   const char *dos_prog_abs = NULL;  /* Owned externally: either in argv or in dosfnbuf or (after exec) within mem. */
+  char dos_prog_drive = '\0';
   unsigned tick_count;
   unsigned char sphinx_cmm_flags;
   char ctrl_break_checking;  /* 0 or 1. Just a flag, doesn't have any use case. */
@@ -1368,13 +1391,14 @@ int main(int argc, char **argv) {
  do_exec:
   if (dos_prog_abs == NULL) {
     /* TODO(pts): Use pathnames in the DOS %PATH% instead to convert prog_filename back to DOS. */
-    dos_prog_abs = get_dos_abs_filename_r(prog_filename, &dir_state, dosfnbuf);
+    dos_prog_abs = get_dos_abs_filename_r(prog_filename, dos_prog_drive, &dir_state, dosfnbuf);
     if (DEBUG) fprintf(stderr, "debug: dos_prog_abs=%s\n", dos_prog_abs);
     if (dos_prog_abs[0] == '\0') dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
   }
+  dos_prog_drive = dos_prog_abs[0];
   if (img_fd < 0) {
     if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
-      fprintf(stderr, "fatal: can not open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
+      fprintf(stderr, "fatal: cannot open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
       exit(252);
     }
   }
@@ -2292,7 +2316,16 @@ int main(int argc, char **argv) {
               dir_state.dos_prog_abs = dos_prog_abs;  /* For loading the overlay from prog_filename, even if not mounted. */
               prog_filename = get_linux_filename_r(dos_filename, &dir_state, exec_fnbuf, NULL);
               dir_state.dos_prog_abs = NULL;  /* For security. */
-              if ((img_fd = open(prog_filename, O_RDONLY)) < 0) goto error_from_linux;
+              dos_prog_drive = get_dos_filename_drive(dos_filename, &dir_state);
+              if (prog_filename[0] == '\0' || dos_prog_drive == '\0') {
+                fprintf(stderr, "fatal: bad program filename for loading: %s\n", dos_filename);
+                goto fatal_int;
+              }
+              if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
+                /*goto error_from_linux;*/  /* We don't know how to report the error properly here (it's not a normal int 0x21 call. */
+                fprintf(stderr, "fatal: cannot open DOS executable program for loading: %s: %s\n", prog_filename, strerror(errno));
+                goto fatal_int;
+              }
               dos_prog_abs = NULL;
               *(char*)env_end = '\0';  /* Hide counter for absolute program pathname. */
               memcpy(new_env = (char*)mem + (ENV_PARA << 4), env, env_end + 2 - env);
