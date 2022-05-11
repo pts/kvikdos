@@ -706,6 +706,20 @@ typedef struct DirState {
 
 #define LINUX_PATH_SIZE 1024
 
+static void case_fold_on_drive(char *p, char drive, const DirState *dir_state) {
+  const char drive_idx = (drive & ~32) - 'A';
+  if ((unsigned char)drive_idx >= DRIVE_COUNT || !dir_state->linux_mount_dir[(int)drive_idx]) { /* Bad drive. */
+    *p = '\0'; return;
+  } else {
+    char const case_flip = dir_state->case_mode[(int)drive_idx] == CASE_MODE_LOWERCASE ? 32 : 0;
+    char c;
+    while ((c = *p) != '\0') {
+      const char c_uc = c & ~32;
+      *p++ = !(c_uc - 'A' + 0U <= 'Z' - 'A' + 0U) ? c : c_uc ^ case_flip;
+    }
+  }
+}
+
 /* out_buf is LINUX_PATH_SIZE bytes. */
 static const char *get_linux_filename_r(const char *p, const DirState *dir_state, char *out_buf, char **out_lastc_out) {
   char *out_p = out_buf, *out_pend, *out_lastc = out_buf;
@@ -713,7 +727,10 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
   const char *in_dos[2] = { "", "" };
   char drive_idx, case_flip = 0;
   if (*p == '\0') goto done;  /* Empty pathname is an error. */
-  if (dir_state->dos_prog_abs && strcmp(p, dir_state->dos_prog_abs) == 0) {
+  if (!dir_state) {  /* Convert to relative Linux pathname. */
+    in_linux = NULL;
+    in_dos[1] = p;
+  } else if (dir_state->dos_prog_abs && strcmp(p, dir_state->dos_prog_abs) == 0) {
     in_linux = dir_state->linux_prog;
   } else {
     if (p[0] != '\0' && p[1] == ':') {
@@ -769,6 +786,7 @@ static const char *get_linux_filename_r(const char *p, const DirState *dir_state
           dot_count = LINUX_PATH_SIZE + 2;
         } else {
           ++component_count;
+          if (*p == '.') goto error;  /* First character in component is '.'. */
         }
         for (; *p != '\0';) {
           const char c = *p;
@@ -955,20 +973,28 @@ static const char *getenv_dos_prefix(const char *name_prefix, const char *env) {
 }
 
 /* Same extension lookup order as in DOS. */
-static const char * const find_program_exts[] = { ".COM", ".com", ".EXE", ".exe", ".BAT", ".bat", NULL };
+static const char * const find_program_exts[] = { ".com", ".exe", ".bat", NULL };
 static const char * const find_program_no_exts[] = { "", NULL };
 
-/* Both prog_filename and the return value are Linux pathnames.
+/* prog_filename may be a Linux pathname or a DOS program name (single-component).
+ * The return value is a Linux pathname.
  * Uses global variable fnbuf as temporary storage and possible return value.
+ * Uses global variable fnbuf2 as temporary storage.
  */
 static const char *find_program(const char *prog_filename, const DirState *dir_state, const char *dos_path) {
   size_t size;
   const char *p, *pp, *pq;
   char *r;
   char c;
+  char drive = dir_state->drive;
   const char * const * exts0;
   for (p = prog_filename; (c = *p) != '\0' && c != ':' && c != '/' && c != '\\'; ++p) {}
-  if (*p != '\0') return prog_filename;  /* Too complicated, don't attempt DOS %PATH% lookup. */
+  if (*p != '\0') return prog_filename;  /* prog_filename looks too complicated (e.g. it contains directory name), don't attempt DOS %PATH% lookup. */
+  get_linux_filename_r(prog_filename, NULL /* dir_state */, fnbuf2, NULL);
+  if ((fnbuf2[0] == '.' && fnbuf2[1] == '\0') ||  /* "." is an invalid program name. */
+      fnbuf2[0] == '\0') { too_long:
+    fnbuf[0] = '\0'; return fnbuf;  /* Invalid program name. */
+  }
   size = strlen(prog_filename);
   for (p = prog_filename + size; p != prog_filename && *--p != '.';) {}
   /* DOS allows only exts in find_program_exts, we allow anything the user specifies here. */
@@ -981,7 +1007,12 @@ static const char *find_program(const char *prog_filename, const DirState *dir_s
     if (pp) {
       char c, *pt, ptc;
       for (pq = pp; (c = *pp) != ';' && c != '\0'; ++pp) {}
-      if ((pq[0] & ~32) - 'A' + 0U <= 'Z' - 'A' + 0U && pq[1] == ':' && pq[2] != '\\' && pq[2] != '/') goto end_of_pp;  /* Not an absolute pathname within a drive. */
+      drive = pq[0] & ~32;
+      if (drive - 'A' + 0U <= 'Z' - 'A' + 0U && pq[1] == ':') {
+        if (pq[2] != '\\' && pq[2] != '/') goto end_of_pp;  /* Not an absolute pathname within a drive. */
+      } else {
+        drive = dir_state->drive;
+      }
       *(char*)pp = '\0';  /* Temporary terminator within dos_path, for get_linux_filename_r. */
       for (pt = (char*)pp; pt != pq && ((ptc = pt[-1]) == '\\' || ptc == '/'); --pt) {}
       if (pt != pq) { ptc = *pt; *pt = '\0'; }  /* Temporarily remove trailing backslashes. */
@@ -991,21 +1022,23 @@ static const char *find_program(const char *prog_filename, const DirState *dir_s
       if (*fnbuf == '\0') goto end_of_pp;  /* TODO(pts): `return prog_filename' on too long. */
       r = fnbuf + strlen(fnbuf);
       if (fnbuf[0] != '\0' && r[-1] != '/') {  /* fnbuf ends with a slash if %PATH% component is just a drive letter, e.g. C: */
-        if ((unsigned)(r - fnbuf)  >= sizeof(fnbuf)) return prog_filename;  /* Too long. */
+        if ((unsigned)(r - fnbuf)  >= sizeof(fnbuf)) goto too_long;
         *r++ = '/';
       }
     }
-    if ((unsigned)(r - fnbuf) + size >= sizeof(fnbuf)) return prog_filename;  /* Too long. */
-    memcpy(r, prog_filename, size);
+    if ((unsigned)(r - fnbuf) + size >= sizeof(fnbuf)) goto too_long;
+    memcpy(r, prog_filename, size + 1);  /* Including the trailing '\0'. */
+    case_fold_on_drive(r, drive, dir_state);
+    if (*r == '\0') goto end_of_pp;  /* Invalid pathname or invalid drive. */
     r += size;
     *r = '\0';
     if (DEBUG) fprintf(stderr, "debug: trying progs: %s\n", fnbuf);
     for (exts = exts0; *exts; ++exts) {
       const size_t ext_size = strlen(*exts);
       struct stat st;
-      if ((unsigned)(r - fnbuf) + ext_size >= sizeof(fnbuf)) return prog_filename;  /* Too long. */
-      memcpy(r, *exts, ext_size);
-      r[ext_size] = '\0';
+      if ((unsigned)(r - fnbuf) + ext_size >= sizeof(fnbuf)) goto too_long;
+      memcpy(r, *exts, ext_size + 1);  /* Including the trailing '\0'. */
+      case_fold_on_drive(r, drive, dir_state);
       if (DEBUG) fprintf(stderr, "debug: trying prog: %s\n", fnbuf);
       if (stat(fnbuf, &st) == 0 && S_ISREG(st.st_mode)) {
         if (DEBUG) fprintf(stderr, "debug: found prog: %s\n", fnbuf);
@@ -1152,7 +1185,7 @@ int main(int argc, char **argv) {
   struct kvm_run *run;
   struct kvm_regs regs;
   struct kvm_sregs sregs, initial_sregs;
-  const char *prog_filename;
+  const char *prog_filename, *prog_name_arg;
   char header[PROGRAM_HEADER_SIZE];
   unsigned header_size;
   char had_get_ints, had_get_first_mcb, is_exec;
@@ -1169,6 +1202,7 @@ int main(int argc, char **argv) {
   int tty_in_fd;
   char is_tty_in_error, is_hlt_ok;
   struct pollfd pollfd0;
+  const char *dos_path;
 
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
   { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
@@ -1299,7 +1333,7 @@ int main(int argc, char **argv) {
   }
   /* Now: argv contains remaining (non-flag) arguments. */
   if (!argv[0]) {
-    fprintf(stderr, "fatal: missing <dos-com-or-exe-file> program filename\n");
+    fprintf(stderr, "fatal: missing <dos-com-or-exe-file> DOS program filename\n");
     exit(1);
   }
   if (!dir_state.linux_mount_dir[dir_state.drive - 'A']) {
@@ -1315,10 +1349,16 @@ int main(int argc, char **argv) {
   fprintf(stderr, "GLF (%s)\n", get_linux_filename(".\\aaa\\.."));
   fprintf(stderr, "GLF (%s)\n", get_linux_filename("C:\\foo\\.\\\\\\.\\bar\\.\\..\\.\\bazzzz\\.."));
 #endif
-  prog_filename = *argv++;  /* This is a Linux filename. */
+  prog_name_arg = *argv++;  /* This is a Linux filename. */
   /* Remaining arguments in argv will be passed to the DOS program in PSP:0x80. */
 
-  prog_filename = find_program(prog_filename, &dir_state, getenv_prefix("PATH=", (char const**)envp0, (char const**)envp));
+  dos_path = getenv_prefix("PATH=", (char const**)envp0, (char const**)envp);
+  prog_filename = find_program(prog_name_arg, &dir_state, dos_path);
+  if (*prog_filename == '\0') {
+    fprintf(stderr, "fatal: invalid <dos-com-or-exe-file> DOS program filename: %s\n", prog_name_arg);
+    exit(252);
+  }
+  prog_name_arg = NULL;
   kvm_fds.kvm_fd = -1;
   run = NULL; mem = NULL;  /* Pacify GCC. */
   is_exec = 0;
