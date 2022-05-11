@@ -1041,7 +1041,7 @@ static const char *find_program(const char *prog_filename, const DirState *dir_s
       get_linux_filename_r(pq, dir_state, fnbuf, NULL);
       if (pt != pq) *pt = ptc;  /* Restore trailing backlashes, if any. */
       *(char*)pp = c;  /* Restore the terminator. */
-      if (*fnbuf == '\0') goto end_of_pp;  /* TODO(pts): `return prog_filename' on too long. */
+      if (*fnbuf == '\0') goto end_of_pp;  /* Skip if filename is invalid. */
       r = fnbuf + strlen(fnbuf);
       if (fnbuf[0] != '\0' && r[-1] != '/') {  /* fnbuf ends with a slash if %PATH% component is just a drive letter, e.g. C: */
         if ((unsigned)(r - fnbuf)  >= sizeof(fnbuf)) goto too_long;
@@ -1224,7 +1224,7 @@ int main(int argc, char **argv) {
   const unsigned short *next_fake_key;
   int tty_in_fd;
   char is_tty_in_error, is_hlt_ok;
-  char is_drive_e_mount_specified, is_drive_specified;
+  char is_drive_e_mount_specified, is_drive_c_mount_specified, is_drive_specified, is_prog_filename_linux;
   struct pollfd pollfd0;
   const char *dos_path;
 
@@ -1261,7 +1261,7 @@ int main(int argc, char **argv) {
 
   envp = envp0 = ++argv;
   tty_in_fd = -1;
-  is_drive_e_mount_specified = is_drive_specified = is_tty_in_error = is_hlt_ok = 0;
+  is_drive_e_mount_specified = is_drive_c_mount_specified = is_drive_specified = is_tty_in_error = is_hlt_ok = 0;
   dos_prog_abs = NULL;
   while (argv[0]) {
     char *arg = *argv++;
@@ -1327,7 +1327,11 @@ int main(int argc, char **argv) {
         }
         dir_state.linux_mount_dir[(int)drive_idx] = arg;  /* argv retains ownership of arg. */
         dir_state.case_mode[(int)drive_idx] = case_mode;
-        if (drive_idx == 'E' - 'A') is_drive_e_mount_specified = 1;
+        if (drive_idx == 'E' - 'A') {
+          is_drive_e_mount_specified = 1;
+        } else if (drive_idx == 'C' - 'A') {
+          is_drive_c_mount_specified = 1;
+        }
       }
     } else if (0 == strncmp(arg, "--mount=", 8)) {
       arg += 8;
@@ -1390,7 +1394,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "fatal: cannot open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
     exit(252);
   }
-  if (!is_drive_e_mount_specified && prog_filename == prog_name_arg) {  /* If not explicitly mounted, mount E: to the directory of prog_filename.  */
+  is_prog_filename_linux = (prog_filename == prog_name_arg);
+  if (!is_drive_e_mount_specified && is_prog_filename_linux) {  /* If not explicitly mounted, mount E: to the directory of prog_filename.  */
     const char *p = prog_name_arg + strlen(prog_name_arg), *q;
     size_t q_size;
     for (; p != prog_name_arg && p[-1] != '/'; --p) {}
@@ -1432,7 +1437,13 @@ int main(int argc, char **argv) {
     /* TODO(pts): Use pathnames in the DOS %PATH% instead to convert prog_filename back to DOS. */
     dos_prog_abs = get_dos_abs_filename_r(prog_filename, dos_prog_drive, &dir_state, dosfnbuf);
     if (DEBUG) fprintf(stderr, "debug: prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", prog_filename, dos_prog_abs, dos_prog_drive);
-    if (dos_prog_abs[0] == '\0') dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
+  }
+  if (dos_prog_abs[0] == '\0') {
+    dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
+  } else if (dos_prog_abs[0] == 'C' && !is_drive_c_mount_specified && dir_state.linux_mount_dir['C' - 'A']) {  /* Autodetect lowercase and remount C: */
+    const char *q;
+    for (q = prog_filename; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
+    dir_state.case_mode['C' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;  /* Mount as lowercase iff the executable program name has at least one lowercase character. */
   }
   dos_prog_drive = dos_prog_abs[0];
   header_size = detect_dos_executable_program(img_fd, prog_filename, header);
