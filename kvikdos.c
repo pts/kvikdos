@@ -1091,6 +1091,10 @@ static const unsigned char scancodes[128] = {
     0x26, 0x32, 0x31, 0x18, 0x19, 0x10, 0x13, 0x1f, 0x14, 0x16, 0x2f, 0x11,
     0x2d, 0x15, 0x2c, 0x1a, 0x2b, 0x1b, 0x29, 0x35 };
 
+/* Simulated, fake keypresses for --tty-in=-3 . */
+static const unsigned short fake_keys[3] = {
+    0x011b /* <Esc> */, 0x4400 /* <F10> */, 0x1c0d /* <Enter> */ };
+
 /* It's unclear whether running the new program and discarding the current
  * one is the right approach in the general case (especially with al == 3).
  * So we just whitelist a few programs where we do that.
@@ -1142,6 +1146,7 @@ int main(int argc, char **argv) {
   unsigned dta_seg_ofs;  /* Disk transfer address (DTA). */
   unsigned ongoing_set_int;
   unsigned short last_dos_error_code;
+  const unsigned short *next_fake_key;
   int tty_in_fd;
   char is_tty_in_error, is_hlt_ok;
   struct pollfd pollfd0;
@@ -1160,7 +1165,7 @@ int main(int argc, char **argv) {
                     "    If <case> is :, then mount uppercase. If <case> is -, then mount lowercase.\n"
                     "--drive=<drive>: Sets initial current drive for DOS program.\n"
                     "--tty-in=<fd>: Selects Linux file descriptor for keyboard input.\n"
-                    "    -2: stdin buffered; -1: /dev/tty; 0: stdin etc.\n",
+                    "    -3: fake keys; -2: stdin buffered; -1: /dev/tty; 0: stdin etc.\n",
                     argv[0]);
     exit(argv[0] && argv[1] ? 0 : 1);
   }
@@ -1251,9 +1256,9 @@ int main(int argc, char **argv) {
       if (!argv[0]) goto missing_argument;
       arg = *argv++;
      do_tty_in:
-      if (sscanf(arg, "%d%n", &tty_in_fd, &char_count) < 1 || char_count + 0U != strlen(arg) || tty_in_fd < -2) {
-        /* -1: use /dev/tty; -2: use 0 (stdin), but don't try to disable buffering. */
-        fprintf(stderr, "fatal: tty-in argument must be nonnegative integer or -1 or -2: %s\n", arg);
+      if (sscanf(arg, "%d%n", &tty_in_fd, &char_count) < 1 || char_count + 0U != strlen(arg) || tty_in_fd < -3) {
+        /* -1: use /dev/tty; -2: use 0 (stdin), but don't try to disable buffering; -3: fake keys in round-robin. */
+        fprintf(stderr, "fatal: tty-in argument must be nonnegative integer or -1, -2 or -3: %s\n", arg);
         exit(1);
       }
       /* Now we've set tty_in_fd. */
@@ -1480,6 +1485,7 @@ int main(int argc, char **argv) {
   dta_seg_ofs = 0x80 | PSP_PARA << 16;
   ongoing_set_int = 0;  /* No set_int operation ongoing. */
   last_dos_error_code = 0;
+  next_fake_key = fake_keys;
 
   if (DEBUG) dump_regs("debug", &regs, &sregs);
 
@@ -2271,56 +2277,65 @@ int main(int argc, char **argv) {
             *(unsigned char*)&regs.rax = *(const unsigned char*)((const char*)mem + 0x417);  /* In BDA, 0 by default, no modifier keys pressed. */
           } else if (ah == 0x01 || ah == 0x11 ||  /* Check buffer, do not clear. */
                      ah == 0x00 || ah == 0x00) {  /* Wait for keystroke and read. */
-            /* TODO(pts): Disable line buffering if isatty(0). Enable it again at exit if needed. */
-            int got;
-            struct termios tio;
-            tcflag_t old_lflag = 0;
-            if (tty_in_fd == -1) {
-              if ((tty_in_fd = open("/dev/tty", O_RDWR)) < 0) {  /* Current controlling terminal. */
-                tty_in_fd = -2;
+            if (tty_in_fd == -3) {  /* Fake keys. */
+              *(unsigned char*)&regs.rax = *next_fake_key;
+              if (ah & 1) {
+                *(unsigned short*)&regs.rflags &= ~(1 << 6);  /* ZF=0, key available in buffer. */
               } else {
-                tty_in_fd = ensure_fd_is_at_least(tty_in_fd, 5);
+                if (++next_fake_key == fake_keys + sizeof(fake_keys) / sizeof(fake_keys[0])) next_fake_key = fake_keys;
               }
-            }
-            if (!is_tty_in_error) {
-              if (tcgetattr(tty_in_fd, &tio) != 0) {
-                is_tty_in_error = 1;
+            } else {
+              /* TODO(pts): Disable line buffering if isatty(0). Enable it again at exit if needed. */
+              int got;
+              struct termios tio;
+              tcflag_t old_lflag = 0;
+              if (tty_in_fd == -1) {
+                if ((tty_in_fd = open("/dev/tty", O_RDWR)) < 0) {  /* Current controlling terminal. */
+                  tty_in_fd = -2;
+                } else {
+                  tty_in_fd = ensure_fd_is_at_least(tty_in_fd, 5);
+                }
+              }
+              if (!is_tty_in_error) {
+                if (tcgetattr(tty_in_fd, &tio) != 0) {
+                  is_tty_in_error = 1;
+                } else {
+                  old_lflag = tio.c_lflag;
+                  /* TODO(pts): Handle Ctrl-<C> and other signals. */
+                  tio.c_lflag &= ~(ICANON | ECHO);  /* As a side effect, ECHOCTL is also disabled, so Ctrl-<C> won't show up as ^C, but it will still send SIGINT. */
+                  if (tcsetattr(tty_in_fd, 0, &tio) != 0) {
+                    is_tty_in_error = 1;
+                  }
+                }
+              }
+              if (ah & 1) {
+                const int got = poll(&pollfd0, 1  /* pollfd count */, 0 /* timeout */);  /* Like select(2), but faster. Easier to setup than epoll(2). */
+                if (got < 0) {
+                  perror("poll stdin");
+                  exit(252);
+                } else if (got) {
+                  *(unsigned short*)&regs.rax =  0x011b;  /* Fake <Esc> in keyboard buffer. */
+                  *(unsigned short*)&regs.rflags &= ~(1 << 6);  /* ZF=0, key available. */
+                } else {
+                  *(unsigned short*)&regs.rflags |= (1 << 6);  /* ZF=1. */
+                }
               } else {
-                old_lflag = tio.c_lflag;
-                /* TODO(pts): Handle Ctrl-<C> and other signals. */
-                tio.c_lflag &= ~(ICANON | ECHO);  /* As a side effect, ECHOCTL is also disabled, so Ctrl-<C> won't show up as ^C, but it will still send SIGINT. */
+                char c;
+                if ((got = read(tty_in_fd == -2 ? 0 : tty_in_fd, &c, 1)) < 1) c = 26;  /* Ctrl-<Z>, simulate EOF. Most programs won't recognize it. */
+                *(unsigned short*)&regs.rax = (c & ~0x7f ? 0x3f : scancodes[(int)c]) << 8 | (c & 0xff);
+              }
+              if (!is_tty_in_error) {
+                tio.c_lflag = old_lflag;
+                /* Since we set ECHO back here, a call with ah == 0x01
+                 * followed by a call with ah == 0x00 will echo the character
+                 * to the Linux terminal.
+                 *
+                 * TODO(pts): Fix it by not setting ECHO back here, only at exit.
+                 */
+                /* TODO(pts): Also change it back upon exit. Even if it's a signal exit. */
                 if (tcsetattr(tty_in_fd, 0, &tio) != 0) {
                   is_tty_in_error = 1;
                 }
-              }
-            }
-            if (ah & 1) {
-              const int got = poll(&pollfd0, 1  /* pollfd count */, 0 /* timeout */);  /* Like select(2), but faster. Easier to setup than epoll(2). */
-              if (got < 0) {
-                perror("poll stdin");
-                exit(252);
-              } else if (got) {
-                *(unsigned short*)&regs.rax =  0x011b;  /* Fake <Esc> in keyboard buffer. */
-                *(unsigned short*)&regs.rflags &= ~(1 << 6);  /* ZF=0. */
-              } else {
-                *(unsigned short*)&regs.rflags |= (1 << 6);  /* ZF=1. */
-              }
-            } else {
-              char c;
-              if ((got = read(tty_in_fd == -2 ? 0 : tty_in_fd, &c, 1)) < 1) c = 26;  /* Ctrl-<Z>, simulate EOF. Most programs won't recognize it. */
-              *(unsigned short*)&regs.rax = (c & ~0x7f ? 0x3f : scancodes[(int)c]) << 8 | (c & 0xff);
-            }
-            if (!is_tty_in_error) {
-              tio.c_lflag = old_lflag;
-              /* Since we set ECHO back here, a call with ah == 0x01
-               * followed by a call with ah == 0x00 will echo the character
-               * to the Linux terminal.
-               *
-               * TODO(pts): Fix it by not setting ECHO back here, only at exit.
-               */
-              /* TODO(pts): Also change it back upon exit. Even if it's a signal exit. */
-              if (tcsetattr(tty_in_fd, 0, &tio) != 0) {
-                is_tty_in_error = 1;
               }
             }
           } else {
