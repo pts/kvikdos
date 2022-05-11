@@ -1259,7 +1259,7 @@ int main(int argc, char **argv) {
                     "--prog=<dos-pathname>: Sets DOS pathname of program.\n"
                     "--mount=<drive><case><dirname>/: Makes Linux dir visible as <drive> for DOS program.\n"
                     "    If <case> is :, then mount uppercase. If <case> is -, then mount lowercase.\n"
-                    "--mount=<drive>--: Makes sure that <drive>: is not visible in DOS.\n"
+                    "--mount=<drive>0: Makes sure that <drive>: is not visible in DOS.\n"
                     "--drive=<drive>: Sets initial current drive for DOS program.\n"
                     "--tty-in=<fd>: Selects Linux file descriptor for keyboard input.\n"
                     "    -3: fake keys; -2: stdin buffered; -1: /dev/tty; 0: stdin etc.\n",
@@ -1318,15 +1318,18 @@ int main(int argc, char **argv) {
       if (!argv[0]) goto missing_argument;
       arg = *argv++;
      do_mount:  /* Default: --mount C:. */
-      if ((arg[0] & ~32) - 'A' + 0U >= DRIVE_COUNT || !(arg[1] == ':' || arg[1] == '-')) {
+      if ((arg[0] & ~32) - 'A' + 0U >= DRIVE_COUNT || !(arg[1] == ':' || arg[1] == '-' || arg[1] == '0')) {
         fprintf(stderr, "fatal: mount argument must start with <drive>: or <drive>-, <drive> must be A .. %c: %s\n", 'A' + DRIVE_COUNT - 1, arg);
         exit(1);
       } else {
         const char drive_idx = (arg[0] & ~32) - 'A';
-        char case_mode = arg[1] == '-' ? CASE_MODE_LOWERCASE : CASE_MODE_UPPERCASE;
-        if (arg[1] == '-' && arg[2] == '-' && arg[3] == '\0') {
+        const char case_mode = arg[1] == '-' ? CASE_MODE_LOWERCASE : CASE_MODE_UPPERCASE;
+        if (arg[1] == '0') {
+          if (arg[2] != '\0') {
+            fprintf(stderr, "fatal: mount argument for not visibility must stop at 0: %s\n", arg);
+            exit(1);
+          }
           arg = NULL;  /* Make sure not mounted. */
-          case_mode = CASE_MODE_UPPERCASE;
         } else {
           arg += 2;
           if (DEBUG) fprintf(stderr, "debug: mount %c: %s\n", drive_idx + 'A', arg);
