@@ -944,6 +944,16 @@ static const char *getenv_prefix(const char *name_prefix, const char **env, cons
   return NULL;
 }
 
+static const char *getenv_dos_prefix(const char *name_prefix, const char *env) {
+  const size_t name_prefix_size = strlen(name_prefix);
+  while (*env != '\0') {
+    const size_t var_size1 = strlen(env) + 1;
+    if (strncmp(env, name_prefix, name_prefix_size) == 0) return env + name_prefix_size;
+    env += var_size1;
+  }
+  return NULL;
+}
+
 /* Same extension lookup order as in DOS. */
 static const char * const find_program_exts[] = { ".COM", ".com", ".EXE", ".exe", ".BAT", ".bat", NULL };
 static const char * const find_program_no_exts[] = { "", NULL };
@@ -1130,7 +1140,7 @@ static char should_skip_exec_program(char const *dos_filename, const char *args,
   p += 2;
   if (p + dos_filename_size >= env_end) return 7;
   if (strcmp(p, dos_filename) != 0) return 8;
-  *env_end_inout = p + dos_filename_size + 1;
+  *env_end_inout = p - 2;  /* Not: p + dos_filename_size + 1; */
   return 0;
 }
 
@@ -1147,7 +1157,7 @@ int main(int argc, char **argv) {
   unsigned header_size;
   char had_get_ints, had_get_first_mcb, is_exec;
   char **envp, **envp0;
-  const char *dos_prog_abs = NULL;  /* Owned externally. */
+  const char *dos_prog_abs = NULL;  /* Owned externally: either in argv or in dosfnbuf or (after exec) within mem. */
   unsigned tick_count;
   unsigned char sphinx_cmm_flags;
   char ctrl_break_checking;  /* 0 or 1. Just a flag, doesn't have any use case. */
@@ -1454,7 +1464,7 @@ int main(int argc, char **argv) {
       while (*env++ != '\0') {
         if (DEBUG) fprintf(stderr, "debug: reusing env var (%s)\n", env - 1);
         if (!(env = memchr(env, '\0', env_end - env))) {
-          fprintf(stderr, "fatal: exec env too large\n");
+          fprintf(stderr, "fatal: exec environment too large\n");
           exit(252);
         }
         ++env;
@@ -2223,12 +2233,14 @@ int main(int argc, char **argv) {
               /*const unsigned short relocation_factor = *(unsigned short*)(params + 2);*/
               char * const psp = (load_para >= PSP_PARA + 0x10 && load_para < DOS_ALLOC_PARA_LIMIT) ? (char*)mem + ((unsigned)(load_para - 0x10) << 4) : NULL;
               const unsigned short env_para = psp ? *(const unsigned short*)(psp + 0x2c) : 0;
-              const char * const env = (env_para >= PSP_PARA + 0x10 && env_para < DOS_ALLOC_PARA_LIMIT) ? (char*)mem + (env_para << 4) : NULL;
+              char * const env = (env_para >= PSP_PARA + 0x10 && env_para < DOS_ALLOC_PARA_LIMIT) ? (char*)mem + (env_para << 4) : NULL;
               const char *env_end = env ? env + (((PROGRAM_MCB_PARA - ENV_PARA < DOS_ALLOC_PARA_LIMIT - env_para) ? PROGRAM_MCB_PARA - ENV_PARA : DOS_ALLOC_PARA_LIMIT - env_para) << 4) : NULL;
               const unsigned char args_size = psp ? (unsigned char)psp[0x80] : 0;
               char * const args = psp ? psp + 0x81 : NULL;
+              char *new_env;
               int reason;
-              if (!(env && args && args_size < 0x7f && args[args_size] == '\r')) {
+              if (!(env && args && args_size < 0x7f && args[args_size] == '\r' &&
+                    sregs.ds.selector + (*(unsigned short*)&regs.rdx >> 4) >= PSP_PARA)) {  /* So that dos_filename won't overlap new_env below. */
                 fprintf(stderr, "fatal: bounds check failed when loading program: %s\n", dos_filename);
                 goto fatal_int;
               }
@@ -2242,7 +2254,9 @@ int main(int argc, char **argv) {
               dir_state.dos_prog_abs = NULL;  /* For security. */
               if ((img_fd = open(prog_filename, O_RDONLY)) < 0) goto error_from_linux;
               dos_prog_abs = NULL;
-              memcpy((char*)mem + (ENV_PARA << 4), env, env_end - env);
+              *(char*)env_end = '\0';  /* Hide counter for absolute program pathname. */
+              memcpy(new_env = (char*)mem + (ENV_PARA << 4), env, env_end + 2 - env);
+              dos_path = getenv_dos_prefix("PATH=", new_env);
               strcpy(fnbuf2, args);  /* Large enough to hold 0x7f bytes. */
               is_exec = 1;
               goto do_exec;
