@@ -887,6 +887,13 @@ static char fnbuf[LINUX_PATH_SIZE], fnbuf2[LINUX_PATH_SIZE], exec_fnbuf[LINUX_PA
 
 #define get_linux_filename(p) get_linux_filename_r((p), &dir_state, fnbuf, NULL)
 
+static const char *skip_dot_slash(const char *p) {
+  while (p[0] == '.' && p[1] == '/') {  /* Skip ./ at the beginning. */
+    for (p += 2; p[0] == '/'; ++p) {}
+  }
+  return p;
+}
+
 #define DOS_PATH_SIZE 64  /* See int 0x21 ah == 0x47 (get current directory) */
 static char dosfnbuf[DOS_PATH_SIZE];
 
@@ -895,11 +902,8 @@ static char dosfnbuf[DOS_PATH_SIZE];
  * the empty string. If drive is '\0', then finds a matching drive.
  */
 static const char *get_dos_abs_filename_r(const char *p, char drive, const DirState *dir_state, char *out_buf) {
-  const char *p0;
-  while (p[0] == '.' && p[1] == '/') {
-    for (p += 2; p[0] == '/'; ++p) {}
-  }
-  p0 = p;
+  const char *p0 = skip_dot_slash(p);
+  p = p0;
   if (drive == '\0') {  /* Find the best drive, i.e. the drive with the longest matching linux_mount_dir. */
     char best_drive = '\0';
     size_t best_mp_size = 0;
@@ -1311,9 +1315,7 @@ int main(int argc, char **argv) {
         } else {
           arg += 2;
           if (DEBUG) fprintf(stderr, "debug: mount %c: %s\n", drive_idx + 'A', arg);
-          while (arg[0] == '.' && arg[1] == '/') {  /* Skip ./ at the beginning. */
-            for (arg += 2; arg[0] == '/'; ++arg) {}
-          }
+          arg = (char*)skip_dot_slash(arg);
           if (arg[0] == '.' && arg[1] == '\0') {
             ++arg;
           } else if (arg[0] != '\0') {
@@ -1390,11 +1392,13 @@ int main(int argc, char **argv) {
     fprintf(stderr, "fatal: invalid <dos-com-or-exe-file> DOS program filename: %s\n", prog_name_arg);
     exit(252);
   }
+  is_prog_filename_linux = (prog_filename == prog_name_arg);
+  prog_filename = skip_dot_slash(prog_filename);
+
   if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
     fprintf(stderr, "fatal: cannot open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
     exit(252);
   }
-  is_prog_filename_linux = (prog_filename == prog_name_arg);
   if (!is_drive_e_mount_specified && is_prog_filename_linux) {  /* If not explicitly mounted, mount E: to the directory of prog_filename.  */
     const char *p = prog_name_arg + strlen(prog_name_arg), *q;
     size_t q_size;
@@ -1440,10 +1444,16 @@ int main(int argc, char **argv) {
   }
   if (dos_prog_abs[0] == '\0') {
     dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
-  } else if (dos_prog_abs[0] == 'C' && !is_drive_c_mount_specified && dir_state.linux_mount_dir['C' - 'A']) {  /* Autodetect lowercase and remount C: */
+  } else if ((dos_prog_abs[0] == 'C' || dos_prog_abs[0] == 'E') && !is_drive_c_mount_specified && dir_state.linux_mount_dir['C' - 'A']) {  /* Autodetect lowercase and remount C: */
     const char *q;
-    for (q = prog_filename; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
-    dir_state.case_mode['C' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;  /* Mount as lowercase iff the executable program name has at least one lowercase character. */
+    if (dos_prog_abs[0] == 'C') { set_case_c:
+      for (q = prog_filename; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
+      dir_state.case_mode['C' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;  /* Mount as lowercase iff the executable program name has at least one lowercase character. */
+    } else {
+      const char *mount_c = dir_state.linux_mount_dir['C' - 'A'];
+      const size_t mount_c_size = strlen(mount_c);
+      if (strncmp(prog_filename, mount_c, mount_c_size) == 0) goto set_case_c;
+    }
   }
   dos_prog_drive = dos_prog_abs[0];
   header_size = detect_dos_executable_program(img_fd, prog_filename, header);
