@@ -1486,18 +1486,18 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   sregs.fs.selector = sregs.gs.selector = ENV_PARA;  /* Random value after magic interrupt table. */
 
   memcpy((char*)mem + (PROGRAM_MCB_PARA << 4), default_program_mcb, 16);
-  { char *psp = load_dos_executable_program(img_fd, prog_filename, mem, header, header_size, &regs, &sregs, &MCB_SIZE_PARA((char*)mem + (PROGRAM_MCB_PARA << 4)));
+  { char *psp_args = load_dos_executable_program(img_fd, prog_filename, mem, header, header_size, &regs, &sregs, &MCB_SIZE_PARA((char*)mem + (PROGRAM_MCB_PARA << 4))) + 0x80;
     if (is_exec) {
       const unsigned size = strlen(fnbuf2);
       if (size > 0x7e) {  /* This shouldn't happen, that was checked before. */
-        fprintf(stderr, "fatal: exec command-line args too long\n");
+        fprintf(stderr, "assert: exec command-line args too long\n");
         exit(252);
       }
-      psp[0x80] = (char)size;
-      memcpy(psp + 0x81, fnbuf2, size);
-      psp[0x81 + size] = '\r';
+      *psp_args++ = (char)size;
+      memcpy(psp_args, fnbuf2, size);
+      psp_args[size] = '\r';
     } else {
-      copy_args_to_dos_args(psp + 0x80, args);
+      copy_args_to_dos_args(psp_args, args);
     }
   }
   close(img_fd);
