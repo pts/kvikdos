@@ -325,8 +325,10 @@ fprintf(stderr, "(%s)\n", (const char *)memmem("foorxbard;", 9, "rd", 2));  /* S
 #define memmem my_memmem
 #endif
 
-/* Returns the total number of header bytes read from img_fd. */
-static int detect_dos_executable_program(int img_fd, const char *filename, char *p) {
+/* prog_filename is a Linux pathname.
+ * Returns the total number of header bytes read from img_fd.
+ */
+static int detect_dos_executable_program(int img_fd, const char *prog_filename, char *p) {
   int r;
   r = read(img_fd, p, PROGRAM_HEADER_SIZE);
   if (r < 0) {
@@ -339,20 +341,66 @@ static int detect_dos_executable_program(int img_fd, const char *filename, char 
   }
   if (r >= 2 && (('M' | 'Z' << 8) == *(unsigned short*)p || ('M' << 8 | 'Z') == *(unsigned short*)p)) {
     if (r < 24) {
-      fprintf(stderr, "fatal: DOS .exe program too short: %s\n", filename);
+      /* DOSBox 0.74-4, FreeDOS 1.2 just assume that it's a .com program if
+       * 2 <= file_size <= 27 and it starts with "MZ" or "ZM".
+       *
+       * In kvikdos, for files starting with "MZ or "ZM", if 2 <= file_size
+       * <= 23, then it fails here, and if file_size >= 24, then is treated
+       * as an .exe program.
+       */
+      fprintf(stderr, "fatal: DOS .exe program too short: %s\n", prog_filename);
       exit(252);
     }
   } else if (r >= 6 && is_same_ascii_nocase(p, "@echo ", 6)) {
-    fprintf(stderr, "fatal: DOS .bat batch files not supported: %s\n", filename);
+    fprintf(stderr, "fatal: DOS .bat batch files not supported as executable: %s\n", prog_filename);
     exit(252);  /* !! add support */
   } else if (r >= 4 && 0 == memcmp(p, "\x7f""ELF", 4)) {  /* Typically Linux native executable. */
-    fprintf(stderr, "fatal: ELF executable programs not supported: %s\n", filename);
+    fprintf(stderr, "fatal: ELF executable programs not supported as executable: %s\n", prog_filename);
     exit(252);  /* TODO(pts): Run them natively, without setting up KVM. */
   } else if (r >= 3 && ('#' | '!' << 8) == *(unsigned short*)p && (p[2] == ' ' || p[2] == '/')) {
     /* Unix script #! shebang detected. */
-    fprintf(stderr, "fatal: Unix scripts not supported: %s\n", filename);
+    fprintf(stderr, "fatal: Unix scripts not supported: %s\n", prog_filename);
     exit(252);  /* TODO(pts): Run them natively, without setting up KVM. */
-  }  /* Otheerwise it's a DOS .com program. */
+  } else {  /* Otheerwise it's a DOS .com program, but only if it has .com extension. */
+    const char *ext = prog_filename + strlen(prog_filename);
+    size_t ext_size;
+    for (; ext != prog_filename && ext[-1] != '/' && ext[-1] != '.'; --ext) {}
+    if (ext == prog_filename || ext[-1] == '/') ext = "";
+    ext_size = strlen(ext) + 1;
+    if (is_same_ascii_nocase(ext, "com", ext_size)) {  /* OK. */
+    } else if (is_same_ascii_nocase(ext, "bat", ext_size)) {
+      /* We may add support for a subset of batch file syntax in the future. */
+      fprintf(stderr, "fatal: DOS .bat batch files not supported: %s\n", prog_filename);
+      exit(252);
+    } else if (is_same_ascii_nocase(ext, "cmd", ext_size)) {
+      fprintf(stderr, "fatal: Windows NT and OS/2 .cmd scripts not supported: %s\n", prog_filename);
+      exit(252);
+    } else if (is_same_ascii_nocase(ext, "sh", ext_size)) {
+      fprintf(stderr, "fatal: Unix .sh shell scripts not supported: %s\n", prog_filename);
+      exit(252);
+    } else if (is_same_ascii_nocase(ext, "pl", ext_size)) {
+      fprintf(stderr, "fatal: Perl .pl scripts not supported: %s\n", prog_filename);
+      exit(252);
+    } else if (is_same_ascii_nocase(ext, "pm", ext_size)) {
+      fprintf(stderr, "fatal: Perl .pm scripts not supported: %s\n", prog_filename);
+      exit(252);
+    } else if (is_same_ascii_nocase(ext, "py", ext_size)) {
+      fprintf(stderr, "fatal: Python .py scripts not supported: %s\n", prog_filename);
+      exit(252);
+    } else if (is_same_ascii_nocase(ext, "rb", ext_size)) {
+      fprintf(stderr, "fatal: Ruby .rb scripts not supported: %s\n", prog_filename);
+      exit(252);
+    } else if (is_same_ascii_nocase(ext, "elf", ext_size)) {
+      fprintf(stderr, "fatal: ELF executable programs not supported: %s\n", prog_filename);
+      exit(252);
+    } else {
+      /* Refuse to run as .com program, file may be a data file or text
+       * file, containing gargage machine instructions.
+       */
+      fprintf(stderr, "fatal: neither .exe signature nor filename extension recognized for program: %s\n", prog_filename);
+      exit(252);
+    }
+  }
   return r;
 }
 
@@ -1042,7 +1090,7 @@ static char detect_prog_filename_type(const char *prog_filename) {
 }
 
 /* Same extension lookup order as in DOS. */
-static const char * const find_prog_on_path_exts[] = { ".com", ".exe", ".bat", NULL };
+static const char * const find_prog_on_path_exts[] = { ".com", ".exe", ".bat", /* "cmd", for Windows. */ NULL };
 static const char * const find_prog_on_path_no_exts[] = { "", NULL };
 
 /* Works only if no ':', '/', or '\\'  in prog_filename. This is guranteed
