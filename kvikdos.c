@@ -721,6 +721,14 @@ static void case_fold_on_drive(char *p, char drive, const DirState *dir_state) {
   }
 }
 
+/* p is a Linux pathname. */
+static char get_case_mode_from_last_component(const char *p) {
+  const char *q = p + strlen(p);
+  for (; q != p && q[-1] != '/'; --q) {}
+  for (; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
+  return (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;
+}
+
 /* p is a DOS pathname. Returns 'A' etc. or '\0' on error. */
 static char get_dos_filename_drive(const char *p, const DirState *dir_state) {
   if (p[0] != '\0' && p[1] == ':') {
@@ -884,7 +892,7 @@ static void get_dos_abspath_r(const char *p, const DirState *dir_state, char *ou
   if (DEBUG) fprintf(stderr, "debug: get_dos_abspath_r=(%s)\n", out_buf);
 }
 
-static char fnbuf[LINUX_PATH_SIZE], fnbuf2[LINUX_PATH_SIZE], exec_fnbuf[LINUX_PATH_SIZE];
+static char fnbuf[LINUX_PATH_SIZE], fnbuf2[LINUX_PATH_SIZE], exec_fnbuf[LINUX_PATH_SIZE], argv0_fnbuf[LINUX_PATH_SIZE];
 
 #define get_linux_filename(p) get_linux_filename_r((p), &dir_state, fnbuf, NULL)
 
@@ -1246,13 +1254,14 @@ int main(int argc, char **argv) {
   char is_tty_in_error, is_hlt_ok;
   char is_drive_specified, is_prog_filename_linux;
   struct pollfd pollfd0;
-  const char *dos_path;
+  const char *dos_path, *argv0;
 
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
   { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
 
   (void)argc;
-  if (!argv[0] || !argv[1] || 0 == strcmp(argv[1], "--help")) {
+  argv0 = argv[0];
+  if (!argv0 || !argv[1] || 0 == strcmp(argv[1], "--help")) {
     fprintf(stderr, "Usage: %s [<flag> ...] <dos-executable-file> [<dos-arg> ...]\n"
                     "This is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.\n"
                     "Flags:\n"
@@ -1264,8 +1273,8 @@ int main(int argc, char **argv) {
                     "--drive=<drive>: Sets initial current drive for DOS program.\n"
                     "--tty-in=<fd>: Selects Linux file descriptor for keyboard input.\n"
                     "    -3: fake keys; -2: stdin buffered; -1: /dev/tty; 0: stdin etc.\n",
-                    argv[0]);
-    exit(argv[0] && argv[1] ? 0 : 1);
+                    argv0);
+    exit(argv0 && argv[1] ? 0 : 1);
   }
 
   { unsigned u;
@@ -1276,6 +1285,7 @@ int main(int argc, char **argv) {
     dir_state.drive = 'C';
     dir_state.dos_prog_abs = NULL;  /* For security, use dos_prog_abs mapping only for read-only opens below. */
     dir_state.linux_mount_dir['C' - 'A'] = fnbuf;  /* Placeholder for default. */
+    dir_state.linux_mount_dir['D' - 'A'] = fnbuf;  /* Placeholder for default. */
     dir_state.linux_mount_dir['E' - 'A'] = fnbuf;  /* Placeholder for default. */
     memset(dir_state.case_mode, CASE_MODE_UNSPECIFIED, DRIVE_COUNT);
   }
@@ -1423,9 +1433,23 @@ int main(int argc, char **argv) {
     fprintf(stderr, "fatal: cannot open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
     exit(252);
   }
-  if (dir_state.linux_mount_dir['C' - 'A'] == fnbuf) {
+  if (dir_state.linux_mount_dir['C' - 'A'] == fnbuf) {  /* Set to current directory in Linux. */
     dir_state.linux_mount_dir['C' - 'A'] = "";  /* Either --mount=C:. (uppercase) or --mount=C-. (lowercase). */
     /*if (dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED) { ... }*/  /* Will be changed below. */
+  }
+  if (dir_state.linux_mount_dir['D' - 'A'] == fnbuf) {  /* Set to emulator directory (based on argv0). !! Process readlink(2). */
+    const char *p_base = skip_dot_slash(argv0), *p = p_base + strlen(p_base);
+    size_t size;
+    for (; p != p_base && p[-1] != '/'; --p) {}
+    if ((size = p - p_base) >= sizeof(argv0_fnbuf)) {
+      fprintf(stderr, "fatal: emulator program name (argv[0]) too long for mount: %s\n", p_base);
+      exit(252);
+    }
+    memcpy(argv0_fnbuf, p_base, size);  /* Empty or ends with slash. */
+    argv0_fnbuf[size] = '\0';
+    remove_duplicate_slashes(argv0_fnbuf);
+    dir_state.linux_mount_dir['D' - 'A'] = argv0_fnbuf;  /* Either --mount=C:. (uppercase) or --mount=C-. (lowercase). */
+    /*if (dir_state.case_mode['D' - 'A'] == CASE_MODE_UNSPECIFIED) { ... }*/  /* Will be changed below. */
   }
   dos_prog_drive = '\0';
   if (dir_state.linux_mount_dir['E' - 'A'] != fnbuf) {
@@ -1468,17 +1492,21 @@ int main(int argc, char **argv) {
   }
   if (dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED && dir_state.linux_mount_dir['C' - 'A']) {
     dir_state.case_mode['C' - 'A'] = CASE_MODE_UPPERCASE;
-    if ((dos_prog_abs[0] == 'C' || dos_prog_abs[0] == 'E')) {  /* Autodetect lowercase and remount C: */  /* !!! don't do this at exec. */
+    if (is_prog_filename_linux && (dos_prog_abs[0] == 'C' || dos_prog_abs[0] == 'E')) {  /* Autodetect lowercase and remount C: */
       const char *q;
-      if (dos_prog_abs[0] == 'C') { set_case_c:
+      if (dos_prog_abs[0] == 'C') { set_case_c:  /* Get case mode from the entire pathname. */
         for (q = prog_filename; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
         dir_state.case_mode['C' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;  /* Mount as lowercase iff the executable program pathname has at least one lowercase character. */
       } else {
         const char *mount_c = dir_state.linux_mount_dir['C' - 'A'];
         const size_t mount_c_size = strlen(mount_c);
         if (strncmp(prog_filename, mount_c, mount_c_size) == 0) goto set_case_c;
+        dir_state.case_mode['C' - 'A'] = get_case_mode_from_last_component(prog_filename);  /* Mount as lowercase iff the executable program has at least one lowercase character. */
       }
     }
+  }
+  if (dir_state.case_mode['D' - 'A'] == CASE_MODE_UNSPECIFIED && dir_state.linux_mount_dir['D' - 'A']) {
+    dir_state.case_mode['D' - 'A'] = is_prog_filename_linux ? get_case_mode_from_last_component(prog_filename) : CASE_MODE_UPPERCASE;  /* Mount as lowercase iff the executable program has at least one lowercase character. */
   }
 
   kvm_fds.kvm_fd = -1;
