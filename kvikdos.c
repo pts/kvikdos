@@ -692,6 +692,7 @@ static int get_linux_handle(unsigned short handle, const struct kvm_fds *kvm_fds
 
 #define CASE_MODE_UPPERCASE 0
 #define CASE_MODE_LOWERCASE 1
+#define CASE_MODE_UNSPECIFIED 2
 
 #define DRIVE_COUNT 6
 
@@ -1243,7 +1244,7 @@ int main(int argc, char **argv) {
   const unsigned short *next_fake_key;
   int tty_in_fd;
   char is_tty_in_error, is_hlt_ok;
-  char is_drive_e_mount_specified, is_drive_c_mount_specified, is_drive_specified, is_prog_filename_linux;
+  char is_drive_specified, is_prog_filename_linux;
   struct pollfd pollfd0;
   const char *dos_path;
 
@@ -1252,7 +1253,7 @@ int main(int argc, char **argv) {
 
   (void)argc;
   if (!argv[0] || !argv[1] || 0 == strcmp(argv[1], "--help")) {
-    fprintf(stderr, "Usage: %s [<flag> ...] <dos-com-or-exe-file> [<dos-arg> ...]\n"
+    fprintf(stderr, "Usage: %s [<flag> ...] <dos-executable-file> [<dos-arg> ...]\n"
                     "This is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.\n"
                     "Flags:\n"
                     "--env=<NAME>=<value>: Adds environment variable.\n"
@@ -1274,13 +1275,14 @@ int main(int argc, char **argv) {
     }
     dir_state.drive = 'C';
     dir_state.dos_prog_abs = NULL;  /* For security, use dos_prog_abs mapping only for read-only opens below. */
-    dir_state.linux_mount_dir['C' - 'A'] = "";  /* By default: --mount=C:. (uppercase), use --mount=C-. for lowercase. */
-    memset(dir_state.case_mode, CASE_MODE_UPPERCASE, DRIVE_COUNT);
+    dir_state.linux_mount_dir['C' - 'A'] = fnbuf;  /* Placeholder for default. */
+    dir_state.linux_mount_dir['E' - 'A'] = fnbuf;  /* Placeholder for default. */
+    memset(dir_state.case_mode, CASE_MODE_UNSPECIFIED, DRIVE_COUNT);
   }
 
   envp = envp0 = ++argv;
   tty_in_fd = -1;
-  is_drive_e_mount_specified = is_drive_c_mount_specified = is_drive_specified = is_tty_in_error = is_hlt_ok = 0;
+  is_drive_specified = is_tty_in_error = is_hlt_ok = 0;
   dos_prog_abs = NULL;
   while (argv[0]) {
     char *arg = *argv++;
@@ -1323,7 +1325,7 @@ int main(int argc, char **argv) {
         exit(1);
       } else {
         const char drive_idx = (arg[0] & ~32) - 'A';
-        const char case_mode = arg[1] == '-' ? CASE_MODE_LOWERCASE : CASE_MODE_UPPERCASE;
+        const char case_mode = arg[1] == '0' ? CASE_MODE_UNSPECIFIED : arg[1] == '-' ? CASE_MODE_LOWERCASE : CASE_MODE_UPPERCASE;
         if (arg[1] == '0') {
           if (arg[2] != '\0') {
             fprintf(stderr, "fatal: mount argument for not visibility must stop at 0: %s\n", arg);
@@ -1333,26 +1335,25 @@ int main(int argc, char **argv) {
         } else {
           arg += 2;
           if (DEBUG) fprintf(stderr, "debug: mount %c: %s\n", drive_idx + 'A', arg);
-          arg = (char*)skip_dot_slash(arg);
-          remove_duplicate_slashes(arg);
-          if (arg[0] == '.' && arg[1] == '\0') {
-            ++arg;
-          } else if (arg[0] != '\0') {
-            char *p = arg + strlen(arg);
-            if (arg[1] != '\0' && p[-1] == '.' && p[-2] == '/') *--p = '\0';  /* Remove trailing . if it ends with /. */
-            if (p[-1] != '/') {
-              fprintf(stderr, "fatal: mount directory target must end with /: %s\n", arg);
-              exit(1);
+          if (arg[0] == '\0') {
+            arg = fnbuf;  /* Placeholder for default. */
+          } else {
+            arg = (char*)skip_dot_slash(arg);
+            remove_duplicate_slashes(arg);
+            if (arg[0] == '.' && arg[1] == '\0') {
+              ++arg;
+            } else if (arg[0] != '\0') {
+              char *p = arg + strlen(arg);
+              if (arg[1] != '\0' && p[-1] == '.' && p[-2] == '/') *--p = '\0';  /* Remove trailing . if it ends with /. */
+              if (p[-1] != '/') {
+                fprintf(stderr, "fatal: mount directory target must end with /: %s\n", arg);
+                exit(1);
+              }
             }
           }
         }
         dir_state.linux_mount_dir[(int)drive_idx] = arg;  /* argv retains ownership of arg. */
         dir_state.case_mode[(int)drive_idx] = case_mode;
-        if (drive_idx == 'E' - 'A') {
-          is_drive_e_mount_specified = 1;
-        } else if (drive_idx == 'C' - 'A') {
-          is_drive_c_mount_specified = 1;
-        }
       }
     } else if (0 == strncmp(arg, "--mount=", 8)) {
       arg += 8;
@@ -1391,7 +1392,7 @@ int main(int argc, char **argv) {
   }
   /* Now: argv contains remaining (non-flag) arguments. */
   if (!argv[0]) {
-    fprintf(stderr, "fatal: missing <dos-com-or-exe-file> DOS program filename\n");
+    fprintf(stderr, "fatal: missing <dos-executable-file> DOS program filename\n");
     exit(1);
   }
 #if 0  /* Tests for replacing the output with "" */
@@ -1408,23 +1409,36 @@ int main(int argc, char **argv) {
   dos_path = getenv_prefix("PATH=", (char const**)envp0, (char const**)envp);
   prog_filename = find_program((char*)prog_name_arg, &dir_state, dos_path);
   if (*prog_filename == '\0') {
-    fprintf(stderr, "fatal: invalid <dos-com-or-exe-file> DOS program filename: %s\n", prog_name_arg);
+    fprintf(stderr, "fatal: invalid <dos-executable-file> DOS program filename: %s\n", prog_name_arg);
     exit(252);
   }
   is_prog_filename_linux = (prog_filename == prog_name_arg);
-  prog_filename = (char*)skip_dot_slash(prog_filename);
-  remove_duplicate_slashes(prog_filename);
+  if (is_prog_filename_linux) {
+    prog_filename = (char*)skip_dot_slash(prog_filename);
+    remove_duplicate_slashes(prog_filename);
+    prog_name_arg = prog_filename;
+  }
 
   if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
     fprintf(stderr, "fatal: cannot open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
     exit(252);
   }
-  if (!is_drive_e_mount_specified && is_prog_filename_linux) {  /* If not explicitly mounted, mount E: to the directory of prog_filename.  */
+  if (dir_state.linux_mount_dir['C' - 'A'] == fnbuf) {
+    dir_state.linux_mount_dir['C' - 'A'] = "";  /* Either --mount=C:. (uppercase) or --mount=C-. (lowercase). */
+    /*if (dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED) { ... }*/  /* Will be changed below. */
+  }
+  dos_prog_drive = '\0';
+  if (dir_state.linux_mount_dir['E' - 'A'] != fnbuf) {
+  } else if (!is_prog_filename_linux) {
+    dir_state.linux_mount_dir['E' - 'A'] = NULL;  /* Drive E: mounted by default. */
+  } else {  /* If not explicitly mounted, mount E: to the directory of prog_filename.  */
     const char *p = prog_name_arg + strlen(prog_name_arg), *q;
     size_t q_size;
     for (; p != prog_name_arg && p[-1] != '/'; --p) {}
     for (q = p; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
-    dir_state.case_mode['E' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;  /* Mount as lowercase iff the executable program name has at least one lowercase character. */
+    if (dir_state.case_mode['E' - 'A'] == CASE_MODE_UNSPECIFIED) {
+      dir_state.case_mode['E' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;  /* Mount as lowercase iff the executable program name has at least one lowercase character. */
+    }
     q = prog_name_arg;
     while (q != p && q[0] == '.' && q[1] == '/') {  /* Skip ./ at the beginning. */
       for (q += 2; q != p && q[0] == '/'; ++q) {}
@@ -1440,14 +1454,31 @@ int main(int argc, char **argv) {
     dir_state.linux_mount_dir['E' - 'A'] = q;  /* Empty or ends with '/'. */
     dos_prog_drive = 'E';
     if (!is_drive_specified && !dir_state.linux_mount_dir[dir_state.drive - 'A']) dir_state.drive = 'E';
-  } else {
-    dos_prog_drive = '\0';
   }
   prog_name_arg = NULL;  /* Make sure we don't use it later, we've already modified it for dir_state.linux_mount_dir['E' - 'A']. */
   if (!dir_state.linux_mount_dir[dir_state.drive - 'A']) {
     /*dir_state.drive = 'C';*/
     fprintf(stderr, "fatal: no mount point for default drive (specify --mount=...): %c:\n", dir_state.drive);
     exit(1);
+  }
+  if (dos_prog_abs == NULL) {
+    /* !! TODO(pts): Use pathnames in the DOS %PATH% instead to convert prog_filename back to DOS. */
+    dos_prog_abs = get_dos_abs_filename_r(prog_filename, dos_prog_drive, &dir_state, dosfnbuf);
+    if (DEBUG) fprintf(stderr, "debug: prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", prog_filename, dos_prog_abs, dos_prog_drive);
+  }
+  if (dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED && dir_state.linux_mount_dir['C' - 'A']) {
+    dir_state.case_mode['C' - 'A'] = CASE_MODE_UPPERCASE;
+    if ((dos_prog_abs[0] == 'C' || dos_prog_abs[0] == 'E')) {  /* Autodetect lowercase and remount C: */  /* !!! don't do this at exec. */
+      const char *q;
+      if (dos_prog_abs[0] == 'C') { set_case_c:
+        for (q = prog_filename; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
+        dir_state.case_mode['C' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;  /* Mount as lowercase iff the executable program pathname has at least one lowercase character. */
+      } else {
+        const char *mount_c = dir_state.linux_mount_dir['C' - 'A'];
+        const size_t mount_c_size = strlen(mount_c);
+        if (strncmp(prog_filename, mount_c, mount_c_size) == 0) goto set_case_c;
+      }
+    }
   }
 
   kvm_fds.kvm_fd = -1;
@@ -1457,24 +1488,7 @@ int main(int argc, char **argv) {
   pollfd0.events = POLLIN;
 
  do_exec:
-  if (dos_prog_abs == NULL) {
-    /* TODO(pts): Use pathnames in the DOS %PATH% instead to convert prog_filename back to DOS. */
-    dos_prog_abs = get_dos_abs_filename_r(prog_filename, dos_prog_drive, &dir_state, dosfnbuf);
-    if (DEBUG) fprintf(stderr, "debug: prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", prog_filename, dos_prog_abs, dos_prog_drive);
-  }
-  if (dos_prog_abs[0] == '\0') {
-    dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
-  } else if ((dos_prog_abs[0] == 'C' || dos_prog_abs[0] == 'E') && !is_drive_c_mount_specified && dir_state.linux_mount_dir['C' - 'A']) {  /* Autodetect lowercase and remount C: */
-    const char *q;
-    if (dos_prog_abs[0] == 'C') { set_case_c:
-      for (q = prog_filename; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
-      dir_state.case_mode['C' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;  /* Mount as lowercase iff the executable program name has at least one lowercase character. */
-    } else {
-      const char *mount_c = dir_state.linux_mount_dir['C' - 'A'];
-      const size_t mount_c_size = strlen(mount_c);
-      if (strncmp(prog_filename, mount_c, mount_c_size) == 0) goto set_case_c;
-    }
-  }
+  if (dos_prog_abs[0] == '\0') dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
   dos_prog_drive = dos_prog_abs[0];
   header_size = detect_dos_executable_program(img_fd, prog_filename, header);
 
@@ -2416,11 +2430,12 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "fatal: cannot open DOS executable program for loading: %s: %s\n", prog_filename, strerror(errno));
                 goto fatal_int;
               }
-              dos_prog_abs = NULL;
               *(char*)env_end = '\0';  /* Hide counter for absolute program pathname. */
               memcpy(new_env = (char*)mem + (ENV_PARA << 4), env, env_end + 2 - env);
               dos_path = getenv_dos_prefix("PATH=", new_env);
               strcpy(fnbuf2, args);  /* Large enough to hold 0x7f bytes. */
+              dos_prog_abs = get_dos_abs_filename_r(prog_filename, dos_prog_drive, &dir_state, dosfnbuf);
+              if (DEBUG) fprintf(stderr, "debug: exec prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", prog_filename, dos_prog_abs, dos_prog_drive);
               is_exec = 1;
               goto do_exec;
             } else {
