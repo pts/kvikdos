@@ -1429,7 +1429,8 @@ static void reset_emu(struct EmuState *emu) {
  * Returns the DOS exit code reported by the program.
  * As a side effect, sets dir_state->dos_prog_abs = NULL, and may change dir_state and tty_state.
  */
-static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filename, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, char **envp0, int img_fd) {
+static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filename, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, char **envp0) {
+  int img_fd;
   struct kvm_fds kvm_fds;
   void *mem;
   struct kvm_run *run;
@@ -1453,15 +1454,18 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
   { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
 
+  if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
+    fprintf(stderr, "fatal: cannot open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
+    exit(252);
+  }
   dos_prog_abs = dir_state->dos_prog_abs;
+  if (dos_prog_abs[0] == '\0') dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
   dir_state->dos_prog_abs = NULL;  /* For security, use dos_prog_abs mapping only for read-only opens below. */
   pollfd0.fd = 0;
   pollfd0.events = POLLIN;
 
  do_exec:
-  if (dos_prog_abs[0] == '\0') dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
   header_size = detect_dos_executable_program(img_fd, prog_filename, header);
-
   reset_emu(emu);
   sregs = emu->initial_sregs;
   kvm_fds = emu->kvm_fds;
@@ -2592,7 +2596,6 @@ int main(int argc, char **argv) {
   TtyState tty_state;
   EmuParams emu_params;
   const char *dos_path;
-  int img_fd;
   char dos_prog_drive;
 
   (void)argc;
@@ -2850,10 +2853,6 @@ int main(int argc, char **argv) {
   }
   prog_name_arg = NULL;  /* Make sure we don't use it later, we've already modified it for dir_state.linux_mount_dir['E' - 'A']. */
 
-  if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
-    fprintf(stderr, "fatal: cannot open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
-    exit(252);
-  }
   if (!dir_state.linux_mount_dir[dir_state.drive - 'A']) {
     /*dir_state.drive = 'C';*/
     fprintf(stderr, "fatal: no mount point for default drive (specify --mount=...): %c:\n", dir_state.drive);
@@ -2877,7 +2876,7 @@ int main(int argc, char **argv) {
   { int exit_code;
     EmuState emu;
     init_emu(&emu);  /* This is lightweight, it doesn't initialized KVM. */
-    exit_code = run_dos_prog(&emu, prog_filename, (const char*const*)argv, &dir_state, &tty_state, &emu_params, envp0, img_fd);
+    exit_code = run_dos_prog(&emu, prog_filename, (const char* const*)argv, &dir_state, &tty_state, &emu_params, envp0);
     if (DEBUG) fprintf(stderr, "debug: DOS program exited with code: 0x%02x", exit_code);
     return exit_code;
   }
