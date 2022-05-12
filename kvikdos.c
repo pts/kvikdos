@@ -1429,7 +1429,7 @@ static void reset_emu(struct EmuState *emu) {
  * Returns the DOS exit code reported by the program.
  * As a side effect, sets dir_state->dos_prog_abs = NULL, and may change dir_state and tty_state.
  */
-static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filename, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, char **envp0, char **envp, int img_fd) {
+static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filename, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, char **envp0, int img_fd) {
   struct kvm_fds kvm_fds;
   void *mem;
   struct kvm_run *run;
@@ -1521,7 +1521,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       env = add_env(env, env_end, "PATH=D:\\foo;C:\\bar", 1);
       env = add_env(env, env_end, "heLLo=World!", 1);
 #endif
-      while (envp0 != envp) {
+      while (*envp0) {
         if (strncmp(*envp0, "PATH=", 5) == 0) do_set_dos_path = 0;
         /* No attempt is made to deduplicate environment variables by name.
          * The user should supply unique names.
@@ -2751,6 +2751,7 @@ int main(int argc, char **argv) {
   fprintf(stderr, "GLF (%s)\n", get_linux_filename("C:\\foo\\.\\\\\\.\\bar\\.\\..\\.\\bazzzz\\.."));
 #endif
   prog_name_arg = *argv++;  /* This is a Linux filename. */
+  *envp = NULL;
   /* Remaining arguments in argv will be passed to the DOS program in PSP:0x80. */
   dos_path = getenv_prefix("PATH=", (char const**)envp0, (char const**)envp);
 
@@ -2876,7 +2877,7 @@ int main(int argc, char **argv) {
   { int exit_code;
     EmuState emu;
     init_emu(&emu);  /* This is lightweight, it doesn't initialized KVM. */
-    exit_code = run_dos_prog(&emu, prog_filename, (const char*const*)argv, &dir_state, &tty_state, &emu_params, envp0, envp, img_fd);
+    exit_code = run_dos_prog(&emu, prog_filename, (const char*const*)argv, &dir_state, &tty_state, &emu_params, envp0, img_fd);
     if (DEBUG) fprintf(stderr, "debug: DOS program exited with code: 0x%02x", exit_code);
     return exit_code;
   }
