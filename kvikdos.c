@@ -1096,7 +1096,7 @@ static char detect_prog_filename_type(const char *prog_filename) {
 }
 
 /* Same extension lookup order as in DOS. */
-static const char * const find_prog_on_path_exts[] = { ".com", ".exe", ".bat", /* "cmd", for Windows. */ NULL };
+static const char * const find_prog_on_path_exts[] = { ".com", ".exe", ".bat", /* ".cmd", for Windows NT+. */ NULL };
 static const char * const find_prog_on_path_no_exts[] = { "", NULL };
 
 /* Works only if no ':', '/', or '\\'  in prog_filename. This is guranteed
