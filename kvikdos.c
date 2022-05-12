@@ -1308,10 +1308,15 @@ typedef struct TtyState {
   char is_tty_in_error;
 } TtyState;
 
+
+typedef struct EmuParams {
+  char is_hlt_ok;
+} EmuParams;
+
 /* Returns the DOS exit code reported by the program.
  * As a side effect, sets dir_state->dos_prog_abs = NULL, and may change dir_state and tty_state.
  */
-static unsigned char run_emu(const char *prog_filename, const char* const *args, DirState *dir_state, TtyState *tty_state, char **envp0, char **envp, char is_hlt_ok, int img_fd) {
+static unsigned char run_emu(const char *prog_filename, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, char **envp0, char **envp, int img_fd) {
   struct kvm_fds kvm_fds;
   void *mem;
   struct kvm_userspace_memory_region region;
@@ -1332,6 +1337,7 @@ static unsigned char run_emu(const char *prog_filename, const char* const *args,
   const unsigned short *next_fake_key;
   int tty_in_fd = tty_state->tty_in_fd;
   struct pollfd pollfd0;
+  const char is_hlt_ok = emu_params->is_hlt_ok;
 
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
   { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
@@ -2553,7 +2559,7 @@ int main(int argc, char **argv) {
   DirState dir_state;
   char **envp0, **envp;
   TtyState tty_state;
-  char is_hlt_ok;
+  EmuParams emu_params;
   const char *dos_path;
   int img_fd;
   char dos_prog_drive;
@@ -2592,7 +2598,8 @@ int main(int argc, char **argv) {
   envp = envp0 = ++argv;
   tty_state.tty_in_fd = -1;
   tty_state.is_tty_in_error = 0;
-  is_drive_specified = is_hlt_ok = 0;
+  emu_params.is_hlt_ok = 0;
+  is_drive_specified = 0;
   while (argv[0]) {
     char *arg = *argv++;
     if (arg[0] != '-' || arg[1] == '\0') {
@@ -2600,7 +2607,7 @@ int main(int argc, char **argv) {
     } else if (arg[1] == '-' && arg[2] == '\0') {
       break;
     } else if (0 == strcmp(arg, "--hlt-ok")) {
-      is_hlt_ok = 1;
+      emu_params.is_hlt_ok = 1;
     } else if (0 == strcmp(arg, "--env")) {
       if (!argv[0]) { missing_argument:
         fprintf(stderr, "fatal: missing argument for flag: %s\n", arg);
@@ -2835,7 +2842,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  { const int exit_code = run_emu(prog_filename, (const char*const*)argv, &dir_state, &tty_state, envp0, envp, is_hlt_ok, img_fd);
+  { const int exit_code = run_emu(prog_filename, (const char*const*)argv, &dir_state, &tty_state, &emu_params, envp0, envp, img_fd);
     if (DEBUG) fprintf(stderr, "debug: DOS program exited with code: 0x%02x", exit_code);
     return exit_code;
   }
