@@ -145,6 +145,75 @@ How to install kvikdos:
 
   If it displays the dot and the `Hello, World!' message, then it's OK.
 
+About making Linux files available for DOS programs:
+
+* kvikdos emulates DOS drives A: .. F: by exposing directories on the Linux
+  filesystem as mount points for these DOS drives.
+
+* Use the `--mount=<drive><case><dirname>/' command-line flag to make
+  DOS drive <drive>: point to Linux directory named <dirname>. Use `:' as
+  <case> for uppercase (see below), and use `-' for lowercase.
+
+* Use the `--mount=<drive>0' command-line flag to make <drive>: invisible
+  to DOS programs. This is useful to override some default mounts.
+
+* Use the `--mount=<drive><case>' command-line flag to override case folding
+  for default mounts.
+
+* The following drives are visible to DOS by default (i.e. default mounts):
+
+  * C: points to the current directory (.) of the kvikdos Linux process.
+
+  * D: points to the directory containing the kvikdos executable program
+    (taken from argv[0]).
+
+  * E: points to the directory containing the <dos-executable-file>
+    specified in the command-line, if it was specified as a Linux pathname.
+
+  * A:, B: and F: are not mounted by default.
+
+* The default drive is C:, but if it was disabled (`--mount=C0'), then the
+  default drive is E:.
+
+* If you don't specify `--env=PATH=...', then the DOS PATH environment
+  variable is set to the directory containing <dos-executable-file>
+  (i.e. `--env=PATH=E:\' most of the time).
+
+* The defaults are set up in way that most of the time you don't need to
+  specify `--mount=...', and you don't need to specify any directory name in
+  DOS pathnames. That's because the current Linux directory is visible as
+  C:\ in DOS, and that's the default within DOS as well.
+
+About uppercase and lowercase filenames:
+
+* Filenames in Linux are case sensitive, but in DOS they are case
+  insensitive. Thus if a DOS program wants to open or access a file, kvikdos
+  has to decide how to case fold the letters in the pathname.
+
+* Only unaccented Latin letters a .. z (and A .. Z) are targets of case
+  folding. International characters (typically with code >= 128) are kept
+  intact.
+
+* When the DOS program tries to open or access a file, kvikdos generates an
+  uppercase or lowercase Linux filename based on the mount flags of the
+  emulated drive the DOS file is on. (DOSBox does it differently: on a per
+  file basis, it uses uppercase iff the lowercase variant doesn't already
+  exists on the filesystem.)
+
+* To specify an uppercase drive, use the `--mount=<drive>:<dirname>' flag.
+  To specify a lowercase drive, replace the `:' with `-' above. For
+  example, to mount the current Linux directory as C: lowercase,
+  specify `--mount=C-' .
+
+* For drives C:, D: and E:, if not explicitly specified as
+  `--mount=<drive>...', kvikdos autodetects lowercase based on the
+  on the <dos-executable-file>: if there is at least
+  one lowercase character, the drive becomes lowercase. For drives D: and E:
+  only the last pathname component is considered, for C:, if
+  <dos-executable-file> is under C:, then the entire pathname is considered.
+  To override autodetection, specify e.g. `--mount=E:' for uppercase and
+  `-mount=E-' for lowercase.
+
 Software compatibility, i.e. DOS programs known to work in kvikdos:
 
 * Turbo Pascal 7.0 compiler tpc.exe. It produces .exe program files
