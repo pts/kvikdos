@@ -746,7 +746,7 @@ static int get_linux_handle(unsigned short handle, const struct kvm_fds *kvm_fds
 
 typedef struct DirState {
   char drive;  /* 'A', 'B', 'C', 'D', ... ('A' + DRIVE_COUNT - 1). */
-  char current_dir[DRIVE_COUNT][128];  /* In DOS syntax. If current_dir[2] is "FOO\BAR\", then it corresponds to C:\FOO\BAR. */
+  char current_dir[DRIVE_COUNT][1];  /* Currently mostly unused. */ /*char current_dir[DRIVE_COUNT][128];*/  /* In DOS syntax. If current_dir[2] is "FOO\BAR\", then it corresponds to C:\FOO\BAR. */
   const char *linux_mount_dir[DRIVE_COUNT];  /* Linux directory to which the specific drive has been mounted, with '/' suffix (or empty), or NULL. Owned externally. linux_mount_dir[2] == "/tmp/foo/" maps DOS path C:\MY\FILE.TXT to Linux path /tmp/foo/MY/FILE.TXT .  */
   char case_mode[DRIVE_COUNT];  /* CASE_MODE_... indicating how letters in DOS filename characters should be converted to Linux (uppercase or lowercase). CASE_MODE_UPPERCASE (0) is the default. We could also call it case_fold. */
   const char *dos_prog_abs;  /* DOS absolute pathname of the program being run. Externally owned, can be NULL. */
@@ -1313,17 +1313,128 @@ typedef struct EmuParams {
   char is_hlt_ok;
 } EmuParams;
 
-/* Returns the DOS exit code reported by the program.
+typedef struct EmuState {
+  struct kvm_fds kvm_fds;
+  struct kvm_sregs initial_sregs;
+  struct kvm_run *kvm_run;
+  void *mem;
+} EmuState;
+
+/* It's a cheap call, the real initialization is done in reset_emu. */
+static void init_emu(struct EmuState *emu) {
+  emu->kvm_fds.kvm_fd = -1;
+  emu->mem = NULL;
+}
+
+/* Must be preceded by init_emu(emu).
+ * After this call, the caller should also call ioctl(kvm_fds.vcpu_fd, KVM_SET_SREGS, &emu->initial_sregs);
+ */
+static void reset_emu(struct EmuState *emu) {
+  void *mem;
+  if (emu->kvm_fds.kvm_fd < 0) {
+    int kvm_fd, vm_fd, vcpu_fd;
+    int kvm_run_mmap_size, api_version;
+    struct kvm_userspace_memory_region region;
+    struct kvm_regs dummy_regs;
+    if ((kvm_fd = open("/dev/kvm", O_RDWR)) < 0) {
+      perror("fatal: failed to open /dev/kvm");
+      exit(252);
+    }
+    if ((api_version = ioctl(kvm_fd, KVM_GET_API_VERSION, 0)) < 0) {
+      perror("fatal: failed to create KVM vm");
+      exit(252);
+    }
+    if (api_version != KVM_API_VERSION) {
+      fprintf(stderr, "fatal: KVM API version mismatch: kernel=%d user=%d\n",
+              api_version, KVM_API_VERSION);
+    }
+    if ((vm_fd = ioctl(kvm_fd, KVM_CREATE_VM, 0)) < 0) {
+      perror("fatal: failed to create KVM vm");
+      exit(252);
+    }
+    if ((emu->mem = mem = mmap(NULL, DOS_MEM_LIMIT, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)) ==
+        NULL) {
+      perror("fatal: mmap");
+      exit(252);
+    }
+
+    memset(&region, 0, sizeof(region));
+    region.slot = 0;
+    region.guest_phys_addr = GUEST_MEM_MODULE_START;  /* Must be a multiple of the Linux page size (0x1000), otherwise KVM_SET_USER_MEMORY_REGION returns EINVAL. */
+    region.memory_size = DOS_MEM_LIMIT - GUEST_MEM_MODULE_START;
+    region.userspace_addr = (uintptr_t)mem + GUEST_MEM_MODULE_START;
+    /*region.flags = KVM_MEM_READONLY;*/  /* Not needed, read-write is default. */
+    if (ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+      perror("fatal: ioctl KVM_SET_USER_MEMORY_REGION");
+      exit(252);
+    }
+    if (GUEST_MEM_MODULE_START != 0) {
+      memset(&region, 0, sizeof(region));
+      region.slot = 1;
+      region.guest_phys_addr = 0;
+      region.memory_size = 0x1000;  /* Magic interrupt table: 0x500 bytes, rounded up to page boundary. */
+      region.userspace_addr = (uintptr_t)mem;
+      region.flags = KVM_MEM_READONLY;
+      if (ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+        perror("fatal: ioctl KVM_SET_USER_MEMORY_REGION");
+        exit(252);
+      }
+    }
+    if ((vcpu_fd = ioctl(vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
+      perror("fatal: can not create KVM vcpu");
+      exit(252);
+    }
+    kvm_run_mmap_size = ioctl(kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
+    if (kvm_run_mmap_size < 0) {
+      perror("fatal: ioctl KVM_GET_VCPU_MMAP_SIZE");
+      exit(252);
+    }
+    if ((emu->kvm_run = (struct kvm_run *)mmap(
+        NULL, kvm_run_mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, vcpu_fd, 0)) == NULL) {
+      perror("fatal: mmap kvm_run: %d\n");
+      exit(252);
+    }
+    if (ioctl(vcpu_fd, KVM_GET_REGS, &dummy_regs) < 0) {  /* We don't use the result; but we just check here that ioctl KVM_GET_REGS works. */
+      perror("fatal: KVM_GET_REGS");
+      exit(252);
+    }
+    if (ioctl(vcpu_fd, KVM_GET_SREGS, &emu->initial_sregs) < 0) {  /* Will be reused by DOS exec(). */
+      perror("fatal: KVM_GET_SREGS");
+      exit(252);
+    }
+    emu->kvm_fds.kvm_fd = kvm_fd; emu->kvm_fds.vm_fd = vm_fd; emu->kvm_fds.vcpu_fd = vcpu_fd;
+  } else {
+    mem = emu->mem;
+    if (madvise((char*)mem + (PSP_PARA << 4), DOS_MEM_LIMIT - (PSP_PARA << 4), MADV_DONTNEED) != 0) {
+      perror("fatal: madvise MADV_DONTNEED\n");
+      exit(252);
+    }
+    if (*(const unsigned*)((char*)mem + (PSP_PARA << 4)) != 0) {
+      fprintf(stderr, "madvise failed to zero PSP\n");
+      exit(252);
+    }
+    memset(mem, '\0', ENV_PARA << 4);
+    memset((char*)mem + ENV_LIMIT, '\0', (PSP_PARA << 4) - ENV_LIMIT);
+  }
+}
+
+/* Runs a DOS .com or .exe program in `emu'. Cannot run DOS .bat batch files.
+ * Must be preceded by init_emu(emu).
+ * It calls reset_emu(emu) in the beginning, so DOS programs run in
+ * subsequent calls won't affect each other's memory and CPU registers (but
+ * they will affect each other through `dir_state.dos_prog_abs',
+ * `dir_state.current_dir, `tty_state',`emu_state' and the open file
+ * descriptors of the emulator Linux process).
+ * Returns the DOS exit code reported by the program.
  * As a side effect, sets dir_state->dos_prog_abs = NULL, and may change dir_state and tty_state.
  */
-static unsigned char run_emu(const char *prog_filename, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, char **envp0, char **envp, int img_fd) {
+static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filename, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, char **envp0, char **envp, int img_fd) {
   struct kvm_fds kvm_fds;
   void *mem;
-  struct kvm_userspace_memory_region region;
-  int kvm_run_mmap_size, api_version;
   struct kvm_run *run;
   struct kvm_regs regs;
-  struct kvm_sregs sregs, initial_sregs;
+  struct kvm_sregs sregs;
   char header[PROGRAM_HEADER_SIZE];
   unsigned header_size;
   char had_get_ints, had_get_first_mcb, is_exec;
@@ -1344,8 +1455,6 @@ static unsigned char run_emu(const char *prog_filename, const char* const *args,
 
   dos_prog_abs = dir_state->dos_prog_abs;
   dir_state->dos_prog_abs = NULL;  /* For security, use dos_prog_abs mapping only for read-only opens below. */
-  kvm_fds.kvm_fd = -1;
-  run = NULL; mem = NULL;  /* Pacify GCC. */
   is_exec = 0;
   pollfd0.fd = 0;
   pollfd0.events = POLLIN;
@@ -1354,89 +1463,12 @@ static unsigned char run_emu(const char *prog_filename, const char* const *args,
   if (dos_prog_abs[0] == '\0') dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
   header_size = detect_dos_executable_program(img_fd, prog_filename, header);
 
-  if (kvm_fds.kvm_fd < 0) {
-    if ((kvm_fds.kvm_fd = open("/dev/kvm", O_RDWR)) < 0) {
-      perror("fatal: failed to open /dev/kvm");
-      exit(252);
-    }
-    if ((api_version = ioctl(kvm_fds.kvm_fd, KVM_GET_API_VERSION, 0)) < 0) {
-      perror("fatal: failed to create KVM vm");
-      exit(252);
-    }
-    if (api_version != KVM_API_VERSION) {
-      fprintf(stderr, "fatal: KVM API version mismatch: kernel=%d user=%d\n",
-              api_version, KVM_API_VERSION);
-    }
-    if ((kvm_fds.vm_fd = ioctl(kvm_fds.kvm_fd, KVM_CREATE_VM, 0)) < 0) {
-      perror("fatal: failed to create KVM vm");
-      exit(252);
-    }
-    if ((mem = mmap(NULL, DOS_MEM_LIMIT, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)) ==
-        NULL) {
-      perror("fatal: mmap");
-      exit(252);
-    }
-
-    memset(&region, 0, sizeof(region));
-    region.slot = 0;
-    region.guest_phys_addr = GUEST_MEM_MODULE_START;  /* Must be a multiple of the Linux page size (0x1000), otherwise KVM_SET_USER_MEMORY_REGION returns EINVAL. */
-    region.memory_size = DOS_MEM_LIMIT - GUEST_MEM_MODULE_START;
-    region.userspace_addr = (uintptr_t)mem + GUEST_MEM_MODULE_START;
-    /*region.flags = KVM_MEM_READONLY;*/  /* Not needed, read-write is default. */
-    if (ioctl(kvm_fds.vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-      perror("fatal: ioctl KVM_SET_USER_MEMORY_REGION");
-      exit(252);
-    }
-    if (GUEST_MEM_MODULE_START != 0) {
-      memset(&region, 0, sizeof(region));
-      region.slot = 1;
-      region.guest_phys_addr = 0;
-      region.memory_size = 0x1000;  /* Magic interrupt table: 0x500 bytes, rounded up to page boundary. */
-      region.userspace_addr = (uintptr_t)mem;
-      region.flags = KVM_MEM_READONLY;
-      if (ioctl(kvm_fds.vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-        perror("fatal: ioctl KVM_SET_USER_MEMORY_REGION");
-        exit(252);
-      }
-    }
-    if ((kvm_fds.vcpu_fd = ioctl(kvm_fds.vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
-      perror("fatal: can not create KVM vcpu");
-      exit(252);
-    }
-    kvm_run_mmap_size = ioctl(kvm_fds.kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
-    if (kvm_run_mmap_size < 0) {
-      perror("fatal: ioctl KVM_GET_VCPU_MMAP_SIZE");
-      exit(252);
-    }
-    run = (struct kvm_run *)mmap(
-        NULL, kvm_run_mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, kvm_fds.vcpu_fd, 0);
-    if (run == NULL) {
-      perror("fatal: mmap kvm_run: %d\n");
-      exit(252);
-    }
-    if (ioctl(kvm_fds.vcpu_fd, KVM_GET_REGS, &regs) < 0) {  /* We don't use the result; but we just check here that ioctl KVM_GET_REGS works. */
-      perror("fatal: KVM_GET_REGS");
-      exit(252);
-    }
-    if (ioctl(kvm_fds.vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
-      perror("fatal: KVM_GET_SREGS");
-      exit(252);
-    }
-    initial_sregs = sregs;  /* Will be reused by exec. */
-  } else {
-    sregs = initial_sregs;
-    if (madvise((char*)mem + (PSP_PARA << 4), DOS_MEM_LIMIT - (PSP_PARA << 4), MADV_DONTNEED) != 0) {
-      perror("fatal: madvise MADV_DONTNEED\n");
-      exit(252);
-    }
-    if (*(const unsigned*)((char*)mem + (PSP_PARA << 4)) != 0) {
-      fprintf(stderr, "madvise failed to zero PSP\n");
-      exit(252);
-    }
-    memset(mem, '\0', ENV_PARA << 4);
-    memset((char*)mem + ENV_LIMIT, '\0', (PSP_PARA << 4) - ENV_LIMIT);
-  }
+  reset_emu(emu);
+  sregs = emu->initial_sregs;
+  kvm_fds = emu->kvm_fds;
+  mem = emu->mem;
+  run = emu->kvm_run;
+  memset(&regs, '\0', sizeof(regs));
 
   /* Any read/write outside the regions above will trigger a KVM_EXIT_MMIO. */
   /* Fill magic interrupt table. */
@@ -1450,7 +1482,6 @@ static unsigned char run_emu(const char *prog_filename, const char* const *args,
   *(unsigned short*)((char*)mem + 0x410) = 0x22;  /* BIOS equipment flags. https://stanislavs.org/helppc/int_11.html */
   ((char*)mem)[(INT_HLT_PARA << 4) - 1] = (char)0xcb;  /* `retf' opcode used by country case map. */
 
-  memset(&regs, '\0', sizeof(regs));
   /*memcpy(initial_sregs, &sregs, sizeof(sregs));*/  /* Not completely 0, but sregs.Xs.selector is 0. */
   sregs.fs.selector = sregs.gs.selector = ENV_PARA;  /* Random value after magic interrupt table. */
 
@@ -2842,7 +2873,10 @@ int main(int argc, char **argv) {
     }
   }
 
-  { const int exit_code = run_emu(prog_filename, (const char*const*)argv, &dir_state, &tty_state, &emu_params, envp0, envp, img_fd);
+  { int exit_code;
+    EmuState emu;
+    init_emu(&emu);  /* This is lightweight, it doesn't initialized KVM. */
+    exit_code = run_dos_prog(&emu, prog_filename, (const char*const*)argv, &dir_state, &tty_state, &emu_params, envp0, envp, img_fd);
     if (DEBUG) fprintf(stderr, "debug: DOS program exited with code: 0x%02x", exit_code);
     return exit_code;
   }
