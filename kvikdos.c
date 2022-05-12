@@ -325,6 +325,13 @@ fprintf(stderr, "(%s)\n", (const char *)memmem("foorxbard;", 9, "rd", 2));  /* S
 #define memmem my_memmem
 #endif
 
+/* Returns an empty string if the specified Linux filename has no extension. */
+static const char *get_linux_ext(const char *p) {
+  const char *ext0 = p + strlen(p), *ext = ext0;
+  for (; ext != p && ext[-1] != '/' && ext[-1] != '.'; --ext) {}
+  return ext == p || ext[-1] == '/' ? ext0 : ext;
+}
+
 /* prog_filename is a Linux pathname.
  * Returns the total number of header bytes read from img_fd.
  */
@@ -362,11 +369,8 @@ static int detect_dos_executable_program(int img_fd, const char *prog_filename, 
     fprintf(stderr, "fatal: Unix scripts not supported: %s\n", prog_filename);
     exit(252);  /* TODO(pts): Run them natively, without setting up KVM. */
   } else {  /* Otheerwise it's a DOS .com program, but only if it has .com extension. */
-    const char *ext = prog_filename + strlen(prog_filename);
-    size_t ext_size;
-    for (; ext != prog_filename && ext[-1] != '/' && ext[-1] != '.'; --ext) {}
-    if (ext == prog_filename || ext[-1] == '/') ext = "";
-    ext_size = strlen(ext) + 1;
+    const char *ext = get_linux_ext(prog_filename);
+    const size_t ext_size = strlen(ext) + 1;
     if (is_same_ascii_nocase(ext, "com", ext_size)) {  /* OK. */
     } else if (is_same_ascii_nocase(ext, "bat", ext_size)) {
       /* We may add support for a subset of batch file syntax in the future. */
