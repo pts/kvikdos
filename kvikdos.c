@@ -1437,7 +1437,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   struct kvm_sregs sregs;
   char header[PROGRAM_HEADER_SIZE];
   unsigned header_size;
-  char had_get_ints, had_get_first_mcb, is_exec;
+  char had_get_ints, had_get_first_mcb;
   const char *dos_prog_abs;  /* Owned externally: either in args or in dosfnbuf or (after exec) within mem. */
   unsigned tick_count;
   unsigned char sphinx_cmm_flags;
@@ -1455,7 +1455,6 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
 
   dos_prog_abs = dir_state->dos_prog_abs;
   dir_state->dos_prog_abs = NULL;  /* For security, use dos_prog_abs mapping only for read-only opens below. */
-  is_exec = 0;
   pollfd0.fd = 0;
   pollfd0.events = POLLIN;
 
@@ -1487,7 +1486,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
 
   memcpy((char*)mem + (PROGRAM_MCB_PARA << 4), default_program_mcb, 16);
   { char *psp_args = load_dos_executable_program(img_fd, prog_filename, mem, header, header_size, &regs, &sregs, &MCB_SIZE_PARA((char*)mem + (PROGRAM_MCB_PARA << 4))) + 0x80;
-    if (is_exec) {
+    if (args) {
+      copy_args_to_dos_args(psp_args, args);
+      args = NULL;  /* DOS exec() shouldn't copy them later. */
+    } else {
       const unsigned size = strlen(fnbuf2);
       if (size > 0x7e) {  /* This shouldn't happen, that was checked before. */
         fprintf(stderr, "assert: exec command-line args too long\n");
@@ -1496,8 +1498,6 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       *psp_args++ = (char)size;
       memcpy(psp_args, fnbuf2, size);
       psp_args[size] = '\r';
-    } else {
-      copy_args_to_dos_args(psp_args, args);
     }
   }
   close(img_fd);
@@ -1506,7 +1506,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   { char *env = (char*)mem + (ENV_PARA << 4), *env0 = env;
     char * const env_end = (char*)mem + ENV_LIMIT;
     char do_set_dos_path = 1;  /* This is smart, but an accasional chdir may ruin it: !(dos_prog_abs[0] == dir_state->drive && dos_prog_abs[1] == ':' && dos_prog_abs[2] == '\\' && strchr(dos_prog_abs + 3, '\\') == 0); */
-    if (is_exec) {
+    char do_clear_after_env = envp0 == NULL;
+    if (do_clear_after_env) {
       while (*env++ != '\0') {
         if (DEBUG) fprintf(stderr, "debug: reusing env var (%s)\n", env - 1);
         if (!(env = memchr(env, '\0', env_end - env))) {
@@ -1527,7 +1528,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
          */
         env = add_env(env, env_end, *envp0++, 1);
       }
-      if (do_set_dos_path) {  /* Set %PATH% to the directory of dos_prog_abs. Set once, next iteration is is_exec above. */
+      if (do_set_dos_path) {  /* Set %PATH% to the directory of dos_prog_abs. Set once. */
         const char *p = dos_prog_abs + strlen(dos_prog_abs);
         const char *p_base = dos_prog_abs + 3;
         size_t size;
@@ -1542,12 +1543,13 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         env += size;
         *env++ = '\0';
       }
+      envp0 = NULL;  /* DOS exec() won't copy them later. */
     }
     if (env == env0) env = add_env(env, env_end, "$=", 1);  /* Some programs such as pbc.exe would fail with an empty environment, so we create a fake variable. */
     env = add_env(env, env_end, "", 0);  /* Empty var marks end of env. */
     env = add_env(env, env_end, "\1", 0);  /* Number of subsequent variables (1). */
     env = add_env(env, env_end, dos_prog_abs, 0);  /* Full program pathname. */
-    if (is_exec) memset(env, '\0', env_end - env);
+    if (do_clear_after_env) memset(env, '\0', env_end - env);
   }
 
 /* We have to set both selector and base, otherwise it won't work. A `mov
@@ -2328,7 +2330,6 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               }
               *(char*)env_end = '\0';  /* Hide counter for absolute program pathname. */
               memcpy(new_env = (char*)mem + (ENV_PARA << 4), env, env_end + 2 - env);
-              /*do_set_dos_path=0;*/  /* Already done by is_exec, this variable is ignored. */
               strcpy(fnbuf2, args);  /* Large enough to hold 0x7f bytes. */
               dos_prog_abs = get_dos_abs_filename_r(prog_filename, new_prog_drive, dir_state, dosfnbuf);
               if (DEBUG) fprintf(stderr, "debug: exec prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", prog_filename, dos_prog_abs, new_prog_drive);
@@ -2336,7 +2337,6 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 fprintf(stderr, "fatal: error getting DOS absolute filename for exec on drive %c: %s\n", new_prog_drive, prog_filename);
                 exit(252);
               }
-              is_exec = 1;
               goto do_exec;
             } else {
               fprintf(stderr, "fatal: unsupported loading of program with al:%02x: %s\n", al, dos_filename);
