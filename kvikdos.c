@@ -987,9 +987,9 @@ static const char *get_dos_abs_filename_r(const char *p, char drive, const DirSt
       const char *mp = dir_state->linux_mount_dir[drive - 'A'];
       if (mp) {
         const size_t mp_size = strlen(mp);
-        if (strncmp(p0, mp, mp_size) == 0 && mp_size >= best_mp_size) {  /* >= here ensures that we can find mp_size == 0 (default). */
+        if (strncmp(p0, mp, mp_size) == 0 && mp_size + 1 > best_mp_size) {  /* Upon equality, use the earlier drive. */
           best_drive = drive;
-          best_mp_size = best_mp_size;
+          best_mp_size = mp_size + 1;
         }
       }
     }
