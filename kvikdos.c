@@ -2605,7 +2605,8 @@ int main(int argc, char **argv) {
   (void)argc;
   argv0 = argv[0];
   if (!argv0 || !argv[1] || 0 == strcmp(argv[1], "--help")) {
-    fprintf(stderr, "Usage: %s [<flag> ...] <dos-executable-file> [<dos-arg> ...]\n"
+    fprintf(stderr, "kvikdos: run DOS programs headless (a very fast DOS emulator)\n"
+                    "Usage: %s [<flag> ...] <dos-executable-file> [<dos-arg> ...]\n"
                     "This is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.\n"
                     "Flags:\n"
                     "--env=<NAME>=<value>: Adds environment variable.\n"
