@@ -10,6 +10,10 @@
 ;
 ;   $ ndisasm -b 16 -o 0x100 waitkey.com
 ;
+; Run it in kvikdos:
+;
+;   $ ./kvikdos --hlt-ok waitkey.com
+;
 
 bits 16
 cpu 8086
