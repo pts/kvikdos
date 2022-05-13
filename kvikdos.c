@@ -1971,8 +1971,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           } else if (ah == 0x25) {  /* Set interrupt vector. */
             if (set_int((unsigned char)regs.rax, *(unsigned short*)&regs.rdx | sregs.ds.selector << 16, mem, had_get_ints)) goto fatal;
           } else if (ah == 0x35) {  /* Get interrupt vector. */
-            /* !! Implement this. */
             const unsigned char get_int_num = (unsigned char)regs.rax;
+            if (DEBUG) fprintf(stderr, "debug: get interrupt vector int:%02x\n", get_int_num);
             if (get_int_num == 0) had_get_ints |= 1;  /* Turbo Pascal 7.0 programs start with this. */
             if (get_int_num == 0x18) had_get_ints |= 2;  /* TASM 3.2, for memory allocation. */
             if (get_int_num == 0x06) had_get_ints |= 4;  /* TLINK 4.0. */
