@@ -1216,8 +1216,10 @@ static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, ch
       ((had_get_ints & 2) && int_num == 0x18) ||  /* TASM 3.2. */
       ((had_get_ints & 4) && int_num == 0x06) ||  /* TLINK 4.0. */
       ((had_get_ints & 1) && (int_num == 0x00 || int_num == 0x24 || int_num == 0x3f))  /* Turbo Pascal 7.0. */ ||
-      ((had_get_ints & 1) && int_num == 0x75)  /* Microsoft QuickBASIC 4.50 compiler qbc.exe. */  ||
-      ((had_get_ints & 1) && (int_num == 0x00 || int_num == 0x02 || int_num - 0x35 + 0U <= 0x3f - 0x35 + 0U))  /* Microsoft BASIC Professional Development System 7.10 compiler pbc.exe. */) {
+      ((had_get_ints & 1) && int_num == 0x75)  /* Microsoft QuickBASIC 4.50 compiler qbc.exe. */ ||
+      ((had_get_ints & 1) && (int_num == 0x00 || int_num == 0x02 || int_num - 0x35 + 0U <= 0x3f - 0x35 + 0U))  /* Microsoft BASIC Professional Development System 7.10 compiler pbc.exe. */ ||
+      ((had_get_ints & 8) && int_num - 0x34 + 0U <= 0x3d - 0x34 + 0U)  /* Microsoft Macro Assembler 1.10 masm.exe */ ||
+      0) {
     /* FYI kvikdos never sends Ctrl-<Break>. */
   } else {
     fprintf(stderr, "fatal: unsupported set interrupt vector int:%02x to cs:%04x ip:%04x\n",
@@ -1689,7 +1691,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   *(unsigned short*)&regs.rflags |= 1 << 1;  /* Reserved bit in EFLAGS. */
   /**(unsigned short*)&regs.rflags |= 1 << 9;*/  /* IF=1, enable interrupts. */
 
-  had_get_ints = 0;  /* 1 << 0: int 0x00; 1 << 1: int 0x18; 1 << 2: int 0x06. */
+  had_get_ints = 0;  /* 1 << 0: int 0x00; 1 << 1: int 0x18; 1 << 2: int 0x06, 1 << 3: Get DOS version. */
   had_get_first_mcb = 0;
   tick_count = 0;
   sphinx_cmm_flags = 0;
@@ -1771,6 +1773,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             (void)!write(1, &c, 1);  /* Emulate STDPRN with stdout. */
           } else if (ah == 0x30) {  /* Get DOS version number. */
             const unsigned char al = (unsigned char)regs.rax;
+            had_get_ints |= 8;
             *(unsigned short*)&regs.rax = 5 | 0 << 8;  /* 5.0. */
             *(unsigned short*)&regs.rbx = al == 1 ? 0x1000 :  /* DOS in HMA. */
                 0xff00;  /* MS-DOS with high 8 bits of OEM serial number in BL. */
