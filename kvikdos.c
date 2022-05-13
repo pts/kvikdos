@@ -1408,7 +1408,7 @@ static void reset_emu(struct EmuState *emu) {
     }
     if ((emu->kvm_run = (struct kvm_run *)mmap(
         NULL, kvm_run_mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, vcpu_fd, 0)) == NULL) {
-      perror("fatal: mmap kvm_run: %d\n");
+      perror("fatal: mmap kvm_run");
       exit(252);
     }
     if (ioctl(vcpu_fd, KVM_GET_REGS, &dummy_regs) < 0) {  /* We don't use the result; but we just check here that ioctl KVM_GET_REGS works. */
@@ -1423,7 +1423,7 @@ static void reset_emu(struct EmuState *emu) {
   } else {
     mem = emu->mem;
     if (madvise((char*)mem + (PSP_PARA << 4), DOS_MEM_LIMIT - (PSP_PARA << 4), MADV_DONTNEED) != 0) {
-      perror("fatal: madvise MADV_DONTNEED\n");
+      perror("fatal: madvise MADV_DONTNEED");
       exit(252);
     }
     if (*(const unsigned*)((char*)mem + (PSP_PARA << 4)) != 0) {
