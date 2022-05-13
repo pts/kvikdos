@@ -2454,6 +2454,16 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               fprintf(stderr, "fatal: unsupported loading of program with al:%02x: %s\n", al, dos_filename);
               goto fatal_int;
             }
+          } else if (ah == 0x0a) {  /* Buffered keyboard input. */
+            char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            unsigned size = *(unsigned char*)p++;
+            char *q = ++p, *q_end = q + size;
+            for (; q != q_end; ++q) {
+              int got = read(0, q, 1);  /* STDIN_FILENO. */
+              if (got <= 0) break;
+              if (*q == '\n') { *q++ = '\r'; break; }
+            }
+            p[-1] = q - p;  /* Return number of byts read. */
           } else {
             goto fatal_int;
           }
