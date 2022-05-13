@@ -2914,9 +2914,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           fprintf(stderr, "DOS program arguments too long\r\n");
           exit_code = 1;
         } else {
-          args_buf[0] = size;
-          memcpy(args_buf + 1, args_str, size);  /* Will contain leading ' ', '\t', '/' etc. */
-          args_buf[1 + size] = '\r';
+          memcpy(args_buf, args_str, size + 1);  /* Including the trailing '\0'. */
           *args_str = '\0';  /* So that p_line becomes terminated by '\0'. */
           for (envp = envp0; *envp && strncmp(*envp, "PATH=", 5) != 0; ++envp) {}
           dir_state->dos_prog_abs = dos_prog_abs;  /* Of the .bat file. */
