@@ -4,7 +4,8 @@
  *
  * This is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.
  *
- * TODO(pts): Optionally, find Linux filenames and the dirname in both lowercase and uppercase.
+ * TODO(pts): Add filename mapping exceptions, e.g. `a86 long-filename.8 long-filename.obj' should just work, showing `LONG-FIL.8' to DOS.
+ * TODO(pts): Optionally, find Linux filenames and the dirname in both lowercase and uppercase, like DOSBox.
  * TODO(pts): Make unp_4.11/unp.exe work.
  * TODO(pts): DOS STDERR to Linux fd 1 (stdout) mapping. DOSBox doesn't do this.
  * TODO(pts): Turbo C, Turbo C++ and Borland C++ compatibility.
