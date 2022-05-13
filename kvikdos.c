@@ -3166,7 +3166,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "fatal: Linux name of executable program too long: %s\n", q);
         exit(252);
       }
-      memcpy(fnbuf, q, q_size);  /* Including trailing '\0'. */
+      memcpy(fnbuf, q, q_size);  /* Including the trailing '\0'. */
       prog_filename = fnbuf;
       *(char*)p = '\0';  /* Modify it in place in argv. */
       dir_state.linux_mount_dir['E' - 'A'] = q;  /* Empty or ends with '/'. */
