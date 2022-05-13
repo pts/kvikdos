@@ -6,12 +6,11 @@
  *
  * TODO(pts): Optionally, find Linux filenames and the dirname in both lowercase and uppercase.
  * TODO(pts): Make unp_4.11/unp.exe work.
- * TODO(pts): DOS STDERR to Linux fd 1 (stdout) mapping.
+ * TODO(pts): DOS STDERR to Linux fd 1 (stdout) mapping. DOSBox doesn't do this.
  * TODO(pts): Turbo C, Turbo C++ and Borland C++ compatibility.
  * TODO(pts): udosrun integration.
  * TODO(pts): udosrun command-line flag compatibility.
  * TODO(pts): Run Linux ELF programs and scripts (#!), for convenience.
- * TODO(pts): Add support for .bat batch files (at least a small subset).
  * TODO(pts): Add support for 32-bit programs: more memory (easy), XMS (and maybe VCPI); make PMODE.INC and WDOSX work (WDOSX maybe works without XMS).
  *
  * Since many parts of the DOS ABI is undocumented, the specific behavior of
@@ -675,7 +674,7 @@ static void dump_regs(const char *prefix, const struct kvm_regs *regs, const str
   fflush(stdout);
 }
 
-static void copy_args_to_dos_args(char *p, const char* const*args) {
+static void copy_args_to_dos_args(char *p, const char* const *args) {
   unsigned size = 1;
   while (*args) {
     const char *arg = *args++;
@@ -753,7 +752,7 @@ static int get_linux_handle(unsigned short handle, const struct kvm_fds *kvm_fds
 
 typedef struct DirState {
   char drive;  /* 'A', 'B', 'C', 'D', ... ('A' + DRIVE_COUNT - 1). */
-  char current_dir[DRIVE_COUNT][1];  /* Currently mostly unused. */ /*char current_dir[DRIVE_COUNT][128];*/  /* In DOS syntax. If current_dir[2] is "FOO\BAR\", then it corresponds to C:\FOO\BAR. */
+  char current_dir[DRIVE_COUNT][1];  /* Currently mostly unused. */ /*char current_dir[DRIVE_COUNT][128];*/  /* In DOS syntax. Ends with \, unless empty. If current_dir[2] is FOO\BAR\, then it corresponds to C:\FOO\BAR. */
   const char *linux_mount_dir[DRIVE_COUNT];  /* Linux directory to which the specific drive has been mounted, with '/' suffix (or empty), or NULL. Owned externally. linux_mount_dir[2] == "/tmp/foo/" maps DOS path C:\MY\FILE.TXT to Linux path /tmp/foo/MY/FILE.TXT .  */
   char case_mode[DRIVE_COUNT];  /* CASE_MODE_... indicating how letters in DOS filename characters should be converted to Linux (uppercase or lowercase). CASE_MODE_UPPERCASE (0) is the default. We could also call it case_fold. */
   const char *dos_prog_abs;  /* DOS absolute pathname of the program being run. Externally owned, can be NULL. */
@@ -1313,6 +1312,7 @@ static char should_skip_exec_program(char const *dos_filename, const char *args,
 typedef struct TtyState {
   int tty_in_fd;
   char is_tty_in_error;
+  const unsigned short *next_fake_key;
 } TtyState;
 
 
@@ -1426,6 +1426,109 @@ static void reset_emu(struct EmuState *emu) {
   }
 }
 
+static void process_key(TtyState *tty_state, unsigned char ah, unsigned short *ax, unsigned short *flags) {
+  if (tty_state->tty_in_fd == -3) {  /* Fake keys. */
+    *ax = *tty_state->next_fake_key;
+    if (ah & 1) {
+      *flags &= ~(1 << 6);  /* ZF=0, key available in buffer. */
+    } else {
+      if (++tty_state->next_fake_key == fake_keys + sizeof(fake_keys) / sizeof(fake_keys[0])) tty_state->next_fake_key = fake_keys;
+    }
+  } else {
+    /* TODO(pts): Disable line buffering if isatty(0). Enable it again at exit if needed. */
+    int got;
+    struct termios tio;
+    tcflag_t old_lflag = 0;
+    if (tty_state->tty_in_fd == -1) {
+      if ((tty_state->tty_in_fd = open("/dev/tty", O_RDWR)) < 0) {  /* Current controlling terminal. */
+        tty_state->tty_in_fd = -2;
+      } else {
+        tty_state->tty_in_fd = ensure_fd_is_at_least(tty_state->tty_in_fd, 5);
+      }
+    }
+    if (!tty_state->is_tty_in_error) {
+      if (tcgetattr(tty_state->tty_in_fd, &tio) != 0) {
+        tty_state->is_tty_in_error = 1;
+      } else {
+        old_lflag = tio.c_lflag;
+        /* TODO(pts): Handle Ctrl-<C> and other signals. */
+        tio.c_lflag &= ~(ICANON | ECHO);  /* As a side effect, ECHOCTL is also disabled, so Ctrl-<C> won't show up as ^C, but it will still send SIGINT. */
+        if (tcsetattr(tty_state->tty_in_fd, 0, &tio) != 0) {
+          tty_state->is_tty_in_error = 1;
+        }
+      }
+    }
+    if (ah & 1) {
+      struct pollfd pollfd0;
+      int got;
+      pollfd0.fd = 0;
+      pollfd0.events = POLLIN;
+      got = poll(&pollfd0, 1  /* pollfd count */, 0 /* timeout */);  /* Like select(2), but faster. Easier to setup than epoll(2). */
+      if (got < 0) {
+        perror("poll stdin");
+        exit(252);
+      } else if (got) {
+        *ax =  0x011b;  /* Fake <Esc> in keyboard buffer. */
+        *flags &= ~(1 << 6);  /* ZF=0, key available. */
+      } else {
+        *flags |= (1 << 6);  /* ZF=1. */
+      }
+    } else {
+      char c;
+      if ((got = read(tty_state->tty_in_fd == -2 ? 0 : tty_state->tty_in_fd, &c, 1)) < 1) c = 26;  /* Ctrl-<Z>, simulate EOF. Most programs won't recognize it. */
+      *ax = (c & ~0x7f ? 0x3f : scancodes[(int)c]) << 8 | (c & 0xff);
+    }
+    if (!tty_state->is_tty_in_error) {
+      tio.c_lflag = old_lflag;
+      /* Since we set ECHO back here, a call with ah == 0x01
+       * followed by a call with ah == 0x00 will echo the character
+       * to the Linux terminal.
+       *
+       * TODO(pts): Fix it by not setting ECHO back here, only at exit.
+       */
+      /* TODO(pts): Also change it back upon exit. Even if it's a signal exit. */
+      if (tcsetattr(tty_state->tty_in_fd, 0, &tio) != 0) {
+        tty_state->is_tty_in_error = 1;
+      }
+    }
+  }
+}
+
+static int open_dos_file(const char *dos_filename, const char *dos_prog_abs, int flags, DirState *dir_state) {
+  const int flags3 = (flags & 3);
+  int fd;
+  const char *linux_filename;
+  char *linux_lastc;  /* Last component of linux_filename. */
+  dir_state->dos_prog_abs = flags3 == O_RDONLY ? dos_prog_abs : NULL;  /* For loading the overlay from prog_filename, even if not mounted. */
+  linux_filename = get_linux_filename_r(dos_filename, dir_state, fnbuf, &linux_lastc);
+  dir_state->dos_prog_abs = NULL;  /* For security. */
+  /* There is some code duplication here with open() in run_dos_prog(). */
+  if (is_same_ascii_nocase(linux_lastc, "nul", 3) && (linux_lastc[3] == '.' || linux_lastc[3] == '\0')) {
+    strcpy(fnbuf, "/dev/null");
+  } else if (is_same_ascii_nocase(linux_lastc, "aux", 3) && (linux_lastc[3] == '\0' || linux_lastc[3] == '.')) {
+    if (flags3 != O_WRONLY) { eacces: /* Don't let the user open aux for non-writing. This is for (partial) comaptibility with `pts-fast-dosbox. */
+      errno = EACCES; return -1;  /* Permission denied. */
+    } else {
+      if ((fd = dup(2)) < 0) { einval: errno = EINVAL; return -1; }
+    }
+    goto after_open;
+  } else if ((is_same_ascii_nocase(linux_lastc, "con", 3) && (linux_lastc[3] == '\0' || linux_lastc[3] == '.')) ||
+             (is_same_ascii_nocase(linux_lastc, "prn", 3) && (linux_lastc[3] == '\0' || linux_lastc[3] == '.')) ||
+             (is_same_ascii_nocase(linux_lastc, "lpt1", 4) && (linux_lastc[4] == '\0' || linux_lastc[4] == '.'))) {
+    if (flags3 == O_RDONLY) {
+      if ((fd = dup(0)) < 0) goto einval;
+    } else if (flags3 == O_WRONLY) {
+      if ((fd = dup(1)) < 0) goto einval;
+    } else {
+      goto eacces;  /* Don't let the user open prn for both reading and writing. This is for (partial) comaptibility with `pts-fast-dosbox. */
+    }
+    goto after_open;
+  }
+  if ((fd = open(linux_filename, flags, 0644)) < 0) return -1;
+ after_open:
+  return fd;
+}
+
 /* Runs a DOS .com or .exe program in `emu'. Cannot run DOS .bat batch files.
  * Must be preceded by init_emu(emu).
  * It calls reset_emu(emu) in the beginning, so DOS programs run in
@@ -1436,7 +1539,7 @@ static void reset_emu(struct EmuState *emu) {
  * Returns the DOS exit code reported by the program.
  * As a side effect, sets dir_state->dos_prog_abs = NULL, and may change dir_state and tty_state.
  */
-static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filename, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, char **envp0) {
+static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filename, const char *args_str, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, const char* const *envp0) {
   int img_fd;
   struct kvm_fds kvm_fds;
   void *mem;
@@ -1453,9 +1556,6 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   unsigned dta_seg_ofs;  /* Disk transfer address (DTA). */
   unsigned ongoing_set_int;
   unsigned short last_dos_error_code;
-  const unsigned short *next_fake_key;
-  int tty_in_fd = tty_state->tty_in_fd;
-  struct pollfd pollfd0;
   const char is_hlt_ok = emu_params->is_hlt_ok;
 
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
@@ -1466,10 +1566,9 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
     exit(252);
   }
   dos_prog_abs = dir_state->dos_prog_abs;
+  if (!dos_prog_abs) dos_prog_abs = "";
   if (dos_prog_abs[0] == '\0') dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
   dir_state->dos_prog_abs = NULL;  /* For security, use dos_prog_abs mapping only for read-only opens below. */
-  pollfd0.fd = 0;
-  pollfd0.events = POLLIN;
 
  do_exec:
   header_size = detect_dos_executable_program(img_fd, prog_filename, header);
@@ -1501,13 +1600,13 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       copy_args_to_dos_args(psp_args, args);
       args = NULL;  /* DOS exec() shouldn't copy them later. */
     } else {
-      const unsigned size = strlen(fnbuf2);
+      const unsigned size = strlen(args_str);
       if (size > 0x7e) {  /* This shouldn't happen, that was checked before. */
         fprintf(stderr, "assert: exec command-line args too long\n");
         exit(252);
       }
       *psp_args++ = (char)size;
-      memcpy(psp_args, fnbuf2, size);
+      memcpy(psp_args, args_str, size);
       psp_args[size] = '\r';
     }
   }
@@ -1587,7 +1686,6 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   dta_seg_ofs = 0x80 | PSP_PARA << 16;
   ongoing_set_int = 0;  /* No set_int operation ongoing. */
   last_dos_error_code = 0;
-  next_fake_key = fake_keys;
 
   if (DEBUG) dump_regs("debug", &regs, &sregs);
 
@@ -1755,10 +1853,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             const char *linux_filename;
             char *linux_lastc;  /* Last component of linux_filename. */
             if (DEBUG) fprintf(stderr, "debug: dos_open(%s)\n", p);
-            dir_state->dos_prog_abs = flags == O_RDONLY ? dos_prog_abs : NULL;  /* For loading the overlay from prog_filename, even if not mounted. */
+            dir_state->dos_prog_abs = flags3 == O_RDONLY ? dos_prog_abs : NULL;  /* For loading the overlay from prog_filename, even if not mounted. */
             linux_filename = get_linux_filename_r(p, dir_state, fnbuf, &linux_lastc);
             dir_state->dos_prog_abs = NULL;  /* For security. */
             if (DEBUG) fprintf(stderr, "debug: dos_open(%s) linux_filename=(%s) current_drive=%c:\n", p, linux_filename, dir_state->drive);
+            /* There is some code duplication here with "type" in run_dos_batch(). */
             /* Since we check linux_lastc rather than linux_filename, we
              * recognize foo\aux.bar as aux. DOSBox 0.74-4 and MS-DOS 6.22
              * do the same, but they also fail if directory foo doesn't exist.
@@ -2342,6 +2441,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(char*)env_end = '\0';  /* Hide counter for absolute program pathname. */
               memcpy(new_env = (char*)mem + (ENV_PARA << 4), env, env_end + 2 - env);
               strcpy(fnbuf2, args);  /* Large enough to hold 0x7f bytes. */
+              args_str = fnbuf2;
               dos_prog_abs = get_dos_abs_filename_r(prog_filename, new_prog_drive, dir_state, dosfnbuf);
               if (DEBUG) fprintf(stderr, "debug: exec prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", prog_filename, dos_prog_abs, new_prog_drive);
               if (dos_prog_abs[0] == '\0') {
@@ -2397,68 +2497,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *(unsigned char*)&regs.rax = *(const unsigned char*)((const char*)mem + 0x417);  /* In BDA, 0 by default, no modifier keys pressed. */
           } else if (ah == 0x01 || ah == 0x11 ||  /* Check buffer, do not clear. */
                      ah == 0x00 || ah == 0x00) {  /* Wait for keystroke and read. */
-            if (tty_in_fd == -3) {  /* Fake keys. */
-              *(unsigned char*)&regs.rax = *next_fake_key;
-              if (ah & 1) {
-                *(unsigned short*)&regs.rflags &= ~(1 << 6);  /* ZF=0, key available in buffer. */
-              } else {
-                if (++next_fake_key == fake_keys + sizeof(fake_keys) / sizeof(fake_keys[0])) next_fake_key = fake_keys;
-              }
-            } else {
-              /* TODO(pts): Disable line buffering if isatty(0). Enable it again at exit if needed. */
-              int got;
-              struct termios tio;
-              tcflag_t old_lflag = 0;
-              if (tty_in_fd == -1) {
-                if ((tty_in_fd = open("/dev/tty", O_RDWR)) < 0) {  /* Current controlling terminal. */
-                  tty_in_fd = -2;
-                } else {
-                  tty_in_fd = ensure_fd_is_at_least(tty_in_fd, 5);
-                }
-                tty_state->tty_in_fd = tty_in_fd;
-              }
-              if (!tty_state->is_tty_in_error) {
-                if (tcgetattr(tty_in_fd, &tio) != 0) {
-                  tty_state->is_tty_in_error = 1;
-                } else {
-                  old_lflag = tio.c_lflag;
-                  /* TODO(pts): Handle Ctrl-<C> and other signals. */
-                  tio.c_lflag &= ~(ICANON | ECHO);  /* As a side effect, ECHOCTL is also disabled, so Ctrl-<C> won't show up as ^C, but it will still send SIGINT. */
-                  if (tcsetattr(tty_in_fd, 0, &tio) != 0) {
-                    tty_state->is_tty_in_error = 1;
-                  }
-                }
-              }
-              if (ah & 1) {
-                const int got = poll(&pollfd0, 1  /* pollfd count */, 0 /* timeout */);  /* Like select(2), but faster. Easier to setup than epoll(2). */
-                if (got < 0) {
-                  perror("poll stdin");
-                  exit(252);
-                } else if (got) {
-                  *(unsigned short*)&regs.rax =  0x011b;  /* Fake <Esc> in keyboard buffer. */
-                  *(unsigned short*)&regs.rflags &= ~(1 << 6);  /* ZF=0, key available. */
-                } else {
-                  *(unsigned short*)&regs.rflags |= (1 << 6);  /* ZF=1. */
-                }
-              } else {
-                char c;
-                if ((got = read(tty_in_fd == -2 ? 0 : tty_in_fd, &c, 1)) < 1) c = 26;  /* Ctrl-<Z>, simulate EOF. Most programs won't recognize it. */
-                *(unsigned short*)&regs.rax = (c & ~0x7f ? 0x3f : scancodes[(int)c]) << 8 | (c & 0xff);
-              }
-              if (!tty_state->is_tty_in_error) {
-                tio.c_lflag = old_lflag;
-                /* Since we set ECHO back here, a call with ah == 0x01
-                 * followed by a call with ah == 0x00 will echo the character
-                 * to the Linux terminal.
-                 *
-                 * TODO(pts): Fix it by not setting ECHO back here, only at exit.
-                 */
-                /* TODO(pts): Also change it back upon exit. Even if it's a signal exit. */
-                if (tcsetattr(tty_in_fd, 0, &tio) != 0) {
-                  tty_state->is_tty_in_error = 1;
-                }
-              }
-            }
+            process_key(tty_state, ah, (unsigned short*)&regs.rax, (unsigned short*)&regs.rflags);
           } else {
             goto fatal_int;
           }
@@ -2592,6 +2631,304 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   exit(252);
 }
 
+static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filename, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, const char* const *envp0) {
+  unsigned char exit_code = 0;
+  int batch_fd, got;
+  char buf[4096], *p = buf, *p_line = buf, *q;
+  char do_echo = 1;
+  size_t size;
+  const char *dos_prog_abs = dir_state->dos_prog_abs;  /* Of the .bat file. */
+  dir_state->dos_prog_abs = NULL;
+  (void)args;
+  if ((batch_fd = open(prog_filename, O_RDONLY)) < 0) {
+    fprintf(stderr, "fatal: cannot open DOS .bat batch file: %s: %s\n", prog_filename, strerror(errno));
+    exit(252);
+  }
+  for (;;) {
+    size = buf + sizeof(buf) - p;
+    if (size == 0) { line_too_long:
+      fprintf(stderr, "fatal: line too long in DOS .bat batch file: %s\n", prog_filename);
+      exit(252);
+    }
+    if ((got = read(batch_fd, p, size)) < 0) {
+      fprintf(stderr, "fatal: error reading from DOS .bat batch file: %s: %s\n", prog_filename, strerror(errno));
+      exit(252);
+    }
+    if (got == 0) {
+      if (p_line == p) break;
+      *p = '\n'; got = 1;  /* Simulate trailing newline. There is room, `size == 0' has already been checked above. MS-DOS 6.22 does the same. */
+    }
+    q = p; p += got;
+    if (q == p_line) {  /* Remove leading \r and \n from line. */
+     next_line:
+      for (; q != p && (*q == '\r' || *q == '\n'); ++q) {}
+      p_line = q;
+    }
+    /* MS-DOS 6.22 doesn't recognize just \n as line terminator, but we do. */
+    for (; q != p && *q != '\r' && *q != '\n'; ++q) {}
+    if (q == p) {  /* End-of-line not yet read. */
+      /* If >= 75% of the buffer is filled with an unfinished line, report an
+       * error. This is to make sure that we're not spending most of our time in
+       * memmove().
+       */
+      if ((size_t)(q - p_line) >= sizeof(buf) - (sizeof(buf) >> 2)) goto line_too_long;
+      if (q == buf + sizeof(buf)) {
+        memmove(buf, p_line, q - p_line);
+        p = q = buf + (q - p_line);
+        p_line = buf;
+      }
+    } else {  /* End-of-line reached, line is p_line...q. */
+      char c, c_endarg, do_echo_line = do_echo;
+      char *r, *arg, *endarg;
+      unsigned cmd_size;
+      *q = '\0';  /* Make it ASCIIZ (terminated by \0). */
+      if (DEBUG) fprintf(stderr, "debug: batch line: (%s)\n", p_line);
+      for (; *p_line == ' ' || *p_line == '\t'; ++p_line) {}  /* MS-DOS 6.22 doesn't ignore leading whitespace, at least not before `rem'. */
+      if (*p_line == '@') { do_echo_line = 0; ++p_line; }
+      if (do_echo_line) {
+        const char *current_dir = dir_state->current_dir[dir_state->drive - 'A'];
+        fprintf(stdout, "\r\n%c:%s>%s\r\n", dir_state->drive, *current_dir == '\0' ? "\\" : current_dir, p_line);
+        fflush(stdout);
+      }
+      for (r = p_line; ((c = *r) + 0U > 31U && c != '\x7f') || c == ' ' || c == '\t'; ++r) {}
+      if (c != '\0') {
+        fprintf(stderr, "fatal: invalid character in DOS .bat batch file: %s\n", prog_filename);
+        exit(252);
+      }
+      if (strchr(p_line, '<') || strchr(p_line, '>') || strchr(p_line, '|')) {
+        fprintf(stderr, "fatal: redirection not supported in DOS .bat batch file: %s\n", prog_filename);
+        exit(252);
+      }
+      if (strchr(p_line, '%')) {
+        fprintf(stderr, "fatal: percent substitution not supported in DOS .bat batch file: %s\n", prog_filename);
+        exit(252);  /* !! add support */
+      }
+      /* MS-DOS 6.22 terminator characters. */
+      for (r = p_line; (c = *r) != '\0' && c != ' ' && c != '\t' && c != '+' && c != '=' && c != '[' && c != ']' && c != '"' && c != '\\' && c != ':' && c != ';' /* && c != '|' && c != '<' && c != '>' */ && c != ',' && c != '.' && c != '/'; ++r) {}
+      cmd_size = r - p_line;
+      for (arg = p_line; arg != r; ++arg) {
+        if (*arg - 'A' + 0U <= 'Z' - 'A' + 0U) *arg |= 32;  /* Convert to lowercase. */
+      }
+      if (cmd_size == 0) goto done_command;  /* Empty command. */
+      for (arg = r; *arg == ' ' || *arg == '\t'; ++arg) {}
+      for (endarg = q; endarg != r && (endarg[-1] == ' ' || endarg[-1] == '\t'); --endarg) {}
+      c_endarg = *endarg;
+      *endarg = '\0';  /* MS-DOS 6.22 passes trailing spaces to .com or .exe programs, but DOSBox 0.74-4 doesn't. We don't. This also affects the `echo' command in DOSBox 0.74-4, but for that we add trailing spaces. */
+      if (cmd_size == 1 && (p_line[0] & ~32)  - 'A' + 0U <= 'Z' - 'A' + 0U) {
+        /* Ignore arguments arg...endarg, like MS-DOS 6.22 does. */
+        char drive = p_line[0] & ~32;
+        if (drive >= 'A' + DRIVE_COUNT || !dir_state->linux_mount_dir[drive - 'A']) {
+          fprintf(stderr, "Invalid drive specification\r\n");  /* Like: MS-DOS 6.22. */
+          exit_code = 1;
+        }
+      } else if (0 == memcmp(p_line, "rem", cmd_size)) {
+        /* Comment, do nothing. */
+      } else if (0 == memcmp(p_line, "cls", cmd_size)) {
+        /* Ignore arguments arg...endarg, like MS-DOS 6.22 does. */
+        fprintf(stdout, "\x1b[3J\x1b[H\x1b[2J");  /* xterm: tput clear */
+        fflush(stdout);
+        exit_code = 0;
+      } else if (0 == memcmp(p_line, "echo", cmd_size)) {
+        *endarg = c_endarg;  /* Don't strip trailing spaces. MS-DOS 6.22 doesn't strip, DOSBox 0.74-4 does strip. */
+        if (*r == '\0') {
+          fprintf(stdout, "ECHO is %s\r\n", do_echo ? "on" : "off");
+        } else {
+          if (0 == memcmp(arg, "on", 3)) {
+            do_echo = 1;
+          } else if (0 == memcmp(arg, "off", 4)) {
+            do_echo = 0;
+          } else {
+            ++r;  /* Skip over a single space, '.', ':' etc. */
+            fwrite(r, 1, endarg - r, stdout);
+            fwrite("\r\n", 1, 2, stdout);
+          }
+        }
+        fflush(stdout);
+        exit_code = 0;
+      } else if (0 == memcmp(p_line, "set", cmd_size)) {
+        if (*r != '\0') {
+          fprintf(stderr, "fatal: changing environment variables not supported: %s\n", r);
+          exit(252);  /* !! TODO(pts): Add support, change a copy of envp0. */
+        } else {
+          const char* const *envp = envp0;
+          if (*envp) {
+            for (; *envp; ++envp) {
+              fprintf(stdout, "%s\r\n", *envp);
+            }
+          } else {
+            fprintf(stdout, "$=\r\n");  /* See run_dos_prog above. */
+          }
+          fflush(stdout);
+        }
+        exit_code = 0;
+      } else if (0 == memcmp(p_line, "ver", cmd_size)) {
+        if (*r != '\0') {
+          fprintf(stderr, "Too many parameters - %s\r\n", r);  /* Like: MS-DOS 6.22. */
+          exit_code = 1;
+        } else {
+          fprintf(stdout, "\r\nkvikdos\r\n\r\n");
+          fflush(stdout);
+          exit_code = 0;
+        }
+      } else if (0 == memcmp(p_line, "exit", cmd_size)) {
+        /* pts-fast-dosbox. */
+        unsigned exit_code2, n;
+        if (is_same_ascii_nocase(arg, "/and", 5)) {  /* Exit only if the previous command has failed (errorlevel 1 or larger). */
+          if (exit_code != 0) break;
+        } else if (is_same_ascii_nocase(arg, "/or", 4)) {  /* Exit only if the previous command has succeeded. */
+          if (exit_code == 0) break;
+        } else if (is_same_ascii_nocase(arg, "/ec", 4)) {
+          /* Use `exit /ec' to propagate the exit code (al in int 0x21 call with ah == 0x4c) of the last program. */
+          break;
+        } else if (is_same_ascii_nocase(arg, "/true", 6)) {
+          exit_code = 0; /* Don't exit, but reset errorlevel to 0. */
+        } else if (sscanf(arg, "%u%n", &exit_code2, (int*)&n) == 1 && strlen(arg) == n && exit_code2 < 256) {
+          exit_code = exit_code2;  /* No need for `& 255', it's already Bit8u. */
+          break;
+        } else {
+          exit_code = 0;
+          break;
+        }
+      } else if (0 == memcmp(p_line, "cd", cmd_size)) {
+        if (*r != '\0') {
+          fprintf(stderr, "fatal: changing current directory not supported: %s\n", r);
+          exit(252);  /* !! TODO(pts): Add support, change a copy of envp0. */
+        } else {
+          const char *current_dir = dir_state->current_dir[dir_state->drive - 'A'];
+          fprintf(stdout, "%c:%s\r\n", dir_state->drive, *current_dir == '\0' ? "\\" : current_dir);
+          fflush(stdout);
+          exit_code = 0;
+        }
+      } else if (0 == memcmp(p_line, "path", cmd_size)) {
+        const char* const *envp;
+        if (*r != '\0') {
+          fprintf(stderr, "fatal: changing environment variables (PATH) not supported: %s\n", r);
+          exit(252);  /* !! TODO(pts): Add support, change a copy of envp0. */
+        }
+        for (envp = envp0; *envp && strncmp(*envp, "PATH=", 5) != 0; ++envp) {}
+        if (*envp) {
+          fprintf(stdout, "%s\r\n", *envp);
+          exit_code = 0;
+        } else {
+          fprintf(stdout, "No Path\r\n\r\n");  /* MS-DOS 6.22. */
+          exit_code = 1;
+        }
+        fflush(stdout);
+      } else if (0 == memcmp(p_line, "pause", cmd_size)) {
+        unsigned short dummy_ax;
+        /* Ignore arguments arg...endarg, like MS-DOS 6.22 does. */
+        fprintf(stdout, "Press any key to continue.\r\n");  /* DOSBox 0.74-4. MS-DOS 6.22 prints more dots. */
+        process_key(tty_state, 0, &dummy_ax, &dummy_ax);
+        exit_code = 0;
+      } else if (0 == memcmp(p_line, "type", cmd_size)) {
+        char *arg2 = arg, c2;
+        for (; (c2 = (*arg2 != '\0')) && c2 != ' ' && c2 != '\t' && c2 != '+' && c2 != '=' && c2 != '/' && c2 != '[' && c2 != ']' && c2 != ';' && c2 != ',' && c2 != '"'; ++arg2) {}  /* MS-DOS 6.22. */
+        if (c2 != '\0') {
+          fprintf(stderr, "Too many parameters - %s\r\n", arg2 + 1);
+          exit_code = 1;
+        } else {  /* Now filename is in arg. */
+          int fd = open_dos_file(arg, dos_prog_abs, O_RDONLY, dir_state);
+          if (fd < 0) {
+            if (errno == ENOENT) {
+              fprintf(stderr, "File not found - %s\r\n", arg);  /* MS-DOS 6.22. */
+            } else {
+              fprintf(stderr, "Error opening (%s) - %s\r\n", strerror(errno), arg);
+            }
+            exit_code = 1;
+          } else {
+            char fbuf[4096], *ep;
+            fflush(stdout);
+            while ((got = read(fd, fbuf, sizeof(fbuf))) > 0) {
+              if ((ep = memchr(fbuf, '\x1a', got)) != NULL) {  /* Stop at Ctrl-<Z>. DOSBox ignores it. */
+                (void)!write(1, fbuf, ep - fbuf);  /* STDOUT_FILENO. */
+                break;
+              }
+              (void)!write(1, fbuf, got);  /* STDOUT_FILENO. */
+            }
+            if ((exit_code = (got < 0)) != 0) {
+              fprintf(stderr, "\r\nError reading (%s) - %s\r\n", strerror(errno), arg);
+            }
+            close(fd);
+          }
+        }
+      } else if (memcmp(p_line, "dir", cmd_size) == 0 ||
+                 memcmp(p_line, "chdir", cmd_size) == 0 ||
+                 memcmp(p_line, "attrib", cmd_size) == 0 ||
+                 memcmp(p_line, "call", cmd_size) == 0 ||
+                 memcmp(p_line, "cd", cmd_size) == 0 ||
+                 memcmp(p_line, "choice", cmd_size) == 0 ||
+                 memcmp(p_line, "copy", cmd_size) == 0 ||
+                 memcmp(p_line, "del", cmd_size) == 0 ||
+                 memcmp(p_line, "delete", cmd_size) == 0 ||
+                 memcmp(p_line, "erase", cmd_size) == 0 ||
+                 memcmp(p_line, "goto", cmd_size) == 0 ||
+                 memcmp(p_line, "help", cmd_size) == 0 ||
+                 memcmp(p_line, "if", cmd_size) == 0 ||
+                 memcmp(p_line, "loadhigh", cmd_size) == 0 ||
+                 memcmp(p_line, "lh", cmd_size) == 0 ||
+                 memcmp(p_line, "mkdir", cmd_size) == 0 ||
+                 memcmp(p_line, "md", cmd_size) == 0 ||
+                 memcmp(p_line, "rmdir", cmd_size) == 0 ||
+                 memcmp(p_line, "rd", cmd_size) == 0 ||
+                 memcmp(p_line, "rem", cmd_size) == 0 ||
+                 memcmp(p_line, "rename", cmd_size) == 0 ||
+                 memcmp(p_line, "ren", cmd_size) == 0 ||
+                 memcmp(p_line, "shift", cmd_size) == 0 ||
+                 memcmp(p_line, "subst", cmd_size) == 0) {
+        *r = '\0';
+        fprintf(stderr, "fatal: DOS command not supported: %s\n", p_line);
+        exit(252);
+        /**r = c;*/
+      } else {  /* Run .com or .exe program. */
+        char *args_str = p_line, args_buf[0x80], c2;
+        const char* prog_filename;
+        const char* const *envp;
+        char prog_drive;
+        size_t size;
+        for (; (c2 = *args_str) != '\0' && c2 != ' ' && c2 != '\t' && c2 != '=' && c2 != ',' && c2 != '/'; ++args_str) {}  /* MS-DOS 6.22. */
+        if (args_str == p_line) {
+          fprintf(stderr, "Empty DOS program name to run\r\n");
+          exit_code = 1;
+        } else if ((size = q - args_str) >= sizeof(args_buf) - 1) {  /* DOS doesn't support longer than 0x7e, including leading spaces. */
+          fprintf(stderr, "DOS program arguments too long\r\n");
+          exit_code = 1;
+        } else {
+          args_buf[0] = size;
+          memcpy(args_buf + 1, args_str, size);  /* Will contain leading ' ', '\t', '/' etc. */
+          args_buf[1 + size] = '\r';
+          *args_str = '\0';  /* So that p_line becomes terminated by '\0'. */
+          for (envp = envp0; *envp && strncmp(*envp, "PATH=", 5) != 0; ++envp) {}
+          dir_state->dos_prog_abs = dos_prog_abs;  /* Of the .bat file. */
+          prog_filename = find_prog_on_path(p_line, dir_state, *envp ? *envp + 5 : NULL, &prog_drive);
+          if (!prog_filename) {
+            /* DOSBox 0.74-4 prints "Illegal command: %s.\r\n" to stdout, we print our error to stderr. */
+            /* MS-DOS 6.22 prints this to stderr: "Bad command or file name\r\n". */
+            fprintf(stderr, "Illegal command - %s\r\n", p_line);
+            exit_code = 1;
+          } else if (*prog_filename == '\0') {
+            fprintf(stderr, "Invalid DOS program name - %s\r\n", p_line);
+            exit_code = 1;
+          } else {
+            dir_state->dos_prog_abs = get_dos_abs_filename_r(prog_filename, prog_drive, dir_state, dosfnbuf);
+            if (dir_state->dos_prog_abs[0] == '\0') {
+              fprintf(stderr, "Error getting absolute filelename - %s\r\n", p_line);
+              exit_code = 1;
+            } else {
+              exit_code = run_dos_prog(emu, prog_filename, args_buf, NULL, dir_state, tty_state, emu_params, envp0);
+            }
+          }
+          dir_state->dos_prog_abs = NULL;  /* For security. */
+        }
+      }
+     done_command:
+      ++q;  /* Skip over the '\0', formerly '\r' or '\n'. */
+      goto next_line;
+    }
+  }
+  close(batch_fd);
+  return exit_code;
+}
+
 int main(int argc, char **argv) {
   const char *argv0;
   char is_drive_specified;
@@ -2641,6 +2978,7 @@ int main(int argc, char **argv) {
   envp = envp0 = ++argv;
   tty_state.tty_in_fd = -1;
   tty_state.is_tty_in_error = 0;
+  tty_state.next_fake_key = fake_keys;
   emu_params.is_hlt_ok = 0;
   is_drive_specified = 0;
   while (argv[0]) {
@@ -2883,9 +3221,14 @@ int main(int argc, char **argv) {
   }
 
   { int exit_code;
+    const char *ext= get_linux_ext(prog_filename);
     EmuState emu;
     init_emu(&emu);  /* This is lightweight, it doesn't initialized KVM. */
-    exit_code = run_dos_prog(&emu, prog_filename, (const char* const*)argv, &dir_state, &tty_state, &emu_params, envp0);
+    if (is_same_ascii_nocase(ext, "bat", 4)) {
+      exit_code = run_dos_batch(&emu, prog_filename, (const char* const*)argv, &dir_state, &tty_state, &emu_params, (const char* const*)envp0);
+    } else {
+      exit_code = run_dos_prog(&emu, prog_filename, NULL, (const char* const*)argv, &dir_state, &tty_state, &emu_params, (const char* const*)envp0);
+    }
     if (DEBUG) fprintf(stderr, "debug: DOS program exited with code: 0x%02x", exit_code);
     return exit_code;
   }
