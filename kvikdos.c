@@ -180,6 +180,8 @@
 
 /* Maximum byte offset where the program (including .bss and stack) can end.
  * 640 KiB should be enough for everyone :-).
+ *
+ * Must be divisible by 0x1000 because it's used in madvise().
  */
 #define DOS_MEM_LIMIT 0xa0000
 
@@ -1422,10 +1424,11 @@ static void reset_emu(struct EmuState *emu) {
     emu->kvm_fds.kvm_fd = kvm_fd; emu->kvm_fds.vm_fd = vm_fd; emu->kvm_fds.vcpu_fd = vcpu_fd;
   } else {
     mem = emu->mem;
-    if (madvise((char*)mem + (PSP_PARA << 4), DOS_MEM_LIMIT - (PSP_PARA << 4), MADV_DONTNEED) != 0) {
+    if (madvise((char*)mem + (((PSP_PARA << 4) + 0xfff) & ~0xfff), DOS_MEM_LIMIT - (((PSP_PARA << 4) + 0xfff) & ~0xfff), MADV_DONTNEED) != 0) {
       perror("fatal: madvise MADV_DONTNEED");
       exit(252);
     }
+    if ((PSP_PARA << 4) & 0xfff) memset((char*) mem + (PSP_PARA << 4), '\0', -(PSP_PARA << 4) & 0xfff);  /* Partial page not cleared by madvise() above. */
     if (*(const unsigned*)((char*)mem + (PSP_PARA << 4)) != 0) {
       fprintf(stderr, "madvise failed to zero PSP\n");
       exit(252);
