@@ -2619,7 +2619,8 @@ int main(int argc, char **argv) {
                     "--mount=<drive>0: Makes sure that <drive>: is not visible in DOS.\n"
                     "--drive=<drive>: Sets initial current drive for DOS program.\n"
                     "--tty-in=<fd>: Selects Linux file descriptor for keyboard input.\n"
-                    "    -3: fake keys; -2: stdin buffered; -1: /dev/tty; 0: stdin etc.\n",
+                    "    -3: fake keys; -2: stdin buffered; -1: /dev/tty; 0: stdin etc.\n"
+                    "--hlt-ok: Allow the hlt instruction.\n",
                     argv0);
     exit(argv0 && argv[1] ? 0 : 1);
   }
