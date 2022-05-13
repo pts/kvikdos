@@ -2660,7 +2660,7 @@ int main(int argc, char **argv) {
      do_env:
       { char *p = arg, c;
         for (; (c = *p) != '\0' && c != '='; ++p) {
-          if (c - 'a' + 0U <= 'z' - 'a' + 0U) c &= ~32;  /* Convert variable name to uppercase. */
+          if (c - 'a' + 0U <= 'z' - 'a' + 0U) *p &= ~32;  /* Convert variable name to uppercase. */
         }
       }
       *envp++ = arg;  /* Reuse the argv array. */
