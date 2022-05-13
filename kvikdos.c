@@ -2299,6 +2299,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             if (al == 0x00) {  /* Get. */
               *(unsigned char*)&regs.rax = 0;  /* Success. */
               *(unsigned char*)&regs.rdx = '/';
+            } else if (al == 0x02) {  /* Get device prefix flag. */
+              *(unsigned char*)&regs.rdx = 0xff;  /* Device prefix /dev/... not needed. */
             } else {
               fprintf(stderr, "fatal: unsupported subcall for switch character: 0x%02x\n", al);
               goto fatal;
