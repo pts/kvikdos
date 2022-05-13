@@ -379,6 +379,9 @@ static int detect_dos_executable_program(int img_fd, const char *prog_filename, 
     } else if (is_same_ascii_nocase(ext, "cmd", ext_size)) {
       fprintf(stderr, "fatal: Windows NT and OS/2 .cmd scripts not supported: %s\n", prog_filename);
       exit(252);
+    } else if (is_same_ascii_nocase(ext, "ps1", ext_size)) {
+      fprintf(stderr, "fatal: PowerShell .ps1 scripts not supported: %s\n", prog_filename);
+      exit(252);
     } else if (is_same_ascii_nocase(ext, "sh", ext_size)) {
       fprintf(stderr, "fatal: Unix .sh shell scripts not supported: %s\n", prog_filename);
       exit(252);
