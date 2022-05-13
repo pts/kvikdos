@@ -438,6 +438,11 @@ static const unsigned char fixed_exepack_stub[283] = {
     0x6b, 0x65, 0x64, 0x20, 0x66, 0x69, 0x6c, 0x65, 0x20, 0x69, 0x73, 0x20,
     0x63, 0x6f, 0x72, 0x72, 0x75, 0x70, 0x74 };
 
+static const unsigned char link_exe_2_00_header[26] = {
+    0x4d, 0x5a, 0x08, 0x01, 0x53, 0x00, 0x3c, 0x02, 0xa0, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xb1, 0x09, 0x00, 0x0c, 0x56, 0x97, 0x08, 0x00, 0xac, 0x05,
+    0x1c, 0x00 };
+
 /* All offsets are in 2-byte words. */
 #define EXE_SIGNATURE 0
 #define EXE_LASTSIZE 1
@@ -472,7 +477,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     const unsigned exesize = exehdr[EXE_LASTSIZE] ? ((nblocks - 1) << 9) + exehdr[EXE_LASTSIZE] : nblocks << 9;
     const unsigned headsize = (unsigned)exehdr[EXE_HDRSIZE] << 4;
     const unsigned image_size = exesize - headsize;
-    const unsigned memsize_min_para = (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MINALLOC];  /* This includes .bss after the image. Please note that this doesn't depend on exehdr[EXE_LASTSIZE]. Formula is same as in MS-DOS 6.22, FreeDOS 1.2, DOSBox 0.74-4. */
+    unsigned memsize_min_para = (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MINALLOC];  /* This includes .bss after the image. Please note that this doesn't depend on exehdr[EXE_LASTSIZE]. Formula is same as in MS-DOS 6.22, FreeDOS 1.2, DOSBox 0.74-4. */
     const unsigned memsize_max_para = (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MAXALLOC];
     char * const image_addr = (char*)mem + (PSP_PARA << 4) + 0x100;
     const unsigned image_para = PSP_PARA + 0x10;
@@ -491,8 +496,12 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
       exit(252);
     }
     if (stack_end_plus_0x100 > (memsize_min_para << 4) + 0x100) {  /* Some .exe files have it. */
-      fprintf(stderr, "fatal: DOS .exe stack pointer after end of program memory (0x%x - 0x100 > 0x%x): %s\n", stack_end_plus_0x100, memsize_min_para << 4, filename);
-      exit(252);
+      if (memcmp(header, link_exe_2_00_header, 26) == 0) {  /* Workaround. */
+        memsize_min_para = (stack_end_plus_0x100 - 0x100 + 0xf) >> 4;
+      } else {
+        fprintf(stderr, "fatal: DOS .exe stack pointer after end of program memory (0x%x - 0x100 > 0x%x): %s\n", stack_end_plus_0x100, memsize_min_para << 4, filename);
+        exit(252);
+      }
     }
     if (memsize_min_para > memsize_max_para) {
       fprintf(stderr, "fatal: DOS .exe minimum memory larger than maximum: %s\n", filename);
