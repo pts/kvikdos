@@ -306,6 +306,17 @@ Alternatives of kvikdos:
   within the Linux terminal. You can use it most conveniently by driving it
   with udosrun (see above).
 
+* EMU2: https://github.com/dmsc/emu2 . It works on the Unix terminal,
+  including interactive text-mode DOS programs. It emulates more hardware
+  and more DOS functionality than kvikdos. It contains a slow and
+  architecture-independent 80286 emulator, without protected mode. It is
+  able to run MASM 1.00. It is quite close to kvikdos in the sense that it
+  maps DOS standard handles to Unix standard file descriptors (stdin, stdout
+  and stderr).
+
+  Unix Makefile example using EMU2 headless:
+  https://gist.github.com/dmsc/28d7f4900e7adaf60427a95f9b471813
+
 * !! doscmd
 
 * !! dosrun and dosrunner
