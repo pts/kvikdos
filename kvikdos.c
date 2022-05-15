@@ -158,6 +158,10 @@
  * Minimum value is 0x50, after the magic interrupt table (first 0x500 bytes
  * of DOS memory). Also there is the environment (up to ENV_LIMIT >> 4)
  * paragraphs between the magic interrup table and base.
+ *
+ * Minimum value is 0x1f0 for Microsoft Macro Assembler 1.00 m.exe; otherwise it hangs.
+ * Minimum value is 0x229 for Microsoft Macro Assembler 1.06 masm.exe; otherwise it hangs.
+ * Minimum value is 0x14c for Microsoft Macro Assembler 1.10 masm.exe; otherwise it hangs.
  */
 #define PSP_PARA 0x100
 
@@ -2625,6 +2629,9 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         } else if (addr == 0xa003e && mmio_len == 2 && !run->mmio.is_write) {
           /* Microsoft Macro Assembler 6.00B driver masm.exe. */
           *(unsigned short*)run->mmio.data = 0;
+        } else if (addr == 0x501 && addr + mmio_len <= 0x504 && run->mmio.is_write) {
+          /* Microsoft Macro Assembler 1.00 m.exe only writes byte at 0x501. */
+          memcpy((char*)mem + addr, run->mmio.data, mmio_len);
         } else {
           highmsg[0] = '\0';
          bad_memory_access:
