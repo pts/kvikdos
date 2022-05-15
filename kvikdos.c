@@ -2299,8 +2299,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           } else if (ah == 0x1a) {  /* Set disk transfer address (DTA). */
             dta_seg_ofs = *(unsigned short*)&regs.rdx | sregs.ds.selector << 16 ;
           } else if (ah == 0x63) {  /* Get lead byte table. Multibyte support in MS-DOS 2.25. */
-            *(unsigned short*)&regs.rax = 1;  /* Invalid function number. */
-            goto error_on_21;
+            goto nonfatal_unknown_int_21_call;
           } else if (ah == 0x38) {  /* Get/set country dependent information. */
             const unsigned char al = (unsigned char)regs.rax;
             char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
@@ -2484,8 +2483,19 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               if (*q == '\n') { *q++ = '\r'; break; }
             }
             p[-1] = q - p;  /* Return number of byts read. */
+          } else if (ah == 0x71) {
+            const unsigned char al = (unsigned char)regs.rax;
+            if (al == 0x0d || al - 0x39 + 0U <= 0x4f - 0x39 + 0U || al == 0x56 || al == 0x60 || al == 0x6c || al - 0xa0 + 0U <= 0xaa - 0xa0 + 0U) {  /* http://mirror.cs.msu.ru/oldlinux.org/Linux.old/docs/interrupts/int-html/int-21.htm */
+               /* ax == 0x716c. Open or create with long file name (starting from Windows 95). http://mirror.cs.msu.ru/oldlinux.org/Linux.old/docs/interrupts/int-html/rb-3209.htm */
+              goto nonfatal_unknown_int_21_call;  /* flat assembler 1.73.24 fasmlite.exe relies on this. */
+            } else {
+              goto fatal_int;
+            }
           } else {
             goto fatal_int;
+           nonfatal_unknown_int_21_call:
+            *(unsigned char*)&regs.rax = 0;  /* Indicate function not supported. MS-DOS 2.0 and 6.22 also do this: AL := 0, CF := 1. */
+            *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
           }
         } else if (int_num == 0x10) {  /* Video output. */
           if (ah == 0x0e) {  /* Teletype output. */
