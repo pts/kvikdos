@@ -2554,15 +2554,17 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           const unsigned char al = (unsigned char)regs.rax;
           if (al == 0x00) {  /* Installation check. */
             if (ah < 2 || ah == 0x15) goto fatal_uic;  /* Doesn't follow the standard format. */
+            /* ah == 0x43: XMS. */
             *(unsigned char*)&regs.rax = 0;  /* Not installed, OK to install. */
+          } else if (*(unsigned short*)&regs.rax == 0x1687) {  /* DPMI. */
+            /* Keep it as is, DPMI not installed. */
 #if 0  /* TLINK 5.1 tlink.exe loading dpmi16bi.ovl */
           } else if (*(unsigned short*)&regs.rax == 0xfb42) {
           } else if (*(unsigned short*)&regs.rax == 0xfb43) {
-          } else if (*(unsigned short*)&regs.rax == 0x1687) {
 #endif
           } else { fatal_uic:
             fprintf(stderr, "fatal: unsupported int 0x%02x ax:%04x\n", int_num, *(const unsigned short*)&regs.rax);
-            goto fatal;
+            goto fatal_int;
           }
         } else if (int_num == 0x15) {  /* System BIOS. */
           const unsigned short ax = (unsigned short)regs.rax;
