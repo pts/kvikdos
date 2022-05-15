@@ -2564,6 +2564,16 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             fprintf(stderr, "fatal: unsupported int 0x%02x ax:%04x\n", int_num, *(const unsigned short*)&regs.rax);
             goto fatal;
           }
+        } else if (int_num == 0x15) {  /* System BIOS. */
+          const unsigned short ax = (unsigned short)regs.rax;
+          if (ax == 0xe801) {  /* Check for large free extended memory (XMS). */
+            *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */  /* No large free extended memory. */
+          } else if (ah == 0x88) {  /* Get extended memory (XMS) size. */
+            *(unsigned short*)&regs.rax = 0;  /* No extended memory. */
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else {
+            goto fatal_uic;
+          }
         } else if (int_num == 0x00) {  /* Division by zero. */
           /* This is called only if the program doesn't override the interrupt vector.
            * Example instructions: `xor ax, ax', `div ax'.
