@@ -1578,6 +1578,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
 
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
   { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
+  { struct SA { int StaticAssert_ShortSize : sizeof(short) == 2; }; }  /* Assumed by *(unsigned short*)... in many places. */
+  { struct SA { int StaticAssert_IntSize : sizeof(int) == 4; }; }  /* Assumed by *(unsigned*)... in many places. */
 
   if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
     fprintf(stderr, "fatal: cannot open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
