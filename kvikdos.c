@@ -1794,6 +1794,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 if (last_dos_error_code > 0x12) *(unsigned short*)&regs.rax = 0x0d;  /* Invalid data. Use int 0x21 call with ah == 0x59 to get the real error. */
               }
               *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
+              if (DEBUG) fprintf(stderr, "debug: int 0x21 call error\n");
             } else {
               const char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
               const int size = (int)*(unsigned short*)&regs.rcx;
@@ -1916,6 +1917,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rax = 4;  /* Too many open files. */
               goto error_on_21;
             }
+            if (DEBUG) fprintf(stderr, "debug: dos_open(%s) dos_fd=%d\n", p, fd);
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             *(unsigned short*)&regs.rax = fd;
           } else if (ah == 0x57) {  /* Get/set file date and time using handle. */
