@@ -2383,6 +2383,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 if (DEBUG) fprintf(stderr, "debug: found linux_file=(%s) dos_file=(%s)\n", fnb, dta + 0x1e);
               }
             }
+            *(unsigned short*)&regs.rax = 0;  /* Undocumented, but necessary and used as a success indicator by the VAL 1995-05-27 linker val.exe. DOSBox also sets it. */
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x4f) {  /* Find next matching file (findnext). */
             const unsigned dta_linear = (dta_seg_ofs & 0xffff) + (dta_seg_ofs >> 16 << 4);
