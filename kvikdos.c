@@ -1768,9 +1768,29 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           /* !! Should we set CF=0 by default? What does MS-DOS do? */
           if (ah == 0x4c) {
             return (unsigned char)regs.rax;
-          } else if (ah == 0x06 && (unsigned char)regs.rdx != 0xff) {  /* Direct console I/O, output. */
-            const char c = (unsigned char)regs.rdx;
-            (void)!write(1, &c, 1);
+          } else if (ah == 0x06) {  /* Direct console I/O. */
+            char c;
+           func_0x06:
+            c = (unsigned char)regs.rdx;
+            if ((unsigned char)regs.rdx != 0xff) {  /* Output. */
+              (void)!write(1, &c, 1);
+            } else {  /* Input. */
+              unsigned short result_ax;
+              process_key(tty_state, 1, &result_ax, (unsigned short*)&regs.rflags);  /* Check availability without reading. */
+              if (*(unsigned short*)&regs.rflags & (1 << 6)) {  /* ZF==1. */
+                process_key(tty_state, 0, &result_ax, (unsigned short*)&regs.rflags);  /* Read. */
+                *(unsigned char*)&regs.rax = (unsigned char)result_ax;  /* Return only the keycode. */
+              }
+            }
+          } else if (ah == 0x07 || ah == 0x08) {  /* Wait for console input without echo. */
+            unsigned short result_ax;
+           func_0x07_or_0x08:
+            /* We should check Ctrl-<Break> with ah == 0x08, but the
+             * difference doesn't matter, bcause in kvikdos Ctrl-<Break> is
+             * never delivered.
+             */
+            process_key(tty_state, 0, &result_ax, (unsigned short*)&regs.rflags);  /* Read. */
+            *(unsigned char*)&regs.rax = (unsigned char)result_ax;  /* Return only the keycode. */
           } else if (ah == 0x02) {  /* Display output. */
             const char c = (unsigned char)regs.rdx;
             (void)!write(1, &c, 1);
@@ -2497,15 +2517,45 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               goto fatal_int;
             }
           } else if (ah == 0x0a) {  /* Buffered keyboard input. */
-            char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
-            unsigned size = *(unsigned char*)p++;
-            char *q = ++p, *q_end = q + size;
-            for (; q != q_end; ++q) {
-              int got = read(0, q, 1);  /* STDIN_FILENO. */
-              if (got <= 0) break;
-              if (*q == '\n') { *q++ = '\r'; break; }
+           func_0x0a: {
+              char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+              unsigned size = *(unsigned char*)p++;
+              char *q = ++p, *q_end = q + size;
+              for (; q != q_end; ++q) {
+                const int got = read(0, q, 1);  /* STDIN_FILENO. */
+                char c;
+                if (got <= 0) break;
+                if ((c = *q) == '\n') {
+                  *q++ = '\r'; break;
+                } else if (c == '\0') {
+                  *q = '\1';  /* Never report control keys: '\0' + another character. */
+                }
+              }
+              p[-1] = q - p;  /* Return number of bytes read. */
             }
-            p[-1] = q - p;  /* Return number of byts read. */
+          } else if (ah == 0x01) {  /* Keyboard input with echo. */
+            char c;
+            int got;
+           func_0x01:
+            if ((got = read(0, &c, 1)) <= 0) {  /* STDIN_FILENO. */
+              c = 0x1a;  /* Ctrl-<Z>, EOF. */
+            } else if (c == '\0') {
+              c = '\1';  /* Never report control keys: '\0' + another character. */
+            }
+            *(unsigned char*)&regs.rax = c;
+          } else if (ah == 0x0c) {  /* Clear keyboard buffer and invoke keyboard function. */
+            const unsigned char al = (unsigned char)regs.rax;
+            if (al == 0x01) {
+              goto func_0x01;
+            } else if (al == 0x06) {
+              goto func_0x06;
+            } else if (al == 0x07 || al == 0x08) {
+              goto func_0x07_or_0x08;
+            } else if (al == 0x0a) {
+              goto func_0x0a;
+            } else {
+              *(unsigned char*)&regs.rax = 0;  /* DOSBox 0.74-4 does this. What should we do? */
+            }
           } else if (ah == 0x71) {
             const unsigned char al = (unsigned char)regs.rax;
             if (al == 0x0d || al - 0x39 + 0U <= 0x4f - 0x39 + 0U || al == 0x56 || al == 0x60 || al == 0x6c || al - 0xa0 + 0U <= 0xaa - 0xa0 + 0U) {  /* http://mirror.cs.msu.ru/oldlinux.org/Linux.old/docs/interrupts/int-html/int-21.htm */
@@ -2567,7 +2617,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           } else if (ah == 0x02) {  /* Get keyboard status. */
             *(unsigned char*)&regs.rax = *(const unsigned char*)((const char*)mem + 0x417);  /* In BDA, 0 by default, no modifier keys pressed. */
           } else if (ah == 0x01 || ah == 0x11 ||  /* Check buffer, do not clear. */
-                     ah == 0x00 || ah == 0x00) {  /* Wait for keystroke and read. */
+                     ah == 0x00 || ah == 0x10) {  /* Wait for keystroke and read. */
             process_key(tty_state, ah, (unsigned short*)&regs.rax, (unsigned short*)&regs.rflags);
           } else {
             goto fatal_int;
