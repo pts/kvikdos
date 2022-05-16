@@ -1874,7 +1874,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             int fd;
             const char *linux_filename;
             char *linux_lastc;  /* Last component of linux_filename. */
-            if (DEBUG) fprintf(stderr, "debug: dos_open(%s)\n", p);
+            if (DEBUG) fprintf(stderr, "debug: dos_open(%s) flags=0x%x\n", p, flags);
             dir_state->dos_prog_abs = flags3 == O_RDONLY ? dos_prog_abs : NULL;  /* For loading the overlay from prog_filename, even if not mounted. */
             linux_filename = get_linux_filename_r(p, dir_state, fnbuf, &linux_lastc);
             dir_state->dos_prog_abs = NULL;  /* For security. */
