@@ -2308,7 +2308,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             SET_SREG(es, dta_seg_ofs >> 16);
             *(unsigned short*)&regs.rbx = dta_seg_ofs;
           } else if (ah == 0x1a) {  /* Set disk transfer address (DTA). */
-            dta_seg_ofs = *(unsigned short*)&regs.rdx | sregs.ds.selector << 16 ;
+            dta_seg_ofs = *(unsigned short*)&regs.rdx | sregs.ds.selector << 16;
           } else if (ah == 0x63) {  /* Get lead byte table. Multibyte support in MS-DOS 2.25. */
             goto nonfatal_unknown_int_21_call;
           } else if (ah == 0x38) {  /* Get/set country dependent information. */
