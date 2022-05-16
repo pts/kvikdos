@@ -1575,6 +1575,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   unsigned ongoing_set_int;
   unsigned short last_dos_error_code;
   const char is_hlt_ok = emu_params->is_hlt_ok;
+  char port_0x40_tick;
 
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
   { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
@@ -1706,6 +1707,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   dta_seg_ofs = 0x80 | PSP_PARA << 16;
   ongoing_set_int = 0;  /* No set_int operation ongoing. */
   last_dos_error_code = 0;
+  port_0x40_tick = 0;
 
   if (DEBUG) dump_regs("debug", &regs, &sregs);
 
@@ -1740,9 +1742,15 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
 
     switch (run->exit_reason) {
      case KVM_EXIT_IO:
-      fprintf(stderr, "fatal: IO port: port=0x%02x data=%08x size=%d direction=%s\n", run->io.port, *(unsigned *)((char *)(run) + run->io.data_offset), run->io.size, run->io.direction ? "out" : "in");
-      goto fatal;
-      /*break;*/  /* Continue as if the in/out hasn't happened. */
+      { char *p = (char*)run + run->io.data_offset;
+        if (run->io.port == 0x40 && run->io.size == 1 && run->io.direction == 0) {
+          *p = port_0x40_tick++;  /* Simulate some timer ticks. */
+          break;
+        } else {
+          fprintf(stderr, "fatal: IO port: port=0x%02x data=%08x size=%d direction=%s\n", run->io.port, *(const unsigned*)p, run->io.size, run->io.direction ? "out" : "in");
+          goto fatal;
+        }
+      }
      case KVM_EXIT_SHUTDOWN:  /* How do we trigger it? */
       fprintf(stderr, "fatal: shutdown\n");
       exit(252);
