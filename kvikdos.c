@@ -2587,6 +2587,13 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           } else {
             goto fatal_uic;
           }
+        } else if (int_num == 0x67) {  /* Various. */
+          const unsigned short ax = (unsigned short)regs.rax;
+          if (ax == 0xde00) {  /* VCPI installation check. http://mirror.cs.msu.ru/oldlinux.org/Linux.old/docs/interrupts/int-html/rb-7491.htm */
+            /* Doing nothing means it's not installed. */
+          } else {
+            goto fatal_uic;
+          }
         } else if (int_num == 0x00) {  /* Division by zero. */
           /* This is called only if the program doesn't override the interrupt vector.
            * Example instructions: `xor ax, ax', `div ax'.
