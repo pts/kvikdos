@@ -1740,9 +1740,9 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
 
     switch (run->exit_reason) {
      case KVM_EXIT_IO:
-      if (DEBUG) fprintf(stderr, "debug: IO port: port=0x%02x data=%04x size=%d direction=%d\n", run->io.port, *(int *)((char *)(run) + run->io.data_offset), run->io.size, run->io.direction);
-      sleep(1);
-      break;  /* Continue as if the in/out hasn't happened. */
+      fprintf(stderr, "fatal: IO port: port=0x%02x data=%08x size=%d direction=%s\n", run->io.port, *(unsigned *)((char *)(run) + run->io.data_offset), run->io.size, run->io.direction ? "out" : "in");
+      goto fatal;
+      /*break;*/  /* Continue as if the in/out hasn't happened. */
      case KVM_EXIT_SHUTDOWN:  /* How do we trigger it? */
       fprintf(stderr, "fatal: shutdown\n");
       exit(252);
