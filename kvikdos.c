@@ -479,7 +479,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     const unsigned headsize = (unsigned)exehdr[EXE_HDRSIZE] << 4;
     const unsigned image_size = exesize - headsize;
     unsigned memsize_min_para = (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MINALLOC];  /* This includes .bss after the image. Please note that this doesn't depend on exehdr[EXE_LASTSIZE]. Formula is same as in MS-DOS 6.22, FreeDOS 1.2, DOSBox 0.74-4. */
-    const unsigned memsize_max_para = (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MAXALLOC];
+    const unsigned memsize_max_para = (unsigned short)(exehdr[EXE_MAXALLOC] + 1) < 2 ? 0xffff : (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MAXALLOC];
     char * const image_addr = (char*)mem + (PSP_PARA << 4) + 0x100;
     const unsigned image_para = PSP_PARA + 0x10;
     unsigned reloc_count = exehdr[EXE_NRELOC];
