@@ -2495,6 +2495,13 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             } else {
               goto fatal_int;
             }
+          } else if (ah == 0x66) {  /* Get/set global code page. */
+            const unsigned char al = (unsigned char)regs.rax;
+            if (al == 1) {
+              *(unsigned short*)&regs.rbx = *(unsigned short*)&regs.rdx = 437;  /* CP-437: https://en.wikipedia.org/wiki/Code_page_437 */
+            } else {
+              goto fatal_int;
+            }
           } else {
             goto fatal_int;
            nonfatal_unknown_int_21_call:
