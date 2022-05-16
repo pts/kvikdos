@@ -2371,9 +2371,16 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)(dta + 0x18) = tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 1980) << 9;
               *(unsigned*)(dta + 0x1a) = (sizeof(st.st_size) > 4 && st.st_size >> (32 * (sizeof(st.st_size) > 4))) ?
                   0xffffffffU : st.st_size;  /* Cap file size at 0xffffffff, no way to return more than 32 bits. */
-              strcpy(dta + 0x1e, fnb);  /* Secure because of the strlen(fnb) check above. */
-              /* We use 0x1e + 13 == 0x2b bytes in dta. */
               if (DEBUG) fprintf(stderr, "debug: found Linux file: %s\n", fnb);
+              { const char *p = fnb;
+                char *q = dta + 0x1e, c;
+                do {  /* Secure because of the strlen(fnb) check above. */
+                  c = *p++;
+                  *q++ = c - 'a' + 0U <= 'z' - 'a' + 0U ? c - 32 : c;  /* Convert to uppercase. */
+                } while (c != '\0');
+                /*strcpy(dta + 0x1e, fnb);*/  /* Secure because of the strlen(fnb) check above. */
+                /* We use up to 0x1e + 13 == 0x2b bytes in dta. */
+              }
             }
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x4f) {  /* Find next matching file (findnext). */
