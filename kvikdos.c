@@ -1987,7 +1987,9 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             if (had_get_ints & 1 ||
                 get_int_num - 0x22 + 0U <= 0x24 - 0x22 + 0U ||  /* Microsoft BASIC Professional Development System 7.10 linker pblink.exe gets interrupt vector 0x24. */
                 get_int_num == 0x18 ||  /* TASM 3.2, used for memory allocation. */
-                get_int_num == 0x06) {  /* TLINK 4.0. */
+                get_int_num == 0x06 ||  /* TLINK 4.0. */
+                get_int_num == 0x67 ||  /* WLINK 7.0. */
+               0) {
               const unsigned short *pp = (const unsigned short*)((char*)mem + (get_int_num << 2));
               if (DEBUG) fprintf(stderr, "debug: get interrupt vector int:%02x is cs:%04x ip:%04x\n", get_int_num, pp[1], pp[0]);
               (*(unsigned short*)&regs.rbx) = pp[0];
