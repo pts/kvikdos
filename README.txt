@@ -283,6 +283,29 @@ Software compatibility, i.e. DOS programs known to work in kvikdos:
   installer in `udosrun -gui' or DOSBox, and then run the installed programs
   in kvikdos.)
 
+Protected mode support for running 32-bit DOS programs in kvikdos:
+
+* The CPU emulation in KVM makes it possible to switch to various types of
+  protected modes (16-bit and 32-bit data and code segments) and even 64-bit
+  long mode (not supported by most existing DOS programs).
+
+* However, to take advantage of protected modes, DOS extenders and/or DPMI
+  hosts are needed, and most of the existing ones don't run in kvikdos.
+
+* These programs work:
+
+  * flat assembler 1.73.30 fasmlite.exe.
+  * pmode.asm 3.07 example.exe.
+
+* Most existing 32-bit DOS programs don't work.
+
+* Currently programs running in kvikdos can use less than 640 KiB of memory,
+  and this also applies to protected mode. (This restriction should be easy
+  to lift.)
+
+* Currently there is no XMS, EMS, VCPI or DPMI support implemented in
+  kvikdos.
+
 Alternatives of kvikdos:
 
 * udosrun (unreleased): A wrapper around pts-fast-dosbox and DOSBox to run
