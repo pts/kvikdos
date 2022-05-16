@@ -2028,8 +2028,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               if (fstat(fd, &st) != 0) goto error_from_linux;
               if (al == 0) {  /* Get. */
                 *(unsigned short*)&regs.rdx = 1 << 5  /* binary */ | (S_ISCHR(st.st_mode) ? 1 : 0) << 7  /* character device */;
+                if (DEBUG) fprintf(stderr, "debug: ioctl get_device_info dos_fd=%d linux_fd=%d result=0x%04x\n", *(unsigned short*)&regs.rbx, fd, *(unsigned short*)&regs.rdx);
                 *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
               } else {
+                if (DEBUG) fprintf(stderr, "debug: ioctl get_device_info dos_fd=%d linux_fd=%d value=0x%04x\n", *(unsigned short*)&regs.rbx, fd, *(unsigned short*)&regs.rdx);
                 if (!S_ISCHR(st.st_mode)) goto error_invalid_drive;  /* We want to indicate that it's not a character device. */
                 /* TLIB 3.01 sets (dx & 0x80) to zero, to disable binary mode (and enable translation). */
                 /* We just ignore the setting. */
