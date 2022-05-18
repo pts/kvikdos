@@ -21,12 +21,13 @@ Requirements:
 
 Limitations:
 
-* kvikdos needs a Linux amd64 system with KVM. (Windows and macOS have
-  similar virtualization technologies, but kvikdos hasn't been ported to
-  them yet. Alternatively, on old Linux i386 systems, the vm86(2) system
-  call could be used, but that's not implemented in kvikdos either.)
-  macOS users should use udosrun insteda of kvikdos, others should use
-  DOSBox or DOSBox-X.
+* kvikdos needs a Linux i386 or amd64 system with KVM. It has been tested
+  and found working with both: Linux compiled for i386 and Linux compiled
+  for amd64. (Windows and macOS have similar virtualization technologies,
+  but kvikdos hasn't been ported to them yet.  Alternatively, on old Linux
+  i386 systems, the vm86(2) system call could be used, but that's not
+  implemented in kvikdos either.) macOS users should use udosrun instead of
+  kvikdos, others should use DOSBox or DOSBox-X.
 
 * kvikdos can run 16-bit DOS programs (written for the 8086, 186 or 286
   processors, but not 16-bit 286 protected mode), it can't run 32-bit DOS
