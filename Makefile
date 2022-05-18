@@ -4,7 +4,8 @@ MAKEFLAGS += -r
 
 ALL = kvikdos guest.com slowp.com malloct.com printenv.com cat.com waitkey.com
 
-CFLAGS = -ansi -pedantic -s -O2 -W -Wall -Wextra -Werror=implicit-function-declaration -Werror=int-conversion -fno-strict-aliasing -Wno-overlength-strings $(XCFLAGS)
+# -Werror=int-conversion: GCC 4.8.4 fails.
+CFLAGS = -ansi -pedantic -s -O2 -W -Wall -Wextra -Werror=implicit-function-declaration -fno-strict-aliasing -Wno-overlength-strings $(XCFLAGS)
 XCFLAGS =  # To be overridden from the command-line.
 
 SRCDEPS = kvikdos.c mini_kvm.h
