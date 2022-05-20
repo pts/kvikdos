@@ -1993,6 +1993,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             const int result = mkdir(get_linux_filename(p), 0755);
             if (result < 0) goto error_from_linux;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x3a) {  /* Remove subdirectory (rmdir). */
+            const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            const int result = rmdir(get_linux_filename(p));
+            if (result < 0) goto error_from_linux;
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x41) {  /* Delete file. */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             const int fd = unlink(get_linux_filename(p));
