@@ -2,6 +2,7 @@
 *.o
 *.com
 *.exe
-/host
-/host32
-/host64
+/kvikdos
+/kvikdos32
+/kvikdos64
+/kvikdos.static
