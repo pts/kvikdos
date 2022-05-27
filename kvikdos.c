@@ -1213,6 +1213,7 @@ static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, ch
       value_seg_ofs == *p ||  /* Unchanged. */
       value_seg_ofs == MAGIC_INT_VALUE(int_num) ||  /* Set back to original. */
       ((had_get_ints & 2) && int_num == 0x18) ||  /* TASM 3.2. */
+      ((had_get_ints & 2) && int_num == 0x00) ||  /* TASM 2.0 and 2.01, after set_int 0x23, set_int 0x18. */
       ((had_get_ints & 4) && int_num == 0x06) ||  /* TLINK 4.0. */
       ((had_get_ints & 1) && (int_num == 0x00 || int_num == 0x24 || int_num == 0x3f))  /* Turbo Pascal 7.0. */ ||
       ((had_get_ints & 1) && int_num == 0x75)  /* Microsoft QuickBASIC 4.50 compiler qbc.exe. */ ||
