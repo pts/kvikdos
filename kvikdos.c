@@ -2081,6 +2081,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               if (bl == 0) bl = dir_state->drive - 'A' + 1;
               if (bl > DRIVE_COUNT || !dir_state->linux_mount_dir[(int)bl - 1]) goto error_invalid_drive;
               *(unsigned char*)&regs.rax = bl > 2;  /* A: (1) and B: (2) are removable (0), C: (3) etc. aren't (1). */
+            } else if (al == 0x0a) {  /* Get whether handle is local or remote. */
+              const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
+              if (fd < 0) goto error_invalid_handle;
+              *(unsigned short*)&regs.rdx = 0;  /* Drive is local. */
             } else {
               fprintf(stderr, "fatal: unsupported DOS ioctl call: 0x%02x\n", al);
               goto fatal;
