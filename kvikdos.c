@@ -1216,6 +1216,7 @@ static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, ch
       ((had_get_ints & 2) && int_num == 0x00) ||  /* TASM 2.0 and 2.01, after set_int 0x23, set_int 0x18. */
       ((had_get_ints & 4) && int_num == 0x06) ||  /* TLINK 4.0. */
       ((had_get_ints & 1) && (int_num == 0x00 || int_num == 0x24 || int_num == 0x3f))  /* Turbo Pascal 7.0. */ ||
+      ((had_get_ints & 1) && (int_num == 0x04 || int_num == 0x05))  /* Watcom 10.0a bpatch.exe. */ ||
       ((had_get_ints & 1) && int_num == 0x75)  /* Microsoft QuickBASIC 4.50 compiler qbc.exe. */ ||
       ((had_get_ints & 1) && (int_num == 0x00 || int_num == 0x02 || int_num - 0x35 + 0U <= 0x3f - 0x35 + 0U))  /* Microsoft BASIC Professional Development System 7.10 compiler pbc.exe. */ ||
       ((had_get_ints & 8) && int_num - 0x34 + 0U <= 0x3d - 0x34 + 0U)  /* Microsoft Macro Assembler 1.10 masm.exe */ ||
