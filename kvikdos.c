@@ -1880,7 +1880,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rax = 0xf;  /* Invalid drive specified. */
               goto error_on_21;
             }
-            p0 = p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + *(unsigned short*)&regs.rdx;
+            p0 = p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + *(unsigned short*)&regs.rsi;
             pend = p + 63;
             s = dir_state->current_dir[dir_state->drive - 'A'];
             for (; *s != '\0' && p != pend; ++s, ++p) {
@@ -1888,6 +1888,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             }
             if (p != p0 && p[-1] == '/') --p;  /* Remove trailing '/'. */
             *p = '\0';  /* Silently truncate to 64 bytes. */
+            if (DEBUG) fprintf(stderr, "debug: get current directory on drive %c: (%s)\n", dir_state->drive, p0);
+            *(unsigned short*)&regs.rax = 0x100;  /* DOSBox 0.74-4 also does this. */
           } else if (ah == 0x3d || ah == 0x3c) {  /* Open to handle (open()). Create to handle (creat()). */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             const int flags = (ah == 0x3c) ? O_RDWR | O_CREAT | O_TRUNC :
