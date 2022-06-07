@@ -2470,13 +2470,16 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             (*(unsigned short*)&regs.rbx) = 0x80;
             SET_SREG(es, 0xfff0);
           } else if (ah == 0x29) {  /* Parse filename for FCB. */
-            /* Microsoft Macro Assembler 6.00B driver masm.exe. */
-            const unsigned char al = (unsigned char)regs.rax;
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rsi);  /* !! Security: check bounds. */
-            if (al == 1) {
-              if (*p != '\0' && *p != '\r') goto error_parse_filename;
-              /* Just do nothing. Returning al == 1 is fine. */
-            } else { error_parse_filename:
+            if (*p == '\0' || *p == '\r' || *p == '\n') {
+              char *q = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rdi);  /* !! Security: check bounds. */
+              /* al == 1, *p == '\r' in Microsoft Macro Assembler 6.00B driver masm.exe. */
+              /* al == 0, *p == '\n' in Power C 2.2.0 compiler pc.exe. */
+              *(unsigned char*)&regs.rax = 0;  /* No wildchar characters present. */
+              *q++ = '\0';  /* Drive: 0 is default. */
+              memset(q, ' ', 12);  /* Filename (8) and extension (3). */
+              /* Don't update SI. */
+            } else {
               fprintf(stderr, "fatal: unsupported parsing of filename: %s\n", p);  /* For ml.exe, this filename is completely broken, it starts with \r, also in DOSBox. */
               goto fatal_int;
             }
