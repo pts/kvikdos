@@ -2488,20 +2488,28 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             const char * const dos_filename = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             if (al == 0 || al == 3) {  /* Microsoft Macro Assembler 6.00B driver masm.exe uses it with al == 3. */
               const char * const params = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rbx);  /* !! Security: check bounds. */
-              const unsigned short load_para = *(unsigned short*)params;
+              const unsigned short load_para = al != 0 ? ((unsigned short*)params)[0] : 0;
               /*const unsigned short relocation_factor = *(unsigned short*)(params + 2);*/
-              char * const psp = (load_para >= PSP_PARA + 0x10 && load_para < DOS_ALLOC_PARA_LIMIT) ? (char*)mem + ((unsigned)(load_para - 0x10) << 4) : NULL;
-              const unsigned short env_para = psp ? *(const unsigned short*)(psp + 0x2c) : 0;
-              char * const env = (env_para >= PSP_PARA + 0x10 && env_para < DOS_ALLOC_PARA_LIMIT) ? (char*)mem + (env_para << 4) : NULL;
+              char * const psp = (al != 0 && load_para >= PSP_PARA + 0x10 && load_para < DOS_ALLOC_PARA_LIMIT) ? (char*)mem + ((unsigned)(load_para - 0x10) << 4) : NULL;
+              const unsigned short env_para = al == 0 ? (((unsigned short*)params)[0] ? ((unsigned short*)params)[0] : ENV_PARA) : psp ? *(const unsigned short*)(psp + 0x2c) : 0;
+              char * const env = ((al == 0 && env_para == ENV_PARA) || (env_para >= PSP_PARA + 0x10 && env_para < DOS_ALLOC_PARA_LIMIT)) ? (char*)mem + (env_para << 4) : NULL;
               const char *env_end = env ? env + (((PROGRAM_MCB_PARA - ENV_PARA < DOS_ALLOC_PARA_LIMIT - env_para) ? PROGRAM_MCB_PARA - ENV_PARA : DOS_ALLOC_PARA_LIMIT - env_para) << 4) : NULL;
-              const unsigned char args_size = psp ? (unsigned char)psp[0x80] : 0;
-              char * const args = psp ? psp + 0x81 : NULL;
+              char * const args = al == 0 ?  (char*)mem + (((unsigned short*)params)[2] << 4) + ((unsigned short*)params)[1] + 1  /* (args - 1) is Pascal string with terminating '\r'. */
+                                : psp ? psp + 0x81 : NULL;
+              const unsigned char args_size = args ? (unsigned char)args[-1] : 0;
+              const char is_args_ok = args && (
+                  (args_size < 0x7f && args[args_size] == '\r') ||
+                  (args_size == '\n' && args[0] == '\n' && args[1] == '.'));  /* Power C 2.2.0 compiler pc.exe. Copy all 128 bytes to new PSP. */
               char *new_env;
               char new_prog_drive;
               int reason;
-              if (!(env && args && args_size < 0x7f && args[args_size] == '\r' &&
+              if (!(env && is_args_ok &&
                     sregs.ds.selector + (*(unsigned short*)&regs.rdx >> 4) >= PSP_PARA)) {  /* So that dos_filename won't overlap new_env below. */
                 fprintf(stderr, "fatal: bounds check failed when loading program: %s\n", dos_filename);
+              }
+              if (al == 0) {
+                /* Power C 2.2.0 compiler pc.exe. */
+                fprintf(stderr, "fatal: unsupported exec with al:%02d: %s\n", al, dos_filename);
                 goto fatal_int;
               }
               args[args_size] = '\0';  /* It was '\r'. */
