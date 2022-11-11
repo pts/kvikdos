@@ -374,7 +374,7 @@ static int detect_dos_executable_program(int img_fd, const char *prog_filename, 
     /* Unix script #! shebang detected. */
     fprintf(stderr, "fatal: Unix scripts not supported: %s\n", prog_filename);
     exit(252);  /* TODO(pts): Run them natively, without setting up KVM. */
-  } else {  /* Otheerwise it's a DOS .com program, but only if it has .com extension. */
+  } else {  /* Otherwise it's a DOS .com program, but only if it has .com extension. */
     const char *ext = get_linux_ext(prog_filename);
     const size_t ext_size = strlen(ext) + 1;
     if (is_same_ascii_nocase(ext, "com", ext_size)) {  /* OK. */
