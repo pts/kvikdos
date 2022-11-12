@@ -1575,6 +1575,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   unsigned short last_dos_error_code;
   const char is_hlt_ok = emu_params->is_hlt_ok;
   char port_0x40_tick;
+  unsigned char video_write_step;
+  char video_byte_written;
 
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
   { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
@@ -1707,6 +1709,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   ongoing_set_int = 0;  /* No set_int operation ongoing. */
   last_dos_error_code = 0;
   port_0x40_tick = 0;
+  video_write_step = 0;
+  video_byte_written = 0;  /* Pacify uninitialized warnings. */
 
   if (DEBUG) dump_regs("debug", &regs, &sregs);
 
@@ -2612,6 +2616,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
           }
         } else if (int_num == 0x10) {  /* Video output. */
+          if (ah != 0x03 && ah != 0x02) video_write_step = 0;
           if (ah == 0x0e) {  /* Teletype output. */
             const char c = regs.rax;
             (void)!write(1, &c, 1);
@@ -2621,6 +2626,36 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             ((unsigned char*)&regs.rbx)[1] = 0;  /* BH := page (0). */
           } else if (ah == 0x08) {  /* Read character and attribute at cursor. */
             *(unsigned short*)&regs.rax = 0;  /* AH == attribute, AL == character. */
+          } else if (ah == 0x09 ||  /* Write Character and Attribute at Cursor Position (it does not move the cursor). */
+                     ah == 0x0a) {  /* Write Character Only at Current Cursor Position. */
+            const unsigned char page = *(unsigned short*)&regs.rbx >> 8;  /* Page in BH. */
+            if (page == 0) {
+              ++video_write_step;
+              video_byte_written = *(char*)&regs.rax;
+            }
+            /* TODO(pts): Record multiple characters (CX > 1). */
+          } else if (ah == 0x03) {  /* Read Cursor Position and Size. */
+            const unsigned char page = *(unsigned short*)&regs.rbx >> 8;  /* Page in BH. */
+            *(unsigned short*)&regs.rcx = *(unsigned short*)((char*)mem + 0x460);
+            *(unsigned short*)&regs.rdx = *((unsigned short*)((char*)mem + 0x450) + page);  /* DH := row (0..24); DL := column (0..79). Both 0 by default. */
+            if (page == 0 && video_write_step == 1) {
+              ++video_write_step;  /* = 2. */
+            } else {
+               video_write_step = 0;
+            }
+          } else if (ah == 0x02) {  /* Set Cursor position. */
+            const unsigned char page = *(unsigned short*)&regs.rbx >> 8;  /* Page in BH. */
+            unsigned short * const cursor_at_ptr = (unsigned short*)((char*)mem + 0x450) + page;
+            if (page == 0 && video_write_step == 2 && *cursor_at_ptr + 1 == *(unsigned short*)&regs.rdx) {  /* Move the cursor by 1 to the right. */
+              /* Write byte to stdout if it was written by int 0x10 (ah == 0x09 or ah == 0x0a), then ah == 0x03, then ah == 0x02.
+               * This is done by ASM32 1.1 assembler asm32.exe
+               */
+              (void)!write(1, &video_byte_written, 1);
+            }
+            video_write_step = 0;
+            if (page < 8) {
+               *cursor_at_ptr = *(unsigned short*)&regs.rdx;  /* DH := row; DL := column. */
+            }
           } else if (ah == 0x12) {  /* Video subsystem configuration. https://stanislavs.org/helppc/int_10-12.html */
             const unsigned char bl = (unsigned char)regs.rbx;
             if (bl == 0x10) {  /* Get video configuration information. */
