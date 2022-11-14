@@ -2109,7 +2109,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               if (DEBUG) fprintf(stderr, "debug: inplace_realloc bad block_para=0x%04x new_size_para=0x%04x\n", block_para, new_size_para);
              error_bad_mcb:
               /*fprintf(stderr, "fatal: bad MCB\n"); goto fatal;*/
-              *(unsigned short*)&regs.rax = 7;  /* Memory control blocks destroyed. */
+              *(unsigned short*)&regs.rax = 7;  /* Memory control blocks destroyed. */ /* !! anasm.com reports this. From where? */
               goto error_on_21;
             }
             if (DEBUG) fprintf(stderr, "debug: inplace_realloc block_para=0x%04x new_size_para=0x%04x\n", block_para, new_size_para);
