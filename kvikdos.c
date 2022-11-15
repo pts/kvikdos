@@ -2656,6 +2656,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             if (page < 8) {
                *cursor_at_ptr = *(unsigned short*)&regs.rdx;  /* DH := row; DL := column. */
             }
+          } else if (ah == 0x01) {  /* Set cursor type. */
+            *(unsigned short*)((char*)mem + 0x460) = *(unsigned short*)&regs.rcx;
           } else if (ah == 0x12) {  /* Video subsystem configuration. https://stanislavs.org/helppc/int_10-12.html */
             const unsigned char bl = (unsigned char)regs.rbx;
             if (bl == 0x10) {  /* Get video configuration information. */
