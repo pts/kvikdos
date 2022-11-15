@@ -1577,6 +1577,9 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   char port_0x40_tick;
   unsigned char video_write_step;
   char video_byte_written;
+  const char *stdout_write_p;
+  const char *stdout_write_end;
+  char is_stdout_write_cursor;
 
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
   { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
@@ -1591,6 +1594,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   if (!dos_prog_abs) dos_prog_abs = "";
   if (dos_prog_abs[0] == '\0') dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
   dir_state->dos_prog_abs = NULL;  /* For security, use dos_prog_abs mapping only for read-only opens below. */
+
+  video_write_step = 0;
+  video_byte_written = 0;  /* Pacify uninitialized warnings. */
+  stdout_write_p = NULL;  /* Pacify uninitialized warnings. */
+  stdout_write_end = NULL;  /* Pacify uninitialized warnings. */
 
  do_exec:
   header_size = detect_dos_executable_program(img_fd, prog_filename, header);
@@ -1709,8 +1717,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   ongoing_set_int = 0;  /* No set_int operation ongoing. */
   last_dos_error_code = 0;
   port_0x40_tick = 0;
-  video_write_step = 0;
-  video_byte_written = 0;  /* Pacify uninitialized warnings. */
+  is_stdout_write_cursor = 0;
 
   if (DEBUG) dump_regs("debug", &regs, &sregs);
 
@@ -1768,8 +1775,26 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         (void)ah;
         /* Documentation about DOS and BIOS int calls: https://stanislavs.org/helppc/idx_interrupt.html */
         if (int_num == 0x29) {
-          const char c = regs.rax;
-          (void)!write(1, &c, 1);
+         do_stdout_write_al:
+          stdout_write_p = (const char*)&regs.rax;
+         do_stdout_write1:
+          stdout_write_end = stdout_write_p + 1;
+         do_stdout_write:
+          if (is_stdout_write_cursor) {
+            const char *p = stdout_write_p;
+            unsigned short *cursor = (unsigned short*)((char*)mem + 0x450) + 0 /* page */;  /* DH := row (0..24); DL := column (0..79). Both 0 by default. */
+            if (*cursor <= 0xff) {
+              while (p != stdout_write_end) {
+                const char c = *p++;
+                if (c - 32U <= 126U - 32U && *cursor < 0xff) {  /* Printable ASCII. Avoid control characters and non-ASCII UTF-8. */
+                  ++*cursor;
+                } else {
+                  *cursor = 0;
+                }
+              }
+            }
+          }
+          (void)!write(1, stdout_write_p, stdout_write_end - stdout_write_p);
         } else if (int_num == 0x20) {
           return 0;  /* EXIT_SUCCESS. */
         } else if (int_num == 0x21) {  /* DOS file and memory sevices. */
@@ -1777,11 +1802,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           if (ah == 0x4c) {
             return (unsigned char)regs.rax;
           } else if (ah == 0x06) {  /* Direct console I/O. */
-            char c;
            func_0x06:
-            c = (unsigned char)regs.rdx;
             if ((unsigned char)regs.rdx != 0xff) {  /* Output. */
-              (void)!write(1, &c, 1);
+              stdout_write_p = (const char*)&regs.rdx;
+              goto do_stdout_write1;
             } else {  /* Input. */
               unsigned short result_ax;
               process_key(tty_state, 1, &result_ax, (unsigned short*)&regs.rflags);  /* Check availability without reading. */
@@ -1800,8 +1824,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             process_key(tty_state, 0, &result_ax, (unsigned short*)&regs.rflags);  /* Read. */
             *(unsigned char*)&regs.rax = (unsigned char)result_ax;  /* Return only the keycode. */
           } else if (ah == 0x02) {  /* Display output. */
-            const char c = (unsigned char)regs.rdx;
-            (void)!write(1, &c, 1);
+              stdout_write_p = (const char*)&regs.rdx;
+              goto do_stdout_write1;
           } else if (ah == 0x04) {  /* Output to STDAUX. */
             const char c = (unsigned char)regs.rdx;
             (void)!write(2, &c, 1);  /* Emulate STDAUX with stderr. */
@@ -1863,7 +1887,9 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 exit(252);
               }
             }
-            (void)!write(1, p + dx0, dx - dx0);
+            stdout_write_p = p + dx0;
+            stdout_write_end = p + dx;
+            goto do_stdout_write;
           } else if (ah == 0x2c) {  /* Get time. */
             time_t ts = time(0);
             struct tm *tm = localtime(&ts);
@@ -2618,8 +2644,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         } else if (int_num == 0x10) {  /* Video output. */
           if (ah != 0x03 && ah != 0x02) video_write_step = 0;
           if (ah == 0x0e) {  /* Teletype output. */
-            const char c = regs.rax;
-            (void)!write(1, &c, 1);
+            goto do_stdout_write_al;
           } else if (ah == 0x0f) {  /* Get video state. https://stanislavs.org/helppc/int_10-f.html */
             sphinx_cmm_flags |= 1;
             *(unsigned short*)&regs.rax = 80 << 8 | 3;  /* 80x25. */
@@ -2638,19 +2663,42 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             const unsigned char page = *(unsigned short*)&regs.rbx >> 8;  /* Page in BH. */
             *(unsigned short*)&regs.rcx = *(unsigned short*)((char*)mem + 0x460);
             *(unsigned short*)&regs.rdx = *((unsigned short*)((char*)mem + 0x450) + page);  /* DH := row (0..24); DL := column (0..79). Both 0 by default. */
-            if (page == 0 && video_write_step == 1) {
-              ++video_write_step;  /* = 2. */
-            } else {
-               video_write_step = 0;
+            if (page == 0) {
+              if (!is_stdout_write_cursor) {
+                *(unsigned short*)&regs.rdx = *(unsigned short*)((char*)mem + 0x450) = 1;  /* Report nonzero column, so subsequent "\x08" in ah == 0x2 (Set cursor position) would work. */
+                is_stdout_write_cursor = 1;
+              }
+              if (video_write_step == 1) {
+                ++video_write_step;  /* = 2. */
+              } else {
+                 video_write_step = 0;
+              }
             }
-          } else if (ah == 0x02) {  /* Set Cursor position. */
+          } else if (ah == 0x02) {  /* Set cursor position. */
             const unsigned char page = *(unsigned short*)&regs.rbx >> 8;  /* Page in BH. */
             unsigned short * const cursor_at_ptr = (unsigned short*)((char*)mem + 0x450) + page;
-            if (page == 0 && video_write_step == 2 && *cursor_at_ptr + 1 == *(unsigned short*)&regs.rdx) {  /* Move the cursor by 1 to the right. */
-              /* Write byte to stdout if it was written by int 0x10 (ah == 0x09 or ah == 0x0a), then ah == 0x03, then ah == 0x02.
-               * This is done by ASM32 1.1 assembler asm32.exe
-               */
-              (void)!write(1, &video_byte_written, 1);
+            if (page == 0) {
+              is_stdout_write_cursor = 1;
+              if (video_write_step == 2 && *cursor_at_ptr + 1 == *(unsigned short*)&regs.rdx) {  /* Move the cursor by 1 to the right. */
+                /* Write byte to stdout if it was written by int 0x10 (ah == 0x09 or ah == 0x0a), then ah == 0x03, then ah == 0x02.
+                 * This is done by ASM32 1.1 assembler asm32.exe
+                 */
+                stdout_write_p = &video_byte_written;
+                goto do_stdout_write1;
+              }
+              if (*(unsigned short*)&regs.rdx <= 0xff && *cursor_at_ptr <= 0xff) {
+                if (*(unsigned short*)&regs.rdx == 0) {
+                  (void)!write(1, "\r", 1);  /* On Linux, move to the beginning of the line. */
+                } else if (*(unsigned short*)&regs.rdx < *cursor_at_ptr) {
+                  unsigned count = *cursor_at_ptr - *(unsigned short*)&regs.rdx;
+                  const char * const backs = "\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08";  /* Works on TERM=xterm and TERM=linux. */
+                  while (count > 0x10) {
+                    (void)!write(1, backs, 0x10);
+                    count -= 0x10;
+                  }
+                  (void)!write(1, backs, count);
+                }
+              }
             }
             video_write_step = 0;
             if (page < 8) {
