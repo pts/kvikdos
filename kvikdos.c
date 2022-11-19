@@ -1970,6 +1970,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rax = get_dos_error_code(errno, 0x1f);  /* By default: General failure. */
               goto error_on_21;
             }
+            /*dup2(fd, 20); close(fd); fd = 20;*/  /* !!! TODO(pts): This breaks .exe files created by `owcc -bdos', which allows fs <= 20. Do some fd remapping. */
            after_open:
             if (fd < 5) fd = ensure_fd_is_at_least(fd, 5);  /* Skip the first 5 DOS standard handles. */
             if ((fd + 0U) >> 16) {
