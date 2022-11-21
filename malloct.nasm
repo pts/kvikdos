@@ -2,7 +2,7 @@
 ; malloct.nasm: a DOS program doing test calls of malloc, inplace_realloc and free
 ; by pts@fazekas.hu at Mon Apr 25 11:36:41 CEST 2022
 ;
-; This program works in DOSBox 0.74, MS-DOS 6.22 ad kvikdos.
+; This program works in DOSBox 0.74, MS-DOS 6.22 and kvikdos.
 ;
 
 bits 16
