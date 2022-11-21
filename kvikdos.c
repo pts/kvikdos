@@ -8,7 +8,7 @@
  * TODO(pts): Optionally, find Linux filenames and the dirname in both lowercase and uppercase, like DOSBox.
  * TODO(pts): Make unp_4.11/unp.exe work.
  * TODO(pts): DOS STDERR to Linux fd 1 (stdout) mapping. DOSBox doesn't do this.
- * TODO(pts): Turbo C, Turbo C++ and Borland C++ compatibility.
+ * TODO(pts): Turbo C compatibility
  * TODO(pts): udosrun integration.
  * TODO(pts): udosrun command-line flag compatibility.
  * TODO(pts): Run Linux ELF programs and scripts (#!), for convenience.
@@ -51,6 +51,10 @@
 
 #ifndef DEBUG_ALLOC
 #define DEBUG_ALLOC 0
+#endif
+
+#ifndef DEBUG_INTVEC
+#define DEBUG_INTVEC 0
 #endif
 
 #if 0  /* We don't use ROM and BIOS area and then XMS above DOS_MEM_LIMIT, we just map DOS_MEM_LIMIT. */
@@ -1209,15 +1213,17 @@ static char *find_prog_on_path(const char *prog_filename, const DirState *dir_st
  */
 static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, char had_get_ints) {
   unsigned * const p = (unsigned*)mem + int_num;
-  if (DEBUG) {
+  if (DEBUG || DEBUG_INTVEC) {
     fprintf(stderr, "debug: set interrupt vector int:%02x to cs:%04x ip:%04x\n",
             int_num, (unsigned short)(value_seg_ofs >> 16), (unsigned short)value_seg_ofs);
   }
+  /* !!! TODO(pts): Make the default permissive in general, and enable these protections only on a flag. */
   if (int_num - 0x22 + 0U <= 0x24 - 022 +0U ||  /* Application Ctrl-<Break> handler == 0x23. We allow 0x22..0x24. */
       value_seg_ofs == *p ||  /* Unchanged. */
       value_seg_ofs == MAGIC_INT_VALUE(int_num) ||  /* Set back to original. */
       ((had_get_ints & 2) && int_num == 0x18) ||  /* TASM 3.2. */
       ((had_get_ints & 2) && int_num == 0x00) ||  /* TASM 2.0 and 2.01, after set_int 0x23, set_int 0x18. */
+      ((had_get_ints & 2) && (int_num == 0x1b || int_num == 0x3f)) ||  /* Borland Turbo C++ 1.01 compiler tcc.exe (no `& 8'), Borland C++ 2.0 complier bcc.exe (has also `& 8') */
       ((had_get_ints & 4) && int_num == 0x06) ||  /* TLINK 4.0. */
       ((had_get_ints & 1) && (int_num == 0x00 || int_num == 0x24 || int_num == 0x3f))  /* Turbo Pascal 7.0. */ ||
       ((had_get_ints & 1) && (int_num == 0x04 || int_num == 0x05))  /* Watcom 10.0a bpatch.exe. */ ||
@@ -1841,6 +1847,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             (void)!write(1, &c, 1);  /* Emulate STDPRN with stdout. */
           } else if (ah == 0x30) {  /* Get DOS version number. */
             const unsigned char al = (unsigned char)regs.rax;
+            if (DEBUG || DEBUG_INTVEC) fprintf(stderr, "debug: get DOS version\n");
             had_get_ints |= 8;
             *(unsigned short*)&regs.rax = 5 | 0 << 8;  /* 5.0. */
             *(unsigned short*)&regs.rbx = al == 1 ? 0x1000 :  /* DOS in HMA. */
@@ -2057,18 +2064,20 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             if (set_int((unsigned char)regs.rax, *(unsigned short*)&regs.rdx | sregs.ds.selector << 16, mem, had_get_ints)) goto fatal;
           } else if (ah == 0x35) {  /* Get interrupt vector. */
             const unsigned char get_int_num = (unsigned char)regs.rax;
-            if (DEBUG) fprintf(stderr, "debug: get interrupt vector int:%02x\n", get_int_num);
+            if (DEBUG || DEBUG_INTVEC) fprintf(stderr, "debug: get interrupt vector int:%02x\n", get_int_num);
             if (get_int_num == 0) had_get_ints |= 1;  /* Turbo Pascal 7.0 programs start with this. */
-            if (get_int_num == 0x18) had_get_ints |= 2;  /* TASM 3.2, for memory allocation. */
+            if (get_int_num == 0x18) had_get_ints |= 2;  /* TASM 3.2, Borland C++ 2.0 compiler bcc.exe for memory allocation. */
             if (get_int_num == 0x06) had_get_ints |= 4;  /* TLINK 4.0. */
             if ((had_get_ints & 8) && get_int_num == 0x34) had_get_ints |= 0x10;  /* JWasm 2.11a jwasmr.exe */
 
+            /* !!! TODO(pts): Make the default permissive in general, and enable these protections only on a flag. */
             if ((had_get_ints & 1) ||
                 get_int_num - 0x22 + 0U <= 0x24 - 0x22 + 0U ||  /* Microsoft BASIC Professional Development System 7.10 linker pblink.exe gets interrupt vector 0x24. */
                 get_int_num == 0x18 ||  /* TASM 3.2, used for memory allocation. */
                 get_int_num == 0x06 ||  /* TLINK 4.0. */
                 get_int_num == 0x67 ||  /* WLINK 7.0. */
                 ((had_get_ints & 0x10) && (get_int_num - 0x34 + 0U <= 0x3d - 0x34 + 0U || get_int_num == 0x02 || get_int_num == 0x1b)) ||  /* JWasm 2.11a jwasmr.exe */
+                ((had_get_ints & 2) && (get_int_num == 0x1b || get_int_num == 0x3f)) ||  /* Borland Turbo C++ 1.01 compiler tcc.exe, Borland C++ 2.0 complier bcc.exe */
                0) {
               const unsigned short *pp = (const unsigned short*)((char*)mem + (get_int_num << 2));
               if (DEBUG) fprintf(stderr, "debug: get interrupt vector int:%02x is cs:%04x ip:%04x\n", get_int_num, pp[1], pp[0]);
@@ -2560,7 +2569,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rax = 1;  /* Best fit. */
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             } else if (al == 0x01) {  /* Set. */
-              /* Programs compiled by Borland C++ 5.02 bcc.exe set it with BX == MS_LAST_FIT, and return ``Out of memory'' if not implemented correctly. */
+              /* Programs compiled by Borland C++ 5.02 compiler bcc.exe set it with BX == MS_LAST_FIT, and return ``Out of memory'' if not implemented correctly. */
               /* See mallocs.nasm for a test of MS_LAST_FIT functionality. */
               *(unsigned short*)&regs.rax = *(unsigned short*)&regs.rbx;
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
