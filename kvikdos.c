@@ -768,6 +768,7 @@ static int get_linux_handle(unsigned short handle, const struct kvm_fds *kvm_fds
 
 #define DRIVE_COUNT 6
 
+/* A relatively small struct, no string buffers. */
 typedef struct DirState {
   char drive;  /* 'A', 'B', 'C', 'D', ... ('A' + DRIVE_COUNT - 1). */
   char current_dir[DRIVE_COUNT][1];  /* Currently mostly unused. */ /*char current_dir[DRIVE_COUNT][128];*/  /* In DOS syntax. Ends with \, unless empty. If current_dir[2] is FOO\BAR\, then it corresponds to C:\FOO\BAR. */
@@ -3282,16 +3283,22 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
   return exit_code;
 }
 
-static int parse_args_and_run_dos(char **argv, const char *pre_msg, const char *usage_extra, const char *post_msg) {
+typedef struct ParsedCmdArgs {
+  const char *prog_filename;
+  EmuParams emu_params;
+  DirState dir_state;
+  TtyState tty_state;
+  const char* const *args;  /* NULL-terminated list of NUL-terminated strings. Overlaps the program main(...) argv. */
+  const char* const *envp0;  /* NULL-terminated list of NUL-terminated strings. Overlaps the program main(...) argv. */
+} ParsedCmdArgs;
+
+static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const char *pre_msg, const char *usage_extra, const char *post_msg) {
+  ParsedCmdArgs cmd_args;
   const char *argv0;
   char is_drive_specified;
   char prog_filename_type;
-  const char *prog_filename;
   char *prog_name_arg;
-  DirState dir_state;
   char **envp0, **envp;
-  TtyState tty_state;
-  EmuParams emu_params;
   const char *dos_path;
   char dos_prog_drive;
 
@@ -3314,22 +3321,22 @@ static int parse_args_and_run_dos(char **argv, const char *pre_msg, const char *
 
   { unsigned u;
     for (u = 0; u < DRIVE_COUNT; ++u) {
-      dir_state.current_dir[u][0] = '\0';
-      dir_state.linux_mount_dir[u] = NULL;
+      cmd_args.dir_state.current_dir[u][0] = '\0';
+      cmd_args.dir_state.linux_mount_dir[u] = NULL;
     }
-    dir_state.drive = 'C';
-    dir_state.dos_prog_abs = NULL;
-    dir_state.linux_mount_dir['C' - 'A'] = fnbuf;  /* Placeholder for default. */
-    dir_state.linux_mount_dir['D' - 'A'] = fnbuf;  /* Placeholder for default. */
-    dir_state.linux_mount_dir['E' - 'A'] = fnbuf;  /* Placeholder for default. */
-    memset(dir_state.case_mode, CASE_MODE_UNSPECIFIED, DRIVE_COUNT);
+    cmd_args.dir_state.drive = 'C';
+    cmd_args.dir_state.dos_prog_abs = NULL;
+    cmd_args.dir_state.linux_mount_dir['C' - 'A'] = fnbuf;  /* Placeholder for default. */
+    cmd_args.dir_state.linux_mount_dir['D' - 'A'] = fnbuf;  /* Placeholder for default. */
+    cmd_args.dir_state.linux_mount_dir['E' - 'A'] = fnbuf;  /* Placeholder for default. */
+    memset(cmd_args.dir_state.case_mode, CASE_MODE_UNSPECIFIED, DRIVE_COUNT);
   }
 
   envp = envp0 = ++argv;
-  tty_state.tty_in_fd = -1;
-  tty_state.is_tty_in_error = 0;
-  tty_state.next_fake_key = fake_keys;
-  emu_params.is_hlt_ok = 0;
+  cmd_args.tty_state.tty_in_fd = -1;
+  cmd_args.tty_state.is_tty_in_error = 0;
+  cmd_args.tty_state.next_fake_key = fake_keys;
+  cmd_args.emu_params.is_hlt_ok = 0;
   is_drive_specified = 0;
   while (argv[0]) {
     char *arg = *argv++;
@@ -3338,7 +3345,7 @@ static int parse_args_and_run_dos(char **argv, const char *pre_msg, const char *
     } else if (arg[1] == '-' && arg[2] == '\0') {
       break;
     } else if (0 == strcmp(arg, "--hlt-ok")) {
-      emu_params.is_hlt_ok = 1;
+      cmd_args.emu_params.is_hlt_ok = 1;
     } else if (0 == strcmp(arg, "--env")) {
       if (!argv[0]) { missing_argument:
         fprintf(stderr, "fatal: missing argument for flag: %s\n", arg);
@@ -3359,7 +3366,7 @@ static int parse_args_and_run_dos(char **argv, const char *pre_msg, const char *
       if (!argv[0]) goto missing_argument;
       arg = *argv++;
      do_prog:
-      dir_state.dos_prog_abs = arg;
+      cmd_args.dir_state.dos_prog_abs = arg;
     } else if (0 == strncmp(arg, "--prog=", 7)) {
       arg += 7;
       goto do_prog;
@@ -3399,8 +3406,8 @@ static int parse_args_and_run_dos(char **argv, const char *pre_msg, const char *
             }
           }
         }
-        dir_state.linux_mount_dir[(int)drive_idx] = arg;  /* argv retains ownership of arg. */
-        dir_state.case_mode[(int)drive_idx] = case_mode;
+        cmd_args.dir_state.linux_mount_dir[(int)drive_idx] = arg;  /* argv retains ownership of arg. */
+        cmd_args.dir_state.case_mode[(int)drive_idx] = case_mode;
       }
     } else if (0 == strncmp(arg, "--mount=", 8)) {
       arg += 8;
@@ -3413,7 +3420,7 @@ static int parse_args_and_run_dos(char **argv, const char *pre_msg, const char *
         fprintf(stderr, "fatal: drive argument must be <drive>:, <drive> must be A .. %c: %s\n", 'A' + DRIVE_COUNT - 1, arg);
         exit(1);
       }
-      dir_state.drive = arg[0] & ~32;
+      cmd_args.dir_state.drive = arg[0] & ~32;
       is_drive_specified = 1;
     } else if (0 == strncmp(arg, "--drive=", 8)) {
       arg += 8;
@@ -3423,12 +3430,12 @@ static int parse_args_and_run_dos(char **argv, const char *pre_msg, const char *
       if (!argv[0]) goto missing_argument;
       arg = *argv++;
      do_tty_in:
-      if (sscanf(arg, "%d%n", &tty_state.tty_in_fd, &char_count) < 1 || char_count + 0U != strlen(arg) || tty_state.tty_in_fd < -3) {
+      if (sscanf(arg, "%d%n", &cmd_args.tty_state.tty_in_fd, &char_count) < 1 || char_count + 0U != strlen(arg) || cmd_args.tty_state.tty_in_fd < -3) {
         /* -1: use /dev/tty; -2: use 0 (stdin), but don't try to disable buffering; -3: fake keys in round-robin. */
         fprintf(stderr, "fatal: tty-in argument must be nonnegative integer or -1, -2 or -3: %s\n", arg);
         exit(1);
       }
-      /* Now we've set tty_state.tty_in_fd. */
+      /* Now we've set cmd_args.tty_state.tty_in_fd. */
     } else if (0 == strncmp(arg, "--tty-in=", 9)) {
       arg += 9;
       goto do_tty_in;
@@ -3455,11 +3462,11 @@ static int parse_args_and_run_dos(char **argv, const char *pre_msg, const char *
   /* Remaining arguments in argv will be passed to the DOS program in PSP:0x80. */
   dos_path = getenv_prefix("PATH=", (char const**)envp0, (char const**)envp);
 
-  if (dir_state.linux_mount_dir['C' - 'A'] == fnbuf) {  /* Set to current directory in Linux. */
-    dir_state.linux_mount_dir['C' - 'A'] = "";  /* Either --mount=C:. (uppercase) or --mount=C-. (lowercase). */
-    /*if (dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED) { ... }*/  /* Will be changed below. */
+  if (cmd_args.dir_state.linux_mount_dir['C' - 'A'] == fnbuf) {  /* Set to current directory in Linux. */
+    cmd_args.dir_state.linux_mount_dir['C' - 'A'] = "";  /* Either --mount=C:. (uppercase) or --mount=C-. (lowercase). */
+    /*if (cmd_args.dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED) { ... }*/  /* Will be changed below. */
   }
-  if (dir_state.linux_mount_dir['D' - 'A'] == fnbuf) {  /* Set to emulator directory (based on argv0). !! Process readlink(2). */
+  if (cmd_args.dir_state.linux_mount_dir['D' - 'A'] == fnbuf) {  /* Set to emulator directory (based on argv0). !! Process readlink(2). */
     const char *p_base = skip_dot_slash(argv0), *p = p_base + strlen(p_base);
     size_t size;
     for (; p != p_base && p[-1] != '/'; --p) {}
@@ -3470,8 +3477,8 @@ static int parse_args_and_run_dos(char **argv, const char *pre_msg, const char *
     memcpy(argv0_fnbuf, p_base, size);  /* Empty or ends with slash. */
     argv0_fnbuf[size] = '\0';
     remove_duplicate_slashes(argv0_fnbuf);
-    dir_state.linux_mount_dir['D' - 'A'] = argv0_fnbuf;  /* Either --mount=C:. (uppercase) or --mount=C-. (lowercase). */
-    /*if (dir_state.case_mode['D' - 'A'] == CASE_MODE_UNSPECIFIED) { ... }*/  /* Will be changed below. */
+    cmd_args.dir_state.linux_mount_dir['D' - 'A'] = argv0_fnbuf;  /* Either --mount=C:. (uppercase) or --mount=C-. (lowercase). */
+    /*if (cmd_args.dir_state.case_mode['D' - 'A'] == CASE_MODE_UNSPECIFIED) { ... }*/  /* Will be changed below. */
   }
   dos_prog_drive = '\0';
 
@@ -3479,14 +3486,14 @@ static int parse_args_and_run_dos(char **argv, const char *pre_msg, const char *
   if (prog_filename_type == PFT_LINUX) {
     prog_name_arg = (char*)skip_dot_slash(prog_name_arg);
     remove_duplicate_slashes(prog_name_arg);
-    prog_filename = prog_name_arg;
-    if (dir_state.linux_mount_dir['E' - 'A'] == fnbuf) {  /* If not explicitly mounted, mount E: to the directory of prog_filename.  */
+    cmd_args.prog_filename = prog_name_arg;
+    if (cmd_args.dir_state.linux_mount_dir['E' - 'A'] == fnbuf) {  /* If not explicitly mounted, mount E: to the directory of prog_filename.  */
       const char *p = prog_name_arg + strlen(prog_name_arg), *q;
       size_t q_size;
       for (; p != prog_name_arg && p[-1] != '/'; --p) {}
       for (q = p; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
-      if (dir_state.case_mode['E' - 'A'] == CASE_MODE_UNSPECIFIED) {
-        dir_state.case_mode['E' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;  /* Mount as lowercase iff the executable program name has at least one lowercase character. */
+      if (cmd_args.dir_state.case_mode['E' - 'A'] == CASE_MODE_UNSPECIFIED) {
+        cmd_args.dir_state.case_mode['E' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;  /* Mount as lowercase iff the executable program name has at least one lowercase character. */
       }
       q = prog_name_arg;
       while (q != p && q[0] == '.' && q[1] == '/') {  /* Skip ./ at the beginning. */
@@ -3498,48 +3505,48 @@ static int parse_args_and_run_dos(char **argv, const char *pre_msg, const char *
         exit(252);
       }
       memcpy(fnbuf, q, q_size);  /* Including the trailing '\0'. */
-      prog_filename = fnbuf;
+      cmd_args.prog_filename = fnbuf;
       *(char*)p = '\0';  /* Modify it in place in argv. */
-      dir_state.linux_mount_dir['E' - 'A'] = q;  /* Empty or ends with '/'. */
+      cmd_args.dir_state.linux_mount_dir['E' - 'A'] = q;  /* Empty or ends with '/'. */
       dos_prog_drive = 'E';
-      if (!is_drive_specified && !dir_state.linux_mount_dir[dir_state.drive - 'A']) dir_state.drive = 'E';
+      if (!is_drive_specified && !cmd_args.dir_state.linux_mount_dir[cmd_args.dir_state.drive - 'A']) cmd_args.dir_state.drive = 'E';
     }
-    if (dir_state.case_mode['D' - 'A'] == CASE_MODE_UNSPECIFIED && dir_state.linux_mount_dir['D' - 'A']) {
-      dir_state.case_mode['D' - 'A'] = get_case_mode_from_last_component(prog_filename);  /* Mount as lowercase iff the executable program has at least one lowercase character. */
+    if (cmd_args.dir_state.case_mode['D' - 'A'] == CASE_MODE_UNSPECIFIED && cmd_args.dir_state.linux_mount_dir['D' - 'A']) {
+      cmd_args.dir_state.case_mode['D' - 'A'] = get_case_mode_from_last_component(cmd_args.prog_filename);  /* Mount as lowercase iff the executable program has at least one lowercase character. */
     }
-    /* We will set dir_state.case_mode['C' - 'A'] later. */
+    /* We will set cmd_args.dir_state.case_mode['C' - 'A'] later. */
   } else {
-    if (dir_state.linux_mount_dir['E' - 'A'] == fnbuf) dir_state.linux_mount_dir['E' - 'A'] = NULL;  /* Drive E: not mounted by default. */
-    if (prog_filename_type == PFT_PATH && !dos_path && dir_state.drive == 'C' && dir_state.linux_mount_dir['C' - 'A'] && dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED) {  /* Just a command without a filename extension, e.g. "guest" or "GUEST". */
-      dir_state.case_mode['C' - 'A'] = get_case_mode_from_last_component(prog_name_arg);
+    if (cmd_args.dir_state.linux_mount_dir['E' - 'A'] == fnbuf) cmd_args.dir_state.linux_mount_dir['E' - 'A'] = NULL;  /* Drive E: not mounted by default. */
+    if (prog_filename_type == PFT_PATH && !dos_path && cmd_args.dir_state.drive == 'C' && cmd_args.dir_state.linux_mount_dir['C' - 'A'] && cmd_args.dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED) {  /* Just a command without a filename extension, e.g. "guest" or "GUEST". */
+      cmd_args.dir_state.case_mode['C' - 'A'] = get_case_mode_from_last_component(prog_name_arg);
     }
     { char drive;
       for (drive = 'C'; drive <= 'E'; ++drive) {
-        if (dir_state.case_mode[drive - 'A'] == CASE_MODE_UNSPECIFIED && dir_state.linux_mount_dir[drive - 'A']) {
-          dir_state.case_mode[drive - 'A'] = CASE_MODE_UPPERCASE;
+        if (cmd_args.dir_state.case_mode[drive - 'A'] == CASE_MODE_UNSPECIFIED && cmd_args.dir_state.linux_mount_dir[drive - 'A']) {
+          cmd_args.dir_state.case_mode[drive - 'A'] = CASE_MODE_UPPERCASE;
         }
       }
     }
-    /* dir_state.linux_mount_dir[...] and dir_state.case_mode[...] are used below. */
+    /* cmd_args.dir_state.linux_mount_dir[...] and cmd_args.dir_state.case_mode[...] are used below. */
     if (prog_filename_type == PFT_DOS) {
-      prog_filename = get_linux_filename_r(prog_name_arg, &dir_state, fnbuf, NULL);  /* Return value is fnbuf. */
-      if (*prog_filename == '\0') {
+      cmd_args.prog_filename = get_linux_filename_r(prog_name_arg, &cmd_args.dir_state, fnbuf, NULL);  /* Return value is fnbuf. */
+      if (*cmd_args.prog_filename == '\0') {
         fprintf(stderr, "fatal: <dos-executable-file> is not a valid DOS pathname or contains an invalid drive: %s\n", prog_name_arg);
         exit(252);
       }
     } else if (prog_filename_type == PFT_PATH) {
-      if (dir_state.linux_mount_dir['E' - 'A'] == fnbuf) dir_state.linux_mount_dir['E' - 'A'] = NULL;  /* Drive E: not mounted by default. */
-      prog_filename = get_linux_filename_r(prog_name_arg, NULL /* dir_state */, fnbuf, NULL);  /* Return value is fnbuf. */
-      if (*prog_filename == '\0') {
+      if (cmd_args.dir_state.linux_mount_dir['E' - 'A'] == fnbuf) cmd_args.dir_state.linux_mount_dir['E' - 'A'] = NULL;  /* Drive E: not mounted by default. */
+      cmd_args.prog_filename = get_linux_filename_r(prog_name_arg, NULL /* cmd_args.dir_state */, fnbuf, NULL);  /* Return value is fnbuf. */
+      if (*cmd_args.prog_filename == '\0') {
         fprintf(stderr, "fatal: <dos-executable-file> is not a valid DOS filename: %s\n", prog_name_arg);
         exit(252);
       }
-      prog_filename = find_prog_on_path(prog_name_arg, &dir_state, dos_path, &dos_prog_drive);  /* Return value is fnbuf or NULL. */
-      if (!prog_filename) {
-        fprintf(stderr, "fatal: DOS command not found on %c:\\ or %%PATH%%: %s\n", dir_state.drive, prog_name_arg);
+      cmd_args.prog_filename = find_prog_on_path(prog_name_arg, &cmd_args.dir_state, dos_path, &dos_prog_drive);  /* Return value is fnbuf or NULL. */
+      if (!cmd_args.prog_filename) {
+        fprintf(stderr, "fatal: DOS command not found on %c:\\ or %%PATH%%: %s\n", cmd_args.dir_state.drive, prog_name_arg);
         exit(252);
       }
-      if (*prog_filename == '\0') {
+      if (*cmd_args.prog_filename == '\0') {
         fprintf(stderr, "fatal: invalid <dos-executable-file> DOS program name: %s\n", prog_name_arg);
         exit(252);
       }
@@ -3548,48 +3555,52 @@ static int parse_args_and_run_dos(char **argv, const char *pre_msg, const char *
       exit(252);
     }
   }
-  prog_name_arg = NULL;  /* Make sure we don't use it later, we've already modified it for dir_state.linux_mount_dir['E' - 'A']. */
+  prog_name_arg = NULL;  /* Make sure we don't use it later, we've already modified it for cmd_args.dir_state.linux_mount_dir['E' - 'A']. */
 
-  if (!dir_state.linux_mount_dir[dir_state.drive - 'A']) {
-    /*dir_state.drive = 'C';*/
-    fprintf(stderr, "fatal: no mount point for default drive (specify --mount=...): %c:\n", dir_state.drive);
+  if (!cmd_args.dir_state.linux_mount_dir[cmd_args.dir_state.drive - 'A']) {
+    /*cmd_args.dir_state.drive = 'C';*/
+    fprintf(stderr, "fatal: no mount point for default drive (specify --mount=...): %c:\n", cmd_args.dir_state.drive);
     exit(1);
   }
-  if (dir_state.dos_prog_abs == NULL) {
-    dir_state.dos_prog_abs = get_dos_abs_filename_r(prog_filename, dos_prog_drive, &dir_state, dosfnbuf);
-    if (DEBUG) fprintf(stderr, "debug: prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", prog_filename, dir_state.dos_prog_abs, dos_prog_drive);
+  if (cmd_args.dir_state.dos_prog_abs == NULL) {
+    cmd_args.dir_state.dos_prog_abs = get_dos_abs_filename_r(cmd_args.prog_filename, dos_prog_drive, &cmd_args.dir_state, dosfnbuf);
+    if (DEBUG) fprintf(stderr, "debug: prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", cmd_args.prog_filename, cmd_args.dir_state.dos_prog_abs, dos_prog_drive);
   }
-  if (prog_filename_type == PFT_LINUX && dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED && dir_state.linux_mount_dir['C' - 'A']) {
-    const char *mount_c = dir_state.linux_mount_dir['C' - 'A'];
+  if (prog_filename_type == PFT_LINUX && cmd_args.dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED && cmd_args.dir_state.linux_mount_dir['C' - 'A']) {
+    const char *mount_c = cmd_args.dir_state.linux_mount_dir['C' - 'A'];
     const char *q;
-    if (dir_state.dos_prog_abs[0] == 'C' || strncmp(prog_filename, mount_c, strlen(mount_c)) == 0) {  /* Set case mode from the entire pathname. */
-      for (q = prog_filename; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
-      dir_state.case_mode['C' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;
+    if (cmd_args.dir_state.dos_prog_abs[0] == 'C' || strncmp(cmd_args.prog_filename, mount_c, strlen(mount_c)) == 0) {  /* Set case mode from the entire pathname. */
+      for (q = cmd_args.prog_filename; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
+      cmd_args.dir_state.case_mode['C' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;
     } else {  /* Set case mode from the basename only. */
-      dir_state.case_mode['C' - 'A'] = get_case_mode_from_last_component(prog_filename);
+      cmd_args.dir_state.case_mode['C' - 'A'] = get_case_mode_from_last_component(cmd_args.prog_filename);
     }
   }
 
-  { int exit_code;
-    const char *ext = get_linux_ext(prog_filename);
-    EmuState emu;
-    init_emu(&emu);  /* This is lightweight, it doesn't initialized KVM. */
-    if (is_same_ascii_nocase(ext, "bat", 4)) {
-      exit_code = run_dos_batch(&emu, prog_filename, (const char* const*)argv, &dir_state, &tty_state, &emu_params, (const char* const*)envp0);
-    } else {
-      exit_code = run_dos_prog(&emu, prog_filename, NULL, (const char* const*)argv, &dir_state, &tty_state, &emu_params, (const char* const*)envp0);
-    }
-    if (DEBUG) fprintf(stderr, "debug: DOS program exited with code: 0x%02x", exit_code);
-    return exit_code;
-  }
+  cmd_args.args = (const char* const*)argv;
+  cmd_args.envp0 = (const char* const*)envp0;
+  *cmd_args_out = cmd_args;
 }
 
 /* --- */
 
 int main(int argc, char **argv) {
+  ParsedCmdArgs cmd_args;
   (void)argc;
-  return parse_args_and_run_dos(
-      argv,
+  parse_args(
+      argv, &cmd_args,
       "kvikdos: run DOS programs headless (a very fast DOS emulator)\nUsage: ", "",
       "This is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.\n");
+  { int exit_code;
+    const char *ext = get_linux_ext(cmd_args.prog_filename);
+    EmuState emu;
+    init_emu(&emu);  /* This is lightweight, it doesn't initialized KVM. */
+    if (is_same_ascii_nocase(ext, "bat", 4)) {
+      exit_code = run_dos_batch(&emu, cmd_args.prog_filename, cmd_args.args, &cmd_args.dir_state, &cmd_args.tty_state, &cmd_args.emu_params, cmd_args.envp0);
+    } else {
+      exit_code = run_dos_prog(&emu, cmd_args.prog_filename, NULL, cmd_args.args, &cmd_args.dir_state, &cmd_args.tty_state, &cmd_args.emu_params, cmd_args.envp0);
+    }
+    if (DEBUG) fprintf(stderr, "debug: DOS program exited with code: 0x%02x", exit_code);
+    return exit_code;
+  }
 }
