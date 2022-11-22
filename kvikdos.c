@@ -1069,6 +1069,7 @@ static int detect_dos_executable_program(int img_fd, const char *prog_filename, 
       fprintf(stderr, "fatal: DOS .exe program too short: %s\n", prog_filename);
       exit(252);
     }
+    /* !! TODO(pts): Follow emulated symlink e.g. if tcc.exe contains `@@@ bcc.exe' */
   } else if (r >= 6 && is_same_ascii_nocase(p, "@echo ", 6)) {
     fprintf(stderr, "fatal: DOS .bat batch files not supported as executable: %s\n", prog_filename);
     exit(252);  /* !! add support */
