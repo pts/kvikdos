@@ -456,6 +456,8 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
   char dos_prog_drive;
 
   argv0 = argv[0];
+  /* Ignoring instances of the --cmd flage, for pts-fast-dosbox compatibility. */
+  for (; argv[1] && 0 == strcmp(argv[1], "--cmd"); ++argv) {}
   if (!argv0 || !argv[1] || 0 == strcmp(argv[1], "--help")) {
     fprintf(stderr, "%s%s%s [<flag> ...] <dos-executable-file> [<dos-arg> ...]\n%s"
                     "Flags:\n"
