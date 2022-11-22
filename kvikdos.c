@@ -57,6 +57,685 @@
 #define DEBUG_INTVEC 0
 #endif
 
+#define CMD_PARSE_DEBUG DEBUG
+
+/* --- Command-line (argv) parser. Can be used separately from kvikdos. */
+
+#include <stdio.h>  /* fprintf(). */
+#include <stdlib.h>  /* exit(). */
+#include <string.h>  /* strcmp(). */
+#include <sys/stat.h>  /* stat(). */
+
+#ifndef CMD_PARSE_DEBUG
+#define CMD_PARSE_DEBUG 0
+#endif
+
+#define CASE_MODE_UPPERCASE 0
+#define CASE_MODE_LOWERCASE 1
+#define CASE_MODE_UNSPECIFIED 2
+
+#define DRIVE_COUNT 6
+static const char *skip_dot_slash(const char *p) {
+  while (p[0] == '.' && p[1] == '/') {  /* Skip ./ at the beginning. */
+    for (p += 2; p[0] == '/'; ++p) {}
+  }
+  return p;
+}
+
+/* Removes the duplicate slashes in place. */
+static void remove_duplicate_slashes(char *p) {
+  const char *q = p;
+  char c;
+  while ((c = *q) != '\0') {
+    *p++ = c;
+    ++q;
+    if (c == '/') {
+      for (; *q == '/'; ++q) {}
+    }
+  }
+  *p = '\0';
+}
+
+static char is_same_ascii_nocase(const char *a, const char *b, unsigned size) {
+  while (size-- != 0) {
+    const unsigned char pa = *a++;
+    const unsigned char pb = *b++;
+    if (!(pa == pb || ((pa | 32) - 'a' + 0U <= 'z' - 'a' + 0U && (pa ^ 32) == pb))) return 0;
+  }
+  return 1;
+}
+
+/* Example name_prefix: "PATH=". */
+static const char *getenv_prefix(const char *name_prefix, const char **env, const char **env_end) {
+  const size_t name_prefix_size = strlen(name_prefix);
+  for (; env != env_end; ++env) {
+    if (strncmp(*env, name_prefix, name_prefix_size) == 0) return *env + name_prefix_size;
+  }
+  return NULL;
+}
+
+/* p is a Linux pathname. */
+static char get_case_mode_from_last_component(const char *p) {
+  const char *q = p + strlen(p);
+  for (; q != p && q[-1] != '/'; --q) {}
+  for (; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
+  return (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;
+}
+
+/* Program filename type. */
+#define PFT_LINUX 0
+#define PFT_DOS 1
+#define PFT_PATH 2
+
+/* Returns PFT_*. */
+static char detect_prog_filename_type(const char *prog_filename) {
+  struct stat st;
+  if ((prog_filename[0] & ~32) - 'A' + 0U <= 'Z' - 'A' + 0U && prog_filename[1] == ':') return PFT_DOS;
+  if (strchr(prog_filename, '/')) return PFT_LINUX;
+  if (strchr(prog_filename, '\\')) return PFT_DOS;
+  if (strchr(prog_filename, '.') && stat(prog_filename, &st) == 0 && S_ISREG(st.st_mode)) return PFT_LINUX;
+  return PFT_PATH;
+}
+
+/* A relatively small struct, no string buffers. */
+typedef struct DirState {
+  char drive;  /* 'A', 'B', 'C', 'D', ... ('A' + DRIVE_COUNT - 1). */
+  char current_dir[DRIVE_COUNT][1];  /* Currently mostly unused. */ /*char current_dir[DRIVE_COUNT][128];*/  /* In DOS syntax. Ends with \, unless empty. If current_dir[2] is FOO\BAR\, then it corresponds to C:\FOO\BAR. */
+  const char *linux_mount_dir[DRIVE_COUNT];  /* Linux directory to which the specific drive has been mounted, with '/' suffix (or empty), or NULL. Owned externally. linux_mount_dir[2] == "/tmp/foo/" maps DOS path C:\MY\FILE.TXT to Linux path /tmp/foo/MY/FILE.TXT .  */
+  char case_mode[DRIVE_COUNT];  /* CASE_MODE_... indicating how letters in DOS filename characters should be converted to Linux (uppercase or lowercase). CASE_MODE_UPPERCASE (0) is the default. We could also call it case_fold. */
+  const char *dos_prog_abs;  /* DOS absolute pathname of the program being run. Externally owned, can be NULL. */
+  const char *linux_prog;  /* Linux pathname of the program being run. Externally owned, can be NULL. */
+} DirState;
+
+static void case_fold_on_drive(char *p, char drive, const DirState *dir_state) {
+  const char drive_idx = (drive & ~32) - 'A';
+  if ((unsigned char)drive_idx >= DRIVE_COUNT || !dir_state->linux_mount_dir[(int)drive_idx]) {  /* Bad drive. */
+    *p = '\0'; return;
+  } else {
+    char const case_flip = dir_state->case_mode[(int)drive_idx] == CASE_MODE_LOWERCASE ? 32 : 0;
+    char c;
+    while ((c = *p) != '\0') {
+      const char c_uc = c & ~32;
+      *p++ = !(c_uc - 'A' + 0U <= 'Z' - 'A' + 0U) ? c : c_uc ^ case_flip;
+    }
+  }
+}
+
+#define DOS_PATH_SIZE 64  /* See int 0x21 ah == 0x47 (get current directory) */
+
+/* Converts Linux pathname p to DOS absolute pathname into out_buf (of
+ * DOS_PATH_SIZE bytes). Always returns out_buf. On error, sets out_buf to
+ * the empty string. If drive is '\0', then finds a matching drive.
+ */
+static const char *get_dos_abs_filename_r(const char *p, char drive, const DirState *dir_state, char *out_buf) {
+  const char *p0 = skip_dot_slash(p);
+  p = p0;
+  if (drive == '\0') {  /* Find the best drive, i.e. the drive with the longest matching linux_mount_dir. */
+    char best_drive = '\0';
+    size_t best_mp_size = 0;
+    for (drive = 'A'; drive < 'A' + DRIVE_COUNT; ++drive) {
+      const char *mp = dir_state->linux_mount_dir[drive - 'A'];
+      if (mp) {
+        const size_t mp_size = strlen(mp);
+        if (strncmp(p0, mp, mp_size) == 0 && mp_size + 1 > best_mp_size) {  /* Upon equality, use the earlier drive. */
+          best_drive = drive;
+          best_mp_size = mp_size + 1;
+        }
+      }
+    }
+    if (best_drive == '\0') goto error;  /* No mounted drives. */
+    drive = best_drive;
+  } else {  /* Use the specified drive. */
+    const char *mp = dir_state->linux_mount_dir[drive - 'A'];
+    if (mp) {
+      const size_t mp_size = strlen(mp);
+      if (strncmp(p0, mp, mp_size) != 0) goto error;  /* File not on the mount point of drive. */
+    } else {
+      goto error;  /* No such drive. */
+    }
+  }
+  {
+    const char *mp = dir_state->linux_mount_dir[drive - 'A'];
+    const size_t mp_size = strlen(mp);
+    if (0 == strncmp(p0, mp, mp_size)) {
+      char *r = out_buf;
+      char *rend = out_buf + DOS_PATH_SIZE - 1;
+      *r++ = drive;
+      *r++ = ':';
+      *r++ = '\\';
+      for (p = p0 + mp_size; *p != '\0';) {
+        const char c = *p++;
+        if (r == rend) goto error;  /* DOS pathname too long. */
+        if (c == '/') {
+          for (; *p == '/'; ++p) {}  /* Skip subsequent slashes. */
+        }
+        /* TODO(pts): Check that each pathname component is at most 8.3 bytes long. */
+        *r++ = (c == '/') ? '\\'  /* Convert '/' to '\\'. */
+             : (c - 'a' + 0U <= 'z' - 'a' + 0U) ? c & ~32 : c;  /* Convert to uppercase. */
+      }
+      *r = '\0';
+      return out_buf;
+    }
+  }
+ error:
+  *out_buf = '\0';  /* Mount point not found. */
+  return out_buf;
+}
+
+#define LINUX_PATH_SIZE 1024
+
+/* p is a DOS pathname. out_buf is LINUX_PATH_SIZE bytes. */
+static char *get_linux_filename_r(const char *p, const DirState *dir_state, char *out_buf, char **out_lastc_out) {
+  char *out_p = out_buf, *out_pend, *out_lastc = out_buf;
+  const char *in_linux;
+  const char *in_dos[2] = { "", "" };
+  char drive_idx, case_flip = 0, case_mode;
+  if (*p == '\0') goto done;  /* Empty pathname is an error. */
+  if (!dir_state) {  /* Convert to relative Linux pathname. */
+    in_linux = NULL;
+    in_dos[1] = p;
+  } else if (dir_state->dos_prog_abs && strcmp(p, dir_state->dos_prog_abs) == 0) {
+    in_linux = dir_state->linux_prog;
+  } else {
+    if (p[0] != '\0' && p[1] == ':') {
+      drive_idx = (p[0] & ~32) - 'A';
+      p += 2;
+    } else {
+      drive_idx = dir_state->drive - 'A';
+    }
+    if ((unsigned char)drive_idx >= DRIVE_COUNT) {  /* Bad or unknown drive letter. */  /* !! Report error 0x3 (Path not found) */
+      /*fprintf(stderr, "fatal: DOS filename on wrong drive: 0x%02x\n", (unsigned char)p[0]);*/  /* !! Report error 0x3 (Path not found) */
+      /*exit(252);*/
+      goto done;
+    }
+    in_linux = dir_state->linux_mount_dir[(int)drive_idx];
+    if (!in_linux) goto done;  /* Drive not available. !! Report error 0x3 (Path not found) */
+    if ((case_mode = dir_state->case_mode[(int)drive_idx]) == CASE_MODE_UNSPECIFIED) {
+      /* This signifies a genuine bug in kvikdos.c. !! Typically still happens in find_prog(). */
+      fprintf(stderr, "assert: case mode not yet specified for drive %c:\n", 'A' + drive_idx);
+      exit(252);
+    }
+    case_flip = case_mode == CASE_MODE_LOWERCASE ? 32 : 0;
+    if (*p == '\\' || *p == '/') {
+      for (++p; *p == '\\' || *p == '/'; ++p) {}
+    } else {
+      in_dos[0] = dir_state->current_dir[(int)drive_idx];
+    }
+    in_dos[1] = p;
+  }
+  out_pend = out_p + LINUX_PATH_SIZE - 1;
+  if (0) { too_long:  /* Pathname too long. !! Handle this error. !! Report error 0x3 (Path not found) or 0x44 (Network name limit exceeded). */
+   error:
+    out_p = out_buf;
+    goto done;
+  }
+  if (in_linux) {
+    const size_t size = strlen(in_linux);
+    if (size > (size_t)(out_pend - out_p)) goto too_long;
+    memcpy(out_p, in_linux, size);
+    out_p += size;
+  }
+  {  /* Convert pathnames in in_dos */
+    const char * const *in_dosi;
+    unsigned component_count = 0;
+    for (in_dosi = in_dos; in_dosi != in_dos + 2; ++in_dosi) {
+      p = *in_dosi;
+      for (; *p != '\0';) {
+        unsigned dot_count = 0;
+        char *out_limit83 = out_p + 8;
+        out_lastc = out_p;
+        if (CMD_PARSE_DEBUG && !(p[0] != '\0' && p[0] != '/' && p[0] != '\\')) {
+          fprintf(stderr, "assert: pathname component empty or starts with / or \\: %s\n", p);
+          exit(252);
+        }
+        if (p[0] == '.' && (p[1] == '\0' || p[1] == '\\' || p[1] == '/' || (p[1] == '.' && (p[2] == '\0' || p[2] == '\\' || p[2] == '/')))) {
+          if (p[1] == '.') {
+            /* Security: Too many levels up, outside linux_mount_dir with `..'. It's still possible to escape up if one of the pathname components is a symlink. */
+            if (component_count-- == 0) goto error;
+          }
+          dot_count = LINUX_PATH_SIZE + 2;
+        } else {
+          ++component_count;
+          if (*p == '.') goto error;  /* First character in component is '.'. */
+        }
+        for (; *p != '\0';) {
+          const char c = *p;
+          if (out_p == out_pend) goto too_long;
+          if (c == '\\' || c == '/') {
+            *out_p++ = '/';  /* Convert '\\' to '/'. */
+            break;
+          } else if (c == '.') {
+            if (dot_count == 0) out_limit83 = out_p + (1 + 3);
+            ++dot_count;
+          } else if (c + 0U <= ' ' + 0U || c =='"' || c == '*' || c == '?' || c == ':' || c == '[' || c == ']' || c == '=' || c == '|' || c == '<' || c == '>' || c == ',' || c == ';' || c == '\x7f') {
+            goto error; /* Character not allowed in DOS pathname. DOSBox allows '+'. */
+          }
+          ++p;
+          if (out_p != out_limit83) {  /* Truncate the basename to 8 characters, and the extension to 3 characters. DOSBox does the same. */
+            const char c_uc = c & ~32;
+            *out_p++ = !(c_uc - 'A' + 0U <= 'Z' - 'A' + 0U) ? c : c_uc ^ case_flip;
+          }
+          /* TODO(pts) Truncate each component to 8.3 characters? */
+        }
+        if (dot_count <= LINUX_PATH_SIZE) {
+          if (dot_count > 1) goto error;  /* More than 1 '.' in component. DOSBox doesn't allow it either. */
+          if (p[-1] == '.') goto error;  /* Last character in component is '.'. DOSBox doesn't allow it either. It's safe to check here because of the assertion above. */
+        }
+        for (; *p == '\\' || *p == '/'; ++p) {}
+      }
+    }
+    if (p[-1] == '/' || p[-1] == '\\') goto error;  /* If pathname ends with a slash, that's an error. It's safe to check since we've checked already that it's not empty. */
+  }
+ done:
+  *out_p = '\0';
+  if (is_same_ascii_nocase(out_lastc, "nul", 3) && (out_lastc[3] == '.' || out_lastc[3] == '\0')) strcpy(out_buf, "/dev/null");
+  if (out_lastc_out) *out_lastc_out = out_lastc;
+  return out_buf;
+}
+
+static char fnbuf[LINUX_PATH_SIZE], fnbuf2[LINUX_PATH_SIZE], argv0_fnbuf[LINUX_PATH_SIZE];
+
+/* Same extension lookup order as in DOS. */
+static const char * const find_prog_on_path_exts[] = { ".com", ".exe", ".bat", /* ".cmd", for Windows NT+. */ NULL };
+static const char * const find_prog_on_path_no_exts[] = { "", NULL };
+
+/* Works only if no ':', '/', or '\\'  in prog_filename. This is guranteed
+ * if detect_prog_filename_type has returned PFT_PATH.
+ * prog_filename is a single-component DOS program name, with or without a '.'.
+ * The return value is a Linux pathname.
+ * Uses global variable fnbuf as temporary storage and return value.
+ * Uses global variable fnbuf2 as temporary storage.
+ */
+static char *find_prog_on_path(const char *prog_filename, const DirState *dir_state, const char *dos_path, char *drive_out) {
+  size_t size;
+  const char *p, *pp, *pq;
+  char *r;
+  char c;
+  char drive = dir_state->drive;
+  const char * const * exts0;
+  for (p = prog_filename; (c = *p) != '\0' && c != ':' && c != '/' && c != '\\'; ++p) {}
+  if (*p != '\0') {
+    /* Call detect_prog_filename_type first, and if it returns PFT_PATH, only then call find_prog_on_path. */
+    fprintf(stderr, "assert: prog_filename contains disallowed characters: %s\n", prog_filename);
+    exit(252);
+  }
+  get_linux_filename_r(prog_filename, NULL /* dir_state */, fnbuf2, NULL);
+  if ((fnbuf2[0] == '.' && fnbuf2[1] == '\0') ||  /* "." is an invalid program name. */
+      fnbuf2[0] == '\0') { too_long:
+    fnbuf[0] = '\0'; return fnbuf;  /* Invalid program name. */
+  }
+  size = strlen(prog_filename);
+  for (p = prog_filename + size; p != prog_filename && *--p != '.';) {}
+  /* DOS allows only exts in find_prog_on_path_exts, we allow anything the user specifies here. */
+  exts0 = (*p != '.') ? find_prog_on_path_exts : find_prog_on_path_no_exts;
+  if (CMD_PARSE_DEBUG) fprintf(stderr, "debug: DOS path lookup prog_filename=%s p=%s dos_path=%s\n", prog_filename, p, dos_path);
+  pp = pq = NULL;
+  for (;;) {  /* Find in current directory first, then continue finding on DOS %PATH%. */
+    const char * const * exts;
+    r = fnbuf;
+    if (pp) {
+      char c, *pt, ptc;
+      for (pq = pp; (c = *pp) != ';' && c != '\0'; ++pp) {}
+      drive = pq[0] & ~32;
+      if (drive - 'A' + 0U <= 'Z' - 'A' + 0U && pq[1] == ':') {
+        if (pq[2] != '\\' && pq[2] != '/') goto end_of_pp;  /* Not an absolute pathname within a drive. */
+      } else {
+        drive = dir_state->drive;
+      }
+      *(char*)pp = '\0';  /* Temporary terminator within dos_path, for get_linux_filename_r. */
+      for (pt = (char*)pp; pt != pq && ((ptc = pt[-1]) == '\\' || ptc == '/'); --pt) {}
+      if (pt != pq) { ptc = *pt; *pt = '\0'; }  /* Temporarily remove trailing backslashes. */
+      get_linux_filename_r(pq, dir_state, fnbuf, NULL);
+      if (pt != pq) *pt = ptc;  /* Restore trailing backlashes, if any. */
+      *(char*)pp = c;  /* Restore the terminator. */
+      if (*fnbuf == '\0') goto end_of_pp;  /* Skip if filename is invalid. */
+      r = fnbuf + strlen(fnbuf);
+      if (fnbuf[0] != '\0' && r[-1] != '/') {  /* fnbuf ends with a slash if %PATH% component is just a drive letter, e.g. C: */
+        if ((unsigned)(r - fnbuf)  >= sizeof(fnbuf)) goto too_long;
+        *r++ = '/';
+      }
+    }
+    if ((unsigned)(r - fnbuf) + size >= sizeof(fnbuf)) goto too_long;
+    memcpy(r, prog_filename, size + 1);  /* Including the trailing '\0'. */
+    case_fold_on_drive(r, drive, dir_state);
+    if (*r == '\0') goto end_of_pp;  /* Invalid pathname or invalid drive. */
+    r += size;
+    *r = '\0';
+    if (CMD_PARSE_DEBUG) fprintf(stderr, "debug: trying progs: %s\n", fnbuf);
+    for (exts = exts0; *exts; ++exts) {
+      const size_t ext_size = strlen(*exts);
+      struct stat st;
+      if ((unsigned)(r - fnbuf) + ext_size >= sizeof(fnbuf)) goto too_long;
+      memcpy(r, *exts, ext_size + 1);  /* Including the trailing '\0'. */
+      case_fold_on_drive(r, drive, dir_state);
+      if (CMD_PARSE_DEBUG) fprintf(stderr, "debug: trying prog: %s\n", fnbuf);
+      if (stat(fnbuf, &st) == 0 && S_ISREG(st.st_mode)) {
+        if (CMD_PARSE_DEBUG) fprintf(stderr, "debug: found prog on drive=%c: %s\n", drive, fnbuf);
+        *drive_out = drive;
+        return fnbuf;  /* Found executable program file. */
+      }
+    }
+   end_of_pp:
+    if (pp) {
+    } else if (dos_path) {
+      pp = dos_path;
+    } else {
+      break;
+    }
+    for (; *pp == ';'; ++pp) {}  /* Skip over %PATH% separator characters ';'. */
+    if (*pp == '\0') break;
+  }
+  return NULL;  /* Not found on %PA%H. */
+}
+
+#define DOS_PATH_SIZE 64  /* See int 0x21 ah == 0x47 (get current directory) */
+static char dosfnbuf[DOS_PATH_SIZE];
+
+typedef struct EmuParams {
+  char is_hlt_ok;
+} EmuParams;
+
+typedef struct ParsedCmdArgs {
+  const char *prog_filename;
+  EmuParams emu_params;
+  DirState dir_state;
+  int tty_in_fd;
+  const char* const *args;  /* NULL-terminated list of NUL-terminated strings. Overlaps the program main(...) argv. */
+  const char* const *envp0;  /* NULL-terminated list of NUL-terminated strings. Overlaps the program main(...) argv. */
+} ParsedCmdArgs;
+
+static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const char *pre_msg, const char *usage_extra, const char *post_msg) {
+  char *placeholder_for_default = (char*)pre_msg;
+  ParsedCmdArgs cmd_args;
+  const char *argv0;
+  char is_drive_specified;
+  char prog_filename_type;
+  char *prog_name_arg;
+  char **envp0, **envp;
+  const char *dos_path;
+  char dos_prog_drive;
+
+  argv0 = argv[0];
+  if (!argv0 || !argv[1] || 0 == strcmp(argv[1], "--help")) {
+    fprintf(stderr, "%s%s%s [<flag> ...] <dos-executable-file> [<dos-arg> ...]\n%s"
+                    "Flags:\n"
+                    "--env=<NAME>=<value>: Adds environment variable.\n"
+                    "--prog=<dos-pathname>: Sets DOS pathname of program.\n"
+                    "--mount=<drive><case><dirname>/: Makes Linux dir visible as <drive> for DOS program.\n"
+                    "    If <case> is :, then mount uppercase. If <case> is -, then mount lowercase.\n"
+                    "--mount=<drive>0: Makes sure that <drive>: is not visible in DOS.\n"
+                    "--drive=<drive>: Sets initial current drive for DOS program.\n"
+                    "--tty-in=<fd>: Selects Linux file descriptor for keyboard input.\n"
+                    "    -3: fake keys; -2: stdin buffered; -1: /dev/tty; 0: stdin etc.\n"
+                    "--hlt-ok: Allow the hlt instruction.\n",
+                    pre_msg, argv0, usage_extra, post_msg);
+    exit(argv0 && argv[1] ? 0 : 1);
+  }
+
+  { unsigned u;
+    for (u = 0; u < DRIVE_COUNT; ++u) {
+      cmd_args.dir_state.current_dir[u][0] = '\0';
+      cmd_args.dir_state.linux_mount_dir[u] = NULL;
+    }
+    cmd_args.dir_state.drive = 'C';
+    cmd_args.dir_state.dos_prog_abs = NULL;
+    cmd_args.dir_state.linux_mount_dir['C' - 'A'] = placeholder_for_default;
+    cmd_args.dir_state.linux_mount_dir['D' - 'A'] = placeholder_for_default;
+    cmd_args.dir_state.linux_mount_dir['E' - 'A'] = placeholder_for_default;
+    memset(cmd_args.dir_state.case_mode, CASE_MODE_UNSPECIFIED, DRIVE_COUNT);
+  }
+
+  envp = envp0 = ++argv;
+  cmd_args.tty_in_fd = -1;
+  cmd_args.emu_params.is_hlt_ok = 0;
+  is_drive_specified = 0;
+  while (argv[0]) {
+    char *arg = *argv++;
+    if (arg[0] != '-' || arg[1] == '\0') {
+      --argv; break;
+    } else if (arg[1] == '-' && arg[2] == '\0') {
+      break;
+    } else if (0 == strcmp(arg, "--hlt-ok")) {
+      cmd_args.emu_params.is_hlt_ok = 1;
+    } else if (0 == strcmp(arg, "--env")) {
+      if (!argv[0]) { missing_argument:
+        fprintf(stderr, "fatal: missing argument for flag: %s\n", arg);
+        exit(1);
+      }
+      arg = *argv++;
+     do_env:
+      { char *p = arg, c;
+        for (; (c = *p) != '\0' && c != '='; ++p) {
+          if (c - 'a' + 0U <= 'z' - 'a' + 0U) *p &= ~32;  /* Convert variable name to uppercase. */
+        }
+      }
+      *envp++ = arg;  /* Reuse the argv array. */
+    } else if (0 == strncmp(arg, "--env=", 6)) {  /* Can be specified multiple times. */
+      arg += 6;
+      goto do_env;
+    } else if (0 == strcmp(arg, "--prog")) {
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+     do_prog:
+      cmd_args.dir_state.dos_prog_abs = arg;
+    } else if (0 == strncmp(arg, "--prog=", 7)) {
+      arg += 7;
+      goto do_prog;
+    } else if (0 == strcmp(arg, "--mount")) {  /* Can be specified multiple times. */
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+     do_mount:  /* Default: --mount C:. */
+      if ((arg[0] & ~32) - 'A' + 0U >= DRIVE_COUNT || !(arg[1] == ':' || arg[1] == '-' || arg[1] == '0')) {
+        fprintf(stderr, "fatal: mount argument must start with <drive>: or <drive>-, <drive> must be A .. %c: %s\n", 'A' + DRIVE_COUNT - 1, arg);
+        exit(1);
+      } else {
+        const char drive_idx = (arg[0] & ~32) - 'A';
+        const char case_mode = arg[1] == '0' ? CASE_MODE_UNSPECIFIED : arg[1] == '-' ? CASE_MODE_LOWERCASE : CASE_MODE_UPPERCASE;
+        if (arg[1] == '0') {
+          if (arg[2] != '\0') {
+            fprintf(stderr, "fatal: mount argument for not visibility must stop at 0: %s\n", arg);
+            exit(1);
+          }
+          arg = NULL;  /* Make sure not mounted. */
+        } else {
+          arg += 2;
+          if (CMD_PARSE_DEBUG) fprintf(stderr, "debug: mount %c: %s\n", drive_idx + 'A', arg);
+          if (arg[0] == '\0') {
+            arg = placeholder_for_default;
+          } else {
+            arg = (char*)skip_dot_slash(arg);
+            remove_duplicate_slashes(arg);
+            if (arg[0] == '.' && arg[1] == '\0') {
+              ++arg;
+            } else if (arg[0] != '\0') {
+              char *p = arg + strlen(arg);
+              if (arg[1] != '\0' && p[-1] == '.' && p[-2] == '/') *--p = '\0';  /* Remove trailing . if it ends with /. */
+              if (p[-1] != '/') {
+                fprintf(stderr, "fatal: mount directory target must end with /: %s\n", arg);
+                exit(1);
+              }
+            }
+          }
+        }
+        cmd_args.dir_state.linux_mount_dir[(int)drive_idx] = arg;  /* argv retains ownership of arg. */
+        cmd_args.dir_state.case_mode[(int)drive_idx] = case_mode;
+      }
+    } else if (0 == strncmp(arg, "--mount=", 8)) {
+      arg += 8;
+      goto do_mount;
+    } else if (0 == strcmp(arg, "--drive")) {  /* Can be specified multiple times. */
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+     do_drive:  /* Default: --drive C: */
+      if ((arg[0] & ~32) - 'A' + 0U >= DRIVE_COUNT || !(arg[1] == '\0' || (arg[1] == ':' && arg[2] == '\0'))) {
+        fprintf(stderr, "fatal: drive argument must be <drive>:, <drive> must be A .. %c: %s\n", 'A' + DRIVE_COUNT - 1, arg);
+        exit(1);
+      }
+      cmd_args.dir_state.drive = arg[0] & ~32;
+      is_drive_specified = 1;
+    } else if (0 == strncmp(arg, "--drive=", 8)) {
+      arg += 8;
+      goto do_drive;
+    } else if (0 == strcmp(arg, "--tty-in")) {
+      int char_count;
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+     do_tty_in:
+      if (sscanf(arg, "%d%n", &cmd_args.tty_in_fd, &char_count) < 1 || char_count + 0U != strlen(arg) || cmd_args.tty_in_fd < -3) {
+        /* -1: use /dev/tty; -2: use 0 (stdin), but don't try to disable buffering; -3: fake keys in round-robin. */
+        fprintf(stderr, "fatal: tty-in argument must be nonnegative integer or -1, -2 or -3: %s\n", arg);
+        exit(1);
+      }
+      /* Now we've set cmd_args.tty_in_fd. */
+    } else if (0 == strncmp(arg, "--tty-in=", 9)) {
+      arg += 9;
+      goto do_tty_in;
+    } else {
+      fprintf(stderr, "fatal: unknown command-line flag: %s\n", arg);
+      exit(1);
+    }
+  }
+  /* Now: argv contains remaining (non-flag) arguments. */
+  if (!argv[0]) {
+    fprintf(stderr, "fatal: missing <dos-executable-file> DOS program filename\n");
+    exit(1);
+  }
+#if 0  /* Tests for replacing the output with "" */
+  fprintf(stderr, "GLF (%s)\n", get_linux_filename("C:\\foo\\.\\.\\\\bar\\."));
+  fprintf(stderr, "GLF (%s)\n", get_linux_filename(".\\.\\."));
+  fprintf(stderr, "GLF (%s)\n", get_linux_filename(".\\aaa\\..\\..\\.."));  /* "" */
+  fprintf(stderr, "GLF (%s)\n", get_linux_filename(".\\aaa\\..\\.."));  /* "" */
+  fprintf(stderr, "GLF (%s)\n", get_linux_filename(".\\aaa\\.."));
+  fprintf(stderr, "GLF (%s)\n", get_linux_filename("C:\\foo\\.\\\\\\.\\bar\\.\\..\\.\\bazzzz\\.."));
+#endif
+  prog_name_arg = *argv++;  /* This is a Linux filename. */
+  *envp = NULL;
+  /* Remaining arguments in argv will be passed to the DOS program in PSP:0x80. */
+  dos_path = getenv_prefix("PATH=", (char const**)envp0, (char const**)envp);
+
+  if (cmd_args.dir_state.linux_mount_dir['C' - 'A'] == placeholder_for_default) {  /* Set to current directory in Linux. */
+    cmd_args.dir_state.linux_mount_dir['C' - 'A'] = "";  /* Either --mount=C:. (uppercase) or --mount=C-. (lowercase). */
+    /*if (cmd_args.dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED) { ... }*/  /* Will be changed below. */
+  }
+  if (cmd_args.dir_state.linux_mount_dir['D' - 'A'] == placeholder_for_default) {  /* Set to emulator directory (based on argv0). !! Process readlink(2). */
+    const char *p_base = skip_dot_slash(argv0), *p = p_base + strlen(p_base);
+    size_t size;
+    for (; p != p_base && p[-1] != '/'; --p) {}
+    if ((size = p - p_base) >= sizeof(argv0_fnbuf)) {
+      fprintf(stderr, "fatal: emulator program name (argv[0]) too long for mount: %s\n", p_base);
+      exit(252);
+    }
+    memcpy(argv0_fnbuf, p_base, size);  /* Empty or ends with slash. */
+    argv0_fnbuf[size] = '\0';
+    remove_duplicate_slashes(argv0_fnbuf);
+    cmd_args.dir_state.linux_mount_dir['D' - 'A'] = argv0_fnbuf;  /* Either --mount=C:. (uppercase) or --mount=C-. (lowercase). */
+    /*if (cmd_args.dir_state.case_mode['D' - 'A'] == CASE_MODE_UNSPECIFIED) { ... }*/  /* Will be changed below. */
+  }
+  dos_prog_drive = '\0';
+
+  prog_filename_type = detect_prog_filename_type(prog_name_arg);
+  if (prog_filename_type == PFT_LINUX) {
+    prog_name_arg = (char*)skip_dot_slash(prog_name_arg);
+    remove_duplicate_slashes(prog_name_arg);
+    cmd_args.prog_filename = prog_name_arg;
+    if (cmd_args.dir_state.linux_mount_dir['E' - 'A'] == placeholder_for_default) {  /* If not explicitly mounted, mount E: to the directory of prog_filename.  */
+      const char *p = prog_name_arg + strlen(prog_name_arg), *q;
+      size_t q_size;
+      for (; p != prog_name_arg && p[-1] != '/'; --p) {}
+      for (q = p; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
+      if (cmd_args.dir_state.case_mode['E' - 'A'] == CASE_MODE_UNSPECIFIED) {
+        cmd_args.dir_state.case_mode['E' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;  /* Mount as lowercase iff the executable program name has at least one lowercase character. */
+      }
+      q = prog_name_arg;
+      while (q != p && q[0] == '.' && q[1] == '/') {  /* Skip ./ at the beginning. */
+        for (q += 2; q != p && q[0] == '/'; ++q) {}
+      }
+      q_size = strlen(q) + 1;
+      if (q_size > sizeof(fnbuf)) {
+        fprintf(stderr, "fatal: Linux name of executable program too long: %s\n", q);
+        exit(252);
+      }
+      memcpy(fnbuf, q, q_size);  /* Including the trailing '\0'. */
+      cmd_args.prog_filename = fnbuf;
+      *(char*)p = '\0';  /* Modify it in place in argv. */
+      cmd_args.dir_state.linux_mount_dir['E' - 'A'] = q;  /* Empty or ends with '/'. */
+      dos_prog_drive = 'E';
+      if (!is_drive_specified && !cmd_args.dir_state.linux_mount_dir[cmd_args.dir_state.drive - 'A']) cmd_args.dir_state.drive = 'E';
+    }
+    if (cmd_args.dir_state.case_mode['D' - 'A'] == CASE_MODE_UNSPECIFIED && cmd_args.dir_state.linux_mount_dir['D' - 'A']) {
+      cmd_args.dir_state.case_mode['D' - 'A'] = get_case_mode_from_last_component(cmd_args.prog_filename);  /* Mount as lowercase iff the executable program has at least one lowercase character. */
+    }
+    /* We will set cmd_args.dir_state.case_mode['C' - 'A'] later. */
+  } else {
+    if (cmd_args.dir_state.linux_mount_dir['E' - 'A'] == placeholder_for_default) cmd_args.dir_state.linux_mount_dir['E' - 'A'] = NULL;  /* Drive E: not mounted by default. */
+    if (prog_filename_type == PFT_PATH && !dos_path && cmd_args.dir_state.drive == 'C' && cmd_args.dir_state.linux_mount_dir['C' - 'A'] && cmd_args.dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED) {  /* Just a command without a filename extension, e.g. "guest" or "GUEST". */
+      cmd_args.dir_state.case_mode['C' - 'A'] = get_case_mode_from_last_component(prog_name_arg);
+    }
+    { char drive;
+      for (drive = 'C'; drive <= 'E'; ++drive) {
+        if (cmd_args.dir_state.case_mode[drive - 'A'] == CASE_MODE_UNSPECIFIED && cmd_args.dir_state.linux_mount_dir[drive - 'A']) {
+          cmd_args.dir_state.case_mode[drive - 'A'] = CASE_MODE_UPPERCASE;
+        }
+      }
+    }
+    /* cmd_args.dir_state.linux_mount_dir[...] and cmd_args.dir_state.case_mode[...] are used below. */
+    if (prog_filename_type == PFT_DOS) {
+      cmd_args.prog_filename = get_linux_filename_r(prog_name_arg, &cmd_args.dir_state, fnbuf, NULL);  /* Return value is fnbuf. */
+      if (*cmd_args.prog_filename == '\0') {
+        fprintf(stderr, "fatal: <dos-executable-file> is not a valid DOS pathname or contains an invalid drive: %s\n", prog_name_arg);
+        exit(252);
+      }
+    } else if (prog_filename_type == PFT_PATH) {
+      if (cmd_args.dir_state.linux_mount_dir['E' - 'A'] == placeholder_for_default) cmd_args.dir_state.linux_mount_dir['E' - 'A'] = NULL;  /* Drive E: not mounted by default. */
+      cmd_args.prog_filename = get_linux_filename_r(prog_name_arg, NULL /* cmd_args.dir_state */, fnbuf, NULL);  /* Return value is fnbuf. */
+      if (*cmd_args.prog_filename == '\0') {
+        fprintf(stderr, "fatal: <dos-executable-file> is not a valid DOS filename: %s\n", prog_name_arg);
+        exit(252);
+      }
+      cmd_args.prog_filename = find_prog_on_path(prog_name_arg, &cmd_args.dir_state, dos_path, &dos_prog_drive);  /* Return value is fnbuf or NULL. */
+      if (!cmd_args.prog_filename) {
+        fprintf(stderr, "fatal: DOS command not found on %c:\\ or %%PATH%%: %s\n", cmd_args.dir_state.drive, prog_name_arg);
+        exit(252);
+      }
+      if (*cmd_args.prog_filename == '\0') {
+        fprintf(stderr, "fatal: invalid <dos-executable-file> DOS program name: %s\n", prog_name_arg);
+        exit(252);
+      }
+    } else {
+      fprintf(stderr, "assert: bad prog_filenam_type: %d\n", prog_filename_type);
+      exit(252);
+    }
+  }
+  prog_name_arg = NULL;  /* Make sure we don't use it later, we've already modified it for cmd_args.dir_state.linux_mount_dir['E' - 'A']. */
+
+  if (!cmd_args.dir_state.linux_mount_dir[cmd_args.dir_state.drive - 'A']) {
+    /*cmd_args.dir_state.drive = 'C';*/
+    fprintf(stderr, "fatal: no mount point for default drive (specify --mount=...): %c:\n", cmd_args.dir_state.drive);
+    exit(1);
+  }
+  if (cmd_args.dir_state.dos_prog_abs == NULL) {
+    cmd_args.dir_state.dos_prog_abs = get_dos_abs_filename_r(cmd_args.prog_filename, dos_prog_drive, &cmd_args.dir_state, dosfnbuf);
+    if (CMD_PARSE_DEBUG) fprintf(stderr, "debug: prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", cmd_args.prog_filename, cmd_args.dir_state.dos_prog_abs, dos_prog_drive);
+  }
+  if (prog_filename_type == PFT_LINUX && cmd_args.dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED && cmd_args.dir_state.linux_mount_dir['C' - 'A']) {
+    const char *mount_c = cmd_args.dir_state.linux_mount_dir['C' - 'A'];
+    const char *q;
+    if (cmd_args.dir_state.dos_prog_abs[0] == 'C' || strncmp(cmd_args.prog_filename, mount_c, strlen(mount_c)) == 0) {  /* Set case mode from the entire pathname. */
+      for (q = cmd_args.prog_filename; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
+      cmd_args.dir_state.case_mode['C' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;
+    } else {  /* Set case mode from the basename only. */
+      cmd_args.dir_state.case_mode['C' - 'A'] = get_case_mode_from_last_component(cmd_args.prog_filename);
+    }
+  }
+
+  cmd_args.args = (const char* const*)argv;
+  cmd_args.envp0 = (const char* const*)envp0;
+  *cmd_args_out = cmd_args;
+}
+
+
+/* --- End of command-line parser */
+
 #if 0  /* We don't use ROM and BIOS area and then XMS above DOS_MEM_LIMIT, we just map DOS_MEM_LIMIT. */
 #define MEM_SIZE (2 << 20)  /* In bytes. 2 MiB. */
 #endif
@@ -309,15 +988,6 @@ static void check_all_mcbs(void *mem) {
 #endif
 
 /* --- */
-
-static char is_same_ascii_nocase(const char *a, const char *b, unsigned size) {
-  while (size-- != 0) {
-    const unsigned char pa = *a++;
-    const unsigned char pb = *b++;
-    if (!(pa == pb || ((pa | 32) - 'a' + 0U <= 'z' - 'a' + 0U && (pa ^ 32) == pb))) return 0;
-  }
-  return 1;
-}
 
 #if !defined(__GLIBC__) && !defined(__UCLIBC__)
 static void *my_memmem(const void *haystack, size_t haystacklen,
@@ -762,46 +1432,6 @@ static int get_linux_handle(unsigned short handle, const struct kvm_fds *kvm_fds
        : handle;
 }
 
-#define CASE_MODE_UPPERCASE 0
-#define CASE_MODE_LOWERCASE 1
-#define CASE_MODE_UNSPECIFIED 2
-
-#define DRIVE_COUNT 6
-
-/* A relatively small struct, no string buffers. */
-typedef struct DirState {
-  char drive;  /* 'A', 'B', 'C', 'D', ... ('A' + DRIVE_COUNT - 1). */
-  char current_dir[DRIVE_COUNT][1];  /* Currently mostly unused. */ /*char current_dir[DRIVE_COUNT][128];*/  /* In DOS syntax. Ends with \, unless empty. If current_dir[2] is FOO\BAR\, then it corresponds to C:\FOO\BAR. */
-  const char *linux_mount_dir[DRIVE_COUNT];  /* Linux directory to which the specific drive has been mounted, with '/' suffix (or empty), or NULL. Owned externally. linux_mount_dir[2] == "/tmp/foo/" maps DOS path C:\MY\FILE.TXT to Linux path /tmp/foo/MY/FILE.TXT .  */
-  char case_mode[DRIVE_COUNT];  /* CASE_MODE_... indicating how letters in DOS filename characters should be converted to Linux (uppercase or lowercase). CASE_MODE_UPPERCASE (0) is the default. We could also call it case_fold. */
-  const char *dos_prog_abs;  /* DOS absolute pathname of the program being run. Externally owned, can be NULL. */
-  const char *linux_prog;  /* Linux pathname of the program being run. Externally owned, can be NULL. */
-} DirState;
-
-#define LINUX_PATH_SIZE 1024
-
-static void case_fold_on_drive(char *p, char drive, const DirState *dir_state) {
-  const char drive_idx = (drive & ~32) - 'A';
-  if ((unsigned char)drive_idx >= DRIVE_COUNT || !dir_state->linux_mount_dir[(int)drive_idx]) {  /* Bad drive. */
-    *p = '\0'; return;
-  } else {
-    char const case_flip = dir_state->case_mode[(int)drive_idx] == CASE_MODE_LOWERCASE ? 32 : 0;
-    char c;
-    while ((c = *p) != '\0') {
-      const char c_uc = c & ~32;
-      *p++ = !(c_uc - 'A' + 0U <= 'Z' - 'A' + 0U) ? c : c_uc ^ case_flip;
-    }
-  }
-}
-
-/* p is a Linux pathname. */
-static char get_case_mode_from_last_component(const char *p) {
-  const char *q = p + strlen(p);
-  for (; q != p && q[-1] != '/'; --q) {}
-  for (; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
-  return (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;
-}
-
 /* p is a DOS pathname. Returns 'A' etc. or '\0' on error. */
 static char get_dos_filename_drive(const char *p, const DirState *dir_state) {
   if (p[0] != '\0' && p[1] == ':') {
@@ -810,114 +1440,6 @@ static char get_dos_filename_drive(const char *p, const DirState *dir_state) {
     return drive_idx + 'A';
   }
   return dir_state->drive;
-}
-
-/* p is a DOS pathname. out_buf is LINUX_PATH_SIZE bytes. */
-static char *get_linux_filename_r(const char *p, const DirState *dir_state, char *out_buf, char **out_lastc_out) {
-  char *out_p = out_buf, *out_pend, *out_lastc = out_buf;
-  const char *in_linux;
-  const char *in_dos[2] = { "", "" };
-  char drive_idx, case_flip = 0, case_mode;
-  if (*p == '\0') goto done;  /* Empty pathname is an error. */
-  if (!dir_state) {  /* Convert to relative Linux pathname. */
-    in_linux = NULL;
-    in_dos[1] = p;
-  } else if (dir_state->dos_prog_abs && strcmp(p, dir_state->dos_prog_abs) == 0) {
-    in_linux = dir_state->linux_prog;
-  } else {
-    if (p[0] != '\0' && p[1] == ':') {
-      drive_idx = (p[0] & ~32) - 'A';
-      p += 2;
-    } else {
-      drive_idx = dir_state->drive - 'A';
-    }
-    if ((unsigned char)drive_idx >= DRIVE_COUNT) {  /* Bad or unknown drive letter. */  /* !! Report error 0x3 (Path not found) */
-      /*fprintf(stderr, "fatal: DOS filename on wrong drive: 0x%02x\n", (unsigned char)p[0]);*/  /* !! Report error 0x3 (Path not found) */
-      /*exit(252);*/
-      goto done;
-    }
-    in_linux = dir_state->linux_mount_dir[(int)drive_idx];
-    if (!in_linux) goto done;  /* Drive not available. !! Report error 0x3 (Path not found) */
-    if ((case_mode = dir_state->case_mode[(int)drive_idx]) == CASE_MODE_UNSPECIFIED) {
-      /* This signifies a genuine bug in kvikdos.c. !! Typically still happens in find_prog(). */
-      fprintf(stderr, "assert: case mode not yet specified for drive %c:\n", 'A' + drive_idx);
-      exit(252);
-    }
-    case_flip = case_mode == CASE_MODE_LOWERCASE ? 32 : 0;
-    if (*p == '\\' || *p == '/') {
-      for (++p; *p == '\\' || *p == '/'; ++p) {}
-    } else {
-      in_dos[0] = dir_state->current_dir[(int)drive_idx];
-    }
-    in_dos[1] = p;
-  }
-  out_pend = out_p + LINUX_PATH_SIZE - 1;
-  if (in_linux) {
-    const size_t size = strlen(in_linux);
-    if (size > (size_t)(out_pend - out_p)) { too_long:  /* Pathname too long. !! Handle this error. !! Report error 0x3 (Path not found) or 0x44 (Network name limit exceeded). */
-     error:
-      out_p = out_buf;
-      goto done;
-    }
-    memcpy(out_p, in_linux, size);
-    out_p += size;
-  }
-  {  /* Convert pathnames in in_dos */
-    const char * const *in_dosi;
-    unsigned component_count = 0;
-    for (in_dosi = in_dos; in_dosi != in_dos + 2; ++in_dosi) {
-      p = *in_dosi;
-      for (; *p != '\0';) {
-        unsigned dot_count = 0;
-        char *out_limit83 = out_p + 8;
-        out_lastc = out_p;
-        if (DEBUG && !(p[0] != '\0' && p[0] != '/' && p[0] != '\\')) {
-          fprintf(stderr, "assert: pathname component empty or starts with / or \\: %s\n", p);
-          exit(252);
-        }
-        if (p[0] == '.' && (p[1] == '\0' || p[1] == '\\' || p[1] == '/' || (p[1] == '.' && (p[2] == '\0' || p[2] == '\\' || p[2] == '/')))) {
-          if (p[1] == '.') {
-            /* Security: Too many levels up, outside linux_mount_dir with `..'. It's still possible to escape up if one of the pathname components is a symlink. */
-            if (component_count-- == 0) goto error;
-          }
-          dot_count = LINUX_PATH_SIZE + 2;
-        } else {
-          ++component_count;
-          if (*p == '.') goto error;  /* First character in component is '.'. */
-        }
-        for (; *p != '\0';) {
-          const char c = *p;
-          if (out_p == out_pend) goto too_long;
-          if (c == '\\' || c == '/') {
-            *out_p++ = '/';  /* Convert '\\' to '/'. */
-            break;
-          } else if (c == '.') {
-            if (dot_count == 0) out_limit83 = out_p + (1 + 3);
-            ++dot_count;
-          } else if (c + 0U <= ' ' + 0U || c =='"' || c == '*' || c == '?' || c == ':' || c == '[' || c == ']' || c == '=' || c == '|' || c == '<' || c == '>' || c == ',' || c == ';' || c == '\x7f') {
-            goto error; /* Character not allowed in DOS pathname. DOSBox allows '+'. */
-          }
-          ++p;
-          if (out_p != out_limit83) {  /* Truncate the basename to 8 characters, and the extension to 3 characters. DOSBox does the same. */
-            const char c_uc = c & ~32;
-            *out_p++ = !(c_uc - 'A' + 0U <= 'Z' - 'A' + 0U) ? c : c_uc ^ case_flip;
-          }
-          /* TODO(pts) Truncate each component to 8.3 characters? */
-        }
-        if (dot_count <= LINUX_PATH_SIZE) {
-          if (dot_count > 1) goto error;  /* More than 1 '.' in component. DOSBox doesn't allow it either. */
-          if (p[-1] == '.') goto error;  /* Last character in component is '.'. DOSBox doesn't allow it either. It's safe to check here because of the assertion above. */
-        }
-        for (; *p == '\\' || *p == '/'; ++p) {}
-      }
-    }
-    if (p[-1] == '/' || p[-1] == '\\') goto error;  /* If pathname ends with a slash, that's an error. It's safe to check since we've checked already that it's not empty. */
-  }
- done:
-  *out_p = '\0';
-  if (is_same_ascii_nocase(out_lastc, "nul", 3) && (out_lastc[3] == '.' || out_lastc[3] == '\0')) strcpy(out_buf, "/dev/null");
-  if (out_lastc_out) *out_lastc_out = out_lastc;
-  return out_buf;
 }
 
 /* Converts a DOS pathname to a fully qualified, absolute DOS pathname. */
@@ -970,92 +1492,12 @@ static void get_dos_abspath_r(const char *p, const DirState *dir_state, char *ou
   if (DEBUG) fprintf(stderr, "debug: get_dos_abspath_r=(%s)\n", out_buf);
 }
 
-static char fnbuf[LINUX_PATH_SIZE], fnbuf2[LINUX_PATH_SIZE], exec_fnbuf[LINUX_PATH_SIZE], argv0_fnbuf[LINUX_PATH_SIZE];
+static char fnbuf[LINUX_PATH_SIZE], fnbuf2[LINUX_PATH_SIZE], argv0_fnbuf[LINUX_PATH_SIZE];
 
 #define get_linux_filename(p) get_linux_filename_r((p), dir_state, fnbuf, NULL)
 
-static const char *skip_dot_slash(const char *p) {
-  while (p[0] == '.' && p[1] == '/') {  /* Skip ./ at the beginning. */
-    for (p += 2; p[0] == '/'; ++p) {}
-  }
-  return p;
-}
-
-/* Removes the duplicate slashes in place. */
-static void remove_duplicate_slashes(char *p) {
-  const char *q = p;
-  char c;
-  while ((c = *q) != '\0') {
-    *p++ = c;
-    ++q;
-    if (c == '/') {
-      for (; *q == '/'; ++q) {}
-    }
-  }
-  *p = '\0';
-}
-
 #define DOS_PATH_SIZE 64  /* See int 0x21 ah == 0x47 (get current directory) */
 static char dosfnbuf[DOS_PATH_SIZE];
-
-/* Converts Linux pathname p to DOS absolute pathname into out_buf (of
- * DOS_PATH_SIZE bytes). Always returns out_buf. On error, sets out_buf to
- * the empty string. If drive is '\0', then finds a matching drive.
- */
-static const char *get_dos_abs_filename_r(const char *p, char drive, const DirState *dir_state, char *out_buf) {
-  const char *p0 = skip_dot_slash(p);
-  p = p0;
-  if (drive == '\0') {  /* Find the best drive, i.e. the drive with the longest matching linux_mount_dir. */
-    char best_drive = '\0';
-    size_t best_mp_size = 0;
-    for (drive = 'A'; drive < 'A' + DRIVE_COUNT; ++drive) {
-      const char *mp = dir_state->linux_mount_dir[drive - 'A'];
-      if (mp) {
-        const size_t mp_size = strlen(mp);
-        if (strncmp(p0, mp, mp_size) == 0 && mp_size + 1 > best_mp_size) {  /* Upon equality, use the earlier drive. */
-          best_drive = drive;
-          best_mp_size = mp_size + 1;
-        }
-      }
-    }
-    if (best_drive == '\0') goto error;  /* No mounted drives. */
-    drive = best_drive;
-  } else {  /* Use the specified drive. */
-    const char *mp = dir_state->linux_mount_dir[drive - 'A'];
-    if (mp) {
-      const size_t mp_size = strlen(mp);
-      if (strncmp(p0, mp, mp_size) != 0) goto error;  /* File not on the mount point of drive. */
-    } else {
-      goto error;  /* No such drive. */
-    }
-  }
-  {
-    const char *mp = dir_state->linux_mount_dir[drive - 'A'];
-    const size_t mp_size = strlen(mp);
-    if (0 == strncmp(p0, mp, mp_size)) {
-      char *r = out_buf;
-      char *rend = out_buf + DOS_PATH_SIZE - 1;
-      *r++ = drive;
-      *r++ = ':';
-      *r++ = '\\';
-      for (p = p0 + mp_size; *p != '\0';) {
-        const char c = *p++;
-        if (r == rend) goto error;  /* DOS pathname too long. */
-        if (c == '/') {
-          for (; *p == '/'; ++p) {}  /* Skip subsequent slashes. */
-        }
-        /* TODO(pts): Check that each pathname component is at most 8.3 bytes long. */
-        *r++ = (c == '/') ? '\\'  /* Convert '/' to '\\'. */
-             : (c - 'a' + 0U <= 'z' - 'a' + 0U) ? c & ~32 : c;  /* Convert to uppercase. */
-      }
-      *r = '\0';
-      return out_buf;
-    }
-  }
- error:
-  *out_buf = '\0';  /* Mount point not found. */
-  return out_buf;
-}
 
 /* `var' usually looks like `PATH=C:\value'. Everything before the '=' is converted to lowercase. */
 static char *add_env(char *env, char *env_end, const char *var, char do_check) {
@@ -1080,15 +1522,6 @@ static char *add_env(char *env, char *env_end, const char *var, char do_check) {
   return env;
 }
 
-/* Example name_prefix: "PATH=". */
-static const char *getenv_prefix(const char *name_prefix, const char **env, const char **env_end) {
-  const size_t name_prefix_size = strlen(name_prefix);
-  for (; env != env_end; ++env) {
-    if (strncmp(*env, name_prefix, name_prefix_size) == 0) return *env + name_prefix_size;
-  }
-  return NULL;
-}
-
 #if 0  /* Currently unused. */
 static const char *getenv_dos_prefix(const char *name_prefix, const char *env) {
   const size_t name_prefix_size = strlen(name_prefix);
@@ -1100,114 +1533,6 @@ static const char *getenv_dos_prefix(const char *name_prefix, const char *env) {
   return NULL;
 }
 #endif
-
-/* Program filename type. */
-#define PFT_LINUX 0
-#define PFT_DOS 1
-#define PFT_PATH 2
-
-/* Returns PFT_*. */
-static char detect_prog_filename_type(const char *prog_filename) {
-  struct stat st;
-  if ((prog_filename[0] & ~32) - 'A' + 0U <= 'Z' - 'A' + 0U && prog_filename[1] == ':') return PFT_DOS;
-  if (strchr(prog_filename, '/')) return PFT_LINUX;
-  if (strchr(prog_filename, '\\')) return PFT_DOS;
-  if (strchr(prog_filename, '.') && stat(prog_filename, &st) == 0 && S_ISREG(st.st_mode)) return PFT_LINUX;
-  return PFT_PATH;
-}
-
-/* Same extension lookup order as in DOS. */
-static const char * const find_prog_on_path_exts[] = { ".com", ".exe", ".bat", /* ".cmd", for Windows NT+. */ NULL };
-static const char * const find_prog_on_path_no_exts[] = { "", NULL };
-
-/* Works only if no ':', '/', or '\\'  in prog_filename. This is guranteed
- * if detect_prog_filename_type has returned PFT_PATH.
- * prog_filename is a single-component DOS program name, with or without a '.'.
- * The return value is a Linux pathname.
- * Uses global variable fnbuf as temporary storage and return value.
- * Uses global variable fnbuf2 as temporary storage.
- */
-static char *find_prog_on_path(const char *prog_filename, const DirState *dir_state, const char *dos_path, char *drive_out) {
-  size_t size;
-  const char *p, *pp, *pq;
-  char *r;
-  char c;
-  char drive = dir_state->drive;
-  const char * const * exts0;
-  for (p = prog_filename; (c = *p) != '\0' && c != ':' && c != '/' && c != '\\'; ++p) {}
-  if (*p != '\0') {
-    /* Call detect_prog_filename_type first, and if it returns PFT_PATH, only then call find_prog_on_path. */
-    fprintf(stderr, "assert: prog_filename contains disallowed characters: %s\n", prog_filename);
-    exit(252);
-  }
-  get_linux_filename_r(prog_filename, NULL /* dir_state */, fnbuf2, NULL);
-  if ((fnbuf2[0] == '.' && fnbuf2[1] == '\0') ||  /* "." is an invalid program name. */
-      fnbuf2[0] == '\0') { too_long:
-    fnbuf[0] = '\0'; return fnbuf;  /* Invalid program name. */
-  }
-  size = strlen(prog_filename);
-  for (p = prog_filename + size; p != prog_filename && *--p != '.';) {}
-  /* DOS allows only exts in find_prog_on_path_exts, we allow anything the user specifies here. */
-  exts0 = (*p != '.') ? find_prog_on_path_exts : find_prog_on_path_no_exts;
-  if (DEBUG) fprintf(stderr, "debug: DOS path lookup prog_filename=%s p=%s dos_path=%s\n", prog_filename, p, dos_path);
-  pp = pq = NULL;
-  for (;;) {  /* Find in current directory first, then continue finding on DOS %PATH%. */
-    const char * const * exts;
-    r = fnbuf;
-    if (pp) {
-      char c, *pt, ptc;
-      for (pq = pp; (c = *pp) != ';' && c != '\0'; ++pp) {}
-      drive = pq[0] & ~32;
-      if (drive - 'A' + 0U <= 'Z' - 'A' + 0U && pq[1] == ':') {
-        if (pq[2] != '\\' && pq[2] != '/') goto end_of_pp;  /* Not an absolute pathname within a drive. */
-      } else {
-        drive = dir_state->drive;
-      }
-      *(char*)pp = '\0';  /* Temporary terminator within dos_path, for get_linux_filename_r. */
-      for (pt = (char*)pp; pt != pq && ((ptc = pt[-1]) == '\\' || ptc == '/'); --pt) {}
-      if (pt != pq) { ptc = *pt; *pt = '\0'; }  /* Temporarily remove trailing backslashes. */
-      get_linux_filename_r(pq, dir_state, fnbuf, NULL);
-      if (pt != pq) *pt = ptc;  /* Restore trailing backlashes, if any. */
-      *(char*)pp = c;  /* Restore the terminator. */
-      if (*fnbuf == '\0') goto end_of_pp;  /* Skip if filename is invalid. */
-      r = fnbuf + strlen(fnbuf);
-      if (fnbuf[0] != '\0' && r[-1] != '/') {  /* fnbuf ends with a slash if %PATH% component is just a drive letter, e.g. C: */
-        if ((unsigned)(r - fnbuf)  >= sizeof(fnbuf)) goto too_long;
-        *r++ = '/';
-      }
-    }
-    if ((unsigned)(r - fnbuf) + size >= sizeof(fnbuf)) goto too_long;
-    memcpy(r, prog_filename, size + 1);  /* Including the trailing '\0'. */
-    case_fold_on_drive(r, drive, dir_state);
-    if (*r == '\0') goto end_of_pp;  /* Invalid pathname or invalid drive. */
-    r += size;
-    *r = '\0';
-    if (DEBUG) fprintf(stderr, "debug: trying progs: %s\n", fnbuf);
-    for (exts = exts0; *exts; ++exts) {
-      const size_t ext_size = strlen(*exts);
-      struct stat st;
-      if ((unsigned)(r - fnbuf) + ext_size >= sizeof(fnbuf)) goto too_long;
-      memcpy(r, *exts, ext_size + 1);  /* Including the trailing '\0'. */
-      case_fold_on_drive(r, drive, dir_state);
-      if (DEBUG) fprintf(stderr, "debug: trying prog: %s\n", fnbuf);
-      if (stat(fnbuf, &st) == 0 && S_ISREG(st.st_mode)) {
-        if (DEBUG) fprintf(stderr, "debug: found prog on drive=%c: %s\n", drive, fnbuf);
-        *drive_out = drive;
-        return fnbuf;  /* Found executable program file. */
-      }
-    }
-   end_of_pp:
-    if (pp) {
-    } else if (dos_path) {
-      pp = dos_path;
-    } else {
-      break;
-    }
-    for (; *pp == ';'; ++pp) {}  /* Skip over %PATH% separator characters ';'. */
-    if (*pp == '\0') break;
-  }
-  return NULL;  /* Not found on %PA%H. */
-}
 
 /* Sets interrupt vector for int_num to value_seg_ofs in IVT. Does some
  * checks. Returns 0 on success.
@@ -1348,10 +1673,6 @@ typedef struct TtyState {
   const unsigned short *next_fake_key;
 } TtyState;
 
-
-typedef struct EmuParams {
-  char is_hlt_ok;
-} EmuParams;
 
 typedef struct EmuState {
   struct kvm_fds kvm_fds;
@@ -1562,6 +1883,8 @@ static int open_dos_file(const char *dos_filename, const char *dos_prog_abs, int
  after_open:
   return fd;
 }
+
+static char exec_fnbuf[LINUX_PATH_SIZE];  /* Used temporarily by run_dos_prog. */
 
 /* Runs a DOS .com or .exe program in `emu'. Cannot run DOS .bat batch files.
  * Must be preceded by init_emu(emu).
@@ -3283,303 +3606,10 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
   return exit_code;
 }
 
-typedef struct ParsedCmdArgs {
-  const char *prog_filename;
-  EmuParams emu_params;
-  DirState dir_state;
-  TtyState tty_state;
-  const char* const *args;  /* NULL-terminated list of NUL-terminated strings. Overlaps the program main(...) argv. */
-  const char* const *envp0;  /* NULL-terminated list of NUL-terminated strings. Overlaps the program main(...) argv. */
-} ParsedCmdArgs;
-
-static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const char *pre_msg, const char *usage_extra, const char *post_msg) {
-  ParsedCmdArgs cmd_args;
-  const char *argv0;
-  char is_drive_specified;
-  char prog_filename_type;
-  char *prog_name_arg;
-  char **envp0, **envp;
-  const char *dos_path;
-  char dos_prog_drive;
-
-  argv0 = argv[0];
-  if (!argv0 || !argv[1] || 0 == strcmp(argv[1], "--help")) {
-    fprintf(stderr, "%s%s%s [<flag> ...] <dos-executable-file> [<dos-arg> ...]\n%s"
-                    "Flags:\n"
-                    "--env=<NAME>=<value>: Adds environment variable.\n"
-                    "--prog=<dos-pathname>: Sets DOS pathname of program.\n"
-                    "--mount=<drive><case><dirname>/: Makes Linux dir visible as <drive> for DOS program.\n"
-                    "    If <case> is :, then mount uppercase. If <case> is -, then mount lowercase.\n"
-                    "--mount=<drive>0: Makes sure that <drive>: is not visible in DOS.\n"
-                    "--drive=<drive>: Sets initial current drive for DOS program.\n"
-                    "--tty-in=<fd>: Selects Linux file descriptor for keyboard input.\n"
-                    "    -3: fake keys; -2: stdin buffered; -1: /dev/tty; 0: stdin etc.\n"
-                    "--hlt-ok: Allow the hlt instruction.\n",
-                    pre_msg, argv0, usage_extra, post_msg);
-    exit(argv0 && argv[1] ? 0 : 1);
-  }
-
-  { unsigned u;
-    for (u = 0; u < DRIVE_COUNT; ++u) {
-      cmd_args.dir_state.current_dir[u][0] = '\0';
-      cmd_args.dir_state.linux_mount_dir[u] = NULL;
-    }
-    cmd_args.dir_state.drive = 'C';
-    cmd_args.dir_state.dos_prog_abs = NULL;
-    cmd_args.dir_state.linux_mount_dir['C' - 'A'] = fnbuf;  /* Placeholder for default. */
-    cmd_args.dir_state.linux_mount_dir['D' - 'A'] = fnbuf;  /* Placeholder for default. */
-    cmd_args.dir_state.linux_mount_dir['E' - 'A'] = fnbuf;  /* Placeholder for default. */
-    memset(cmd_args.dir_state.case_mode, CASE_MODE_UNSPECIFIED, DRIVE_COUNT);
-  }
-
-  envp = envp0 = ++argv;
-  cmd_args.tty_state.tty_in_fd = -1;
-  cmd_args.tty_state.is_tty_in_error = 0;
-  cmd_args.tty_state.next_fake_key = fake_keys;
-  cmd_args.emu_params.is_hlt_ok = 0;
-  is_drive_specified = 0;
-  while (argv[0]) {
-    char *arg = *argv++;
-    if (arg[0] != '-' || arg[1] == '\0') {
-      --argv; break;
-    } else if (arg[1] == '-' && arg[2] == '\0') {
-      break;
-    } else if (0 == strcmp(arg, "--hlt-ok")) {
-      cmd_args.emu_params.is_hlt_ok = 1;
-    } else if (0 == strcmp(arg, "--env")) {
-      if (!argv[0]) { missing_argument:
-        fprintf(stderr, "fatal: missing argument for flag: %s\n", arg);
-        exit(1);
-      }
-      arg = *argv++;
-     do_env:
-      { char *p = arg, c;
-        for (; (c = *p) != '\0' && c != '='; ++p) {
-          if (c - 'a' + 0U <= 'z' - 'a' + 0U) *p &= ~32;  /* Convert variable name to uppercase. */
-        }
-      }
-      *envp++ = arg;  /* Reuse the argv array. */
-    } else if (0 == strncmp(arg, "--env=", 6)) {  /* Can be specified multiple times. */
-      arg += 6;
-      goto do_env;
-    } else if (0 == strcmp(arg, "--prog")) {
-      if (!argv[0]) goto missing_argument;
-      arg = *argv++;
-     do_prog:
-      cmd_args.dir_state.dos_prog_abs = arg;
-    } else if (0 == strncmp(arg, "--prog=", 7)) {
-      arg += 7;
-      goto do_prog;
-    } else if (0 == strcmp(arg, "--mount")) {  /* Can be specified multiple times. */
-      if (!argv[0]) goto missing_argument;
-      arg = *argv++;
-     do_mount:  /* Default: --mount C:. */
-      if ((arg[0] & ~32) - 'A' + 0U >= DRIVE_COUNT || !(arg[1] == ':' || arg[1] == '-' || arg[1] == '0')) {
-        fprintf(stderr, "fatal: mount argument must start with <drive>: or <drive>-, <drive> must be A .. %c: %s\n", 'A' + DRIVE_COUNT - 1, arg);
-        exit(1);
-      } else {
-        const char drive_idx = (arg[0] & ~32) - 'A';
-        const char case_mode = arg[1] == '0' ? CASE_MODE_UNSPECIFIED : arg[1] == '-' ? CASE_MODE_LOWERCASE : CASE_MODE_UPPERCASE;
-        if (arg[1] == '0') {
-          if (arg[2] != '\0') {
-            fprintf(stderr, "fatal: mount argument for not visibility must stop at 0: %s\n", arg);
-            exit(1);
-          }
-          arg = NULL;  /* Make sure not mounted. */
-        } else {
-          arg += 2;
-          if (DEBUG) fprintf(stderr, "debug: mount %c: %s\n", drive_idx + 'A', arg);
-          if (arg[0] == '\0') {
-            arg = fnbuf;  /* Placeholder for default. */
-          } else {
-            arg = (char*)skip_dot_slash(arg);
-            remove_duplicate_slashes(arg);
-            if (arg[0] == '.' && arg[1] == '\0') {
-              ++arg;
-            } else if (arg[0] != '\0') {
-              char *p = arg + strlen(arg);
-              if (arg[1] != '\0' && p[-1] == '.' && p[-2] == '/') *--p = '\0';  /* Remove trailing . if it ends with /. */
-              if (p[-1] != '/') {
-                fprintf(stderr, "fatal: mount directory target must end with /: %s\n", arg);
-                exit(1);
-              }
-            }
-          }
-        }
-        cmd_args.dir_state.linux_mount_dir[(int)drive_idx] = arg;  /* argv retains ownership of arg. */
-        cmd_args.dir_state.case_mode[(int)drive_idx] = case_mode;
-      }
-    } else if (0 == strncmp(arg, "--mount=", 8)) {
-      arg += 8;
-      goto do_mount;
-    } else if (0 == strcmp(arg, "--drive")) {  /* Can be specified multiple times. */
-      if (!argv[0]) goto missing_argument;
-      arg = *argv++;
-     do_drive:  /* Default: --drive C: */
-      if ((arg[0] & ~32) - 'A' + 0U >= DRIVE_COUNT || !(arg[1] == '\0' || (arg[1] == ':' && arg[2] == '\0'))) {
-        fprintf(stderr, "fatal: drive argument must be <drive>:, <drive> must be A .. %c: %s\n", 'A' + DRIVE_COUNT - 1, arg);
-        exit(1);
-      }
-      cmd_args.dir_state.drive = arg[0] & ~32;
-      is_drive_specified = 1;
-    } else if (0 == strncmp(arg, "--drive=", 8)) {
-      arg += 8;
-      goto do_drive;
-    } else if (0 == strcmp(arg, "--tty-in")) {
-      int char_count;
-      if (!argv[0]) goto missing_argument;
-      arg = *argv++;
-     do_tty_in:
-      if (sscanf(arg, "%d%n", &cmd_args.tty_state.tty_in_fd, &char_count) < 1 || char_count + 0U != strlen(arg) || cmd_args.tty_state.tty_in_fd < -3) {
-        /* -1: use /dev/tty; -2: use 0 (stdin), but don't try to disable buffering; -3: fake keys in round-robin. */
-        fprintf(stderr, "fatal: tty-in argument must be nonnegative integer or -1, -2 or -3: %s\n", arg);
-        exit(1);
-      }
-      /* Now we've set cmd_args.tty_state.tty_in_fd. */
-    } else if (0 == strncmp(arg, "--tty-in=", 9)) {
-      arg += 9;
-      goto do_tty_in;
-    } else {
-      fprintf(stderr, "fatal: unknown command-line flag: %s\n", arg);
-      exit(1);
-    }
-  }
-  /* Now: argv contains remaining (non-flag) arguments. */
-  if (!argv[0]) {
-    fprintf(stderr, "fatal: missing <dos-executable-file> DOS program filename\n");
-    exit(1);
-  }
-#if 0  /* Tests for replacing the output with "" */
-  fprintf(stderr, "GLF (%s)\n", get_linux_filename("C:\\foo\\.\\.\\\\bar\\."));
-  fprintf(stderr, "GLF (%s)\n", get_linux_filename(".\\.\\."));
-  fprintf(stderr, "GLF (%s)\n", get_linux_filename(".\\aaa\\..\\..\\.."));  /* "" */
-  fprintf(stderr, "GLF (%s)\n", get_linux_filename(".\\aaa\\..\\.."));  /* "" */
-  fprintf(stderr, "GLF (%s)\n", get_linux_filename(".\\aaa\\.."));
-  fprintf(stderr, "GLF (%s)\n", get_linux_filename("C:\\foo\\.\\\\\\.\\bar\\.\\..\\.\\bazzzz\\.."));
-#endif
-  prog_name_arg = *argv++;  /* This is a Linux filename. */
-  *envp = NULL;
-  /* Remaining arguments in argv will be passed to the DOS program in PSP:0x80. */
-  dos_path = getenv_prefix("PATH=", (char const**)envp0, (char const**)envp);
-
-  if (cmd_args.dir_state.linux_mount_dir['C' - 'A'] == fnbuf) {  /* Set to current directory in Linux. */
-    cmd_args.dir_state.linux_mount_dir['C' - 'A'] = "";  /* Either --mount=C:. (uppercase) or --mount=C-. (lowercase). */
-    /*if (cmd_args.dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED) { ... }*/  /* Will be changed below. */
-  }
-  if (cmd_args.dir_state.linux_mount_dir['D' - 'A'] == fnbuf) {  /* Set to emulator directory (based on argv0). !! Process readlink(2). */
-    const char *p_base = skip_dot_slash(argv0), *p = p_base + strlen(p_base);
-    size_t size;
-    for (; p != p_base && p[-1] != '/'; --p) {}
-    if ((size = p - p_base) >= sizeof(argv0_fnbuf)) {
-      fprintf(stderr, "fatal: emulator program name (argv[0]) too long for mount: %s\n", p_base);
-      exit(252);
-    }
-    memcpy(argv0_fnbuf, p_base, size);  /* Empty or ends with slash. */
-    argv0_fnbuf[size] = '\0';
-    remove_duplicate_slashes(argv0_fnbuf);
-    cmd_args.dir_state.linux_mount_dir['D' - 'A'] = argv0_fnbuf;  /* Either --mount=C:. (uppercase) or --mount=C-. (lowercase). */
-    /*if (cmd_args.dir_state.case_mode['D' - 'A'] == CASE_MODE_UNSPECIFIED) { ... }*/  /* Will be changed below. */
-  }
-  dos_prog_drive = '\0';
-
-  prog_filename_type = detect_prog_filename_type(prog_name_arg);
-  if (prog_filename_type == PFT_LINUX) {
-    prog_name_arg = (char*)skip_dot_slash(prog_name_arg);
-    remove_duplicate_slashes(prog_name_arg);
-    cmd_args.prog_filename = prog_name_arg;
-    if (cmd_args.dir_state.linux_mount_dir['E' - 'A'] == fnbuf) {  /* If not explicitly mounted, mount E: to the directory of prog_filename.  */
-      const char *p = prog_name_arg + strlen(prog_name_arg), *q;
-      size_t q_size;
-      for (; p != prog_name_arg && p[-1] != '/'; --p) {}
-      for (q = p; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
-      if (cmd_args.dir_state.case_mode['E' - 'A'] == CASE_MODE_UNSPECIFIED) {
-        cmd_args.dir_state.case_mode['E' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;  /* Mount as lowercase iff the executable program name has at least one lowercase character. */
-      }
-      q = prog_name_arg;
-      while (q != p && q[0] == '.' && q[1] == '/') {  /* Skip ./ at the beginning. */
-        for (q += 2; q != p && q[0] == '/'; ++q) {}
-      }
-      q_size = strlen(q) + 1;
-      if (q_size > sizeof(fnbuf)) {
-        fprintf(stderr, "fatal: Linux name of executable program too long: %s\n", q);
-        exit(252);
-      }
-      memcpy(fnbuf, q, q_size);  /* Including the trailing '\0'. */
-      cmd_args.prog_filename = fnbuf;
-      *(char*)p = '\0';  /* Modify it in place in argv. */
-      cmd_args.dir_state.linux_mount_dir['E' - 'A'] = q;  /* Empty or ends with '/'. */
-      dos_prog_drive = 'E';
-      if (!is_drive_specified && !cmd_args.dir_state.linux_mount_dir[cmd_args.dir_state.drive - 'A']) cmd_args.dir_state.drive = 'E';
-    }
-    if (cmd_args.dir_state.case_mode['D' - 'A'] == CASE_MODE_UNSPECIFIED && cmd_args.dir_state.linux_mount_dir['D' - 'A']) {
-      cmd_args.dir_state.case_mode['D' - 'A'] = get_case_mode_from_last_component(cmd_args.prog_filename);  /* Mount as lowercase iff the executable program has at least one lowercase character. */
-    }
-    /* We will set cmd_args.dir_state.case_mode['C' - 'A'] later. */
-  } else {
-    if (cmd_args.dir_state.linux_mount_dir['E' - 'A'] == fnbuf) cmd_args.dir_state.linux_mount_dir['E' - 'A'] = NULL;  /* Drive E: not mounted by default. */
-    if (prog_filename_type == PFT_PATH && !dos_path && cmd_args.dir_state.drive == 'C' && cmd_args.dir_state.linux_mount_dir['C' - 'A'] && cmd_args.dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED) {  /* Just a command without a filename extension, e.g. "guest" or "GUEST". */
-      cmd_args.dir_state.case_mode['C' - 'A'] = get_case_mode_from_last_component(prog_name_arg);
-    }
-    { char drive;
-      for (drive = 'C'; drive <= 'E'; ++drive) {
-        if (cmd_args.dir_state.case_mode[drive - 'A'] == CASE_MODE_UNSPECIFIED && cmd_args.dir_state.linux_mount_dir[drive - 'A']) {
-          cmd_args.dir_state.case_mode[drive - 'A'] = CASE_MODE_UPPERCASE;
-        }
-      }
-    }
-    /* cmd_args.dir_state.linux_mount_dir[...] and cmd_args.dir_state.case_mode[...] are used below. */
-    if (prog_filename_type == PFT_DOS) {
-      cmd_args.prog_filename = get_linux_filename_r(prog_name_arg, &cmd_args.dir_state, fnbuf, NULL);  /* Return value is fnbuf. */
-      if (*cmd_args.prog_filename == '\0') {
-        fprintf(stderr, "fatal: <dos-executable-file> is not a valid DOS pathname or contains an invalid drive: %s\n", prog_name_arg);
-        exit(252);
-      }
-    } else if (prog_filename_type == PFT_PATH) {
-      if (cmd_args.dir_state.linux_mount_dir['E' - 'A'] == fnbuf) cmd_args.dir_state.linux_mount_dir['E' - 'A'] = NULL;  /* Drive E: not mounted by default. */
-      cmd_args.prog_filename = get_linux_filename_r(prog_name_arg, NULL /* cmd_args.dir_state */, fnbuf, NULL);  /* Return value is fnbuf. */
-      if (*cmd_args.prog_filename == '\0') {
-        fprintf(stderr, "fatal: <dos-executable-file> is not a valid DOS filename: %s\n", prog_name_arg);
-        exit(252);
-      }
-      cmd_args.prog_filename = find_prog_on_path(prog_name_arg, &cmd_args.dir_state, dos_path, &dos_prog_drive);  /* Return value is fnbuf or NULL. */
-      if (!cmd_args.prog_filename) {
-        fprintf(stderr, "fatal: DOS command not found on %c:\\ or %%PATH%%: %s\n", cmd_args.dir_state.drive, prog_name_arg);
-        exit(252);
-      }
-      if (*cmd_args.prog_filename == '\0') {
-        fprintf(stderr, "fatal: invalid <dos-executable-file> DOS program name: %s\n", prog_name_arg);
-        exit(252);
-      }
-    } else {
-      fprintf(stderr, "assert: bad prog_filenam_type: %d\n", prog_filename_type);
-      exit(252);
-    }
-  }
-  prog_name_arg = NULL;  /* Make sure we don't use it later, we've already modified it for cmd_args.dir_state.linux_mount_dir['E' - 'A']. */
-
-  if (!cmd_args.dir_state.linux_mount_dir[cmd_args.dir_state.drive - 'A']) {
-    /*cmd_args.dir_state.drive = 'C';*/
-    fprintf(stderr, "fatal: no mount point for default drive (specify --mount=...): %c:\n", cmd_args.dir_state.drive);
-    exit(1);
-  }
-  if (cmd_args.dir_state.dos_prog_abs == NULL) {
-    cmd_args.dir_state.dos_prog_abs = get_dos_abs_filename_r(cmd_args.prog_filename, dos_prog_drive, &cmd_args.dir_state, dosfnbuf);
-    if (DEBUG) fprintf(stderr, "debug: prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", cmd_args.prog_filename, cmd_args.dir_state.dos_prog_abs, dos_prog_drive);
-  }
-  if (prog_filename_type == PFT_LINUX && cmd_args.dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED && cmd_args.dir_state.linux_mount_dir['C' - 'A']) {
-    const char *mount_c = cmd_args.dir_state.linux_mount_dir['C' - 'A'];
-    const char *q;
-    if (cmd_args.dir_state.dos_prog_abs[0] == 'C' || strncmp(cmd_args.prog_filename, mount_c, strlen(mount_c)) == 0) {  /* Set case mode from the entire pathname. */
-      for (q = cmd_args.prog_filename; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
-      cmd_args.dir_state.case_mode['C' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;
-    } else {  /* Set case mode from the basename only. */
-      cmd_args.dir_state.case_mode['C' - 'A'] = get_case_mode_from_last_component(cmd_args.prog_filename);
-    }
-  }
-
-  cmd_args.args = (const char* const*)argv;
-  cmd_args.envp0 = (const char* const*)envp0;
-  *cmd_args_out = cmd_args;
+static void init_tty_state(TtyState *tty_state, int tty_in_fd) {
+  tty_state->tty_in_fd = tty_in_fd;
+  tty_state->is_tty_in_error = 0;
+  tty_state->next_fake_key = fake_keys;
 }
 
 /* --- */
@@ -3591,14 +3621,48 @@ int main(int argc, char **argv) {
       argv, &cmd_args,
       "kvikdos: run DOS programs headless (a very fast DOS emulator)\nUsage: ", "",
       "This is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.\n");
+  if (0) {  /* Just dump the parsed command-line. */
+    /* cmd_args.dir_state.linux_prog is still NULL, use cmd_args.prog_filename instead. */
+    printf("linux prog: %s\n", cmd_args.prog_filename);
+    printf("dos prog: %s\n", cmd_args.dir_state.dos_prog_abs);
+    printf("drive %c:\n", cmd_args.dir_state.drive);
+    { char drive_idx;
+      for (drive_idx = 0; drive_idx < DRIVE_COUNT; ++drive_idx) {
+        const char *mount_dir = cmd_args.dir_state.linux_mount_dir[(int)drive_idx];
+        if (mount_dir) {
+          printf("mount dir of   %c: %s\n", 'A' + drive_idx, mount_dir[0] != '\0' ? mount_dir : "./");
+          /*printf("current dir on %c: %s\n", 'A' + drive_idx, cmd_args.dir_state.current_dir[(int)drive_idx]);*/  /* Currently always empty. */
+          printf("case mode of   %c: %d\n", 'A' + drive_idx, cmd_args.dir_state.case_mode[(int)drive_idx]);
+        }
+      }
+    }
+    printf("end of drives\n");
+    { const char* const *arg;
+      for (arg = cmd_args.args; *arg; ++arg) {
+        printf("arg: %s\n", *arg);
+      }
+      printf("end of args\n");
+    }
+    { const char* const *env;
+      for (env = cmd_args.envp0; *env; ++env) {
+        printf("env: %s\n", *env);
+      }
+      printf("end of envs\n");
+    }
+    printf("tty_in_fd: %d\n", cmd_args.tty_in_fd);
+    printf("is_hlt_ok: %d\n", cmd_args.emu_params.is_hlt_ok);
+    return 0;
+  }
   { int exit_code;
     const char *ext = get_linux_ext(cmd_args.prog_filename);
     EmuState emu;
-    init_emu(&emu);  /* This is lightweight, it doesn't initialized KVM. */
+    TtyState tty_state;
+    init_emu(&emu);  /* This is lightweight, it doesn't initialize KVM. */
+    init_tty_state(&tty_state, cmd_args.tty_in_fd);
     if (is_same_ascii_nocase(ext, "bat", 4)) {
-      exit_code = run_dos_batch(&emu, cmd_args.prog_filename, cmd_args.args, &cmd_args.dir_state, &cmd_args.tty_state, &cmd_args.emu_params, cmd_args.envp0);
+      exit_code = run_dos_batch(&emu, cmd_args.prog_filename, cmd_args.args, &cmd_args.dir_state, &tty_state, &cmd_args.emu_params, cmd_args.envp0);
     } else {
-      exit_code = run_dos_prog(&emu, cmd_args.prog_filename, NULL, cmd_args.args, &cmd_args.dir_state, &cmd_args.tty_state, &cmd_args.emu_params, cmd_args.envp0);
+      exit_code = run_dos_prog(&emu, cmd_args.prog_filename, NULL, cmd_args.args, &cmd_args.dir_state, &tty_state, &cmd_args.emu_params, cmd_args.envp0);
     }
     if (DEBUG) fprintf(stderr, "debug: DOS program exited with code: 0x%02x", exit_code);
     return exit_code;
