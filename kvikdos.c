@@ -58,6 +58,7 @@
 #endif
 
 #define CMD_PARSE_DEBUG DEBUG
+#define CMD_PARSE_MEM_MB_1 1
 
 /* --- Command-line (argv) parser. Can be used separately from kvikdos. */
 
@@ -68,6 +69,10 @@
 
 #ifndef CMD_PARSE_DEBUG
 #define CMD_PARSE_DEBUG 0
+#endif
+
+#ifndef CMD_PARSE_MEM_MB_1
+#define CMD_PARSE_MEM_MB_1 0
 #endif
 
 #define CASE_MODE_UPPERCASE 0
@@ -433,6 +438,7 @@ static char dosfnbuf[DOS_PATH_SIZE];
 
 typedef struct EmuParams {
   char is_hlt_ok;
+  unsigned mem_mb;
 } EmuParams;
 
 typedef struct ParsedCmdArgs {
@@ -469,6 +475,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
                     "--drive=<drive>: Sets initial current drive for DOS program.\n"
                     "--tty-in=<fd>: Selects Linux file descriptor for keyboard input.\n"
                     "    -3: fake keys; -2: stdin buffered; -1: /dev/tty; 0: stdin etc.\n"
+                    "--mem-mb=<n>: Use n MiB of memory for DOS. Only 1 is supported.\n"
                     "--hlt-ok: Allow the hlt instruction.\n",
                     pre_msg, argv0, usage_extra, post_msg);
     exit(argv0 && argv[1] ? 0 : 1);
@@ -489,6 +496,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
 
   envp = envp0 = ++argv;
   cmd_args.tty_in_fd = -1;
+  cmd_args.emu_params.mem_mb = 1;
   cmd_args.emu_params.is_hlt_ok = 0;
   is_drive_specified = 0;
   while (argv[0]) {
@@ -592,6 +600,23 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
     } else if (0 == strncmp(arg, "--tty-in=", 9)) {
       arg += 9;
       goto do_tty_in;
+    } else if (0 == strcmp(arg, "--mem-mb")) {
+      int char_count;
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+     do_mem_mb:
+      if (sscanf(arg, "%d%n", (int*)&cmd_args.emu_params.mem_mb, &char_count) < 1 || char_count + 0U != strlen(arg) || (int)cmd_args.emu_params.mem_mb <= 0) {
+        fprintf(stderr, "fatal: mem-mb argument must be poisitive: %s\n", arg);
+        exit(1);
+      }
+      if (CMD_PARSE_MEM_MB_1 && cmd_args.emu_params.mem_mb != 1) {
+        fprintf(stderr, "fatal: only 1 MiB of memory is supported, requested: %s\n", arg);
+        exit(1);
+      }
+      /* Now we've set cmd_args.mem_mb. */
+    } else if (0 == strncmp(arg, "--mem-mb=", 9)) {
+      arg += 9;
+      goto do_mem_mb;
     } else {
       fprintf(stderr, "fatal: unknown command-line flag: %s\n", arg);
       exit(1);
@@ -1715,6 +1740,7 @@ static void reset_emu(struct EmuState *emu) {
       perror("fatal: failed to create KVM vm");
       exit(252);
     }
+    /* If emu_params->mem_mb > 1, then we have allocate more. */
     if ((emu->mem = mem = mmap(NULL, DOS_MEM_LIMIT, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)) ==
         NULL) {
@@ -3652,6 +3678,7 @@ int main(int argc, char **argv) {
       printf("end of envs\n");
     }
     printf("tty_in_fd: %d\n", cmd_args.tty_in_fd);
+    printf("mem_mb: %d\n", cmd_args.emu_params.mem_mb);
     printf("is_hlt_ok: %d\n", cmd_args.emu_params.is_hlt_ok);
     return 0;
   }
