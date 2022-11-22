@@ -3282,7 +3282,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
   return exit_code;
 }
 
-int main(int argc, char **argv) {
+static int parse_args_and_run_dos(char **argv, const char *pre_msg, const char *usage_extra, const char *post_msg) {
   const char *argv0;
   char is_drive_specified;
   char prog_filename_type;
@@ -3295,12 +3295,9 @@ int main(int argc, char **argv) {
   const char *dos_path;
   char dos_prog_drive;
 
-  (void)argc;
   argv0 = argv[0];
   if (!argv0 || !argv[1] || 0 == strcmp(argv[1], "--help")) {
-    fprintf(stderr, "kvikdos: run DOS programs headless (a very fast DOS emulator)\n"
-                    "Usage: %s [<flag> ...] <dos-executable-file> [<dos-arg> ...]\n"
-                    "This is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.\n"
+    fprintf(stderr, "%s%s%s [<flag> ...] <dos-executable-file> [<dos-arg> ...]\n%s"
                     "Flags:\n"
                     "--env=<NAME>=<value>: Adds environment variable.\n"
                     "--prog=<dos-pathname>: Sets DOS pathname of program.\n"
@@ -3311,7 +3308,7 @@ int main(int argc, char **argv) {
                     "--tty-in=<fd>: Selects Linux file descriptor for keyboard input.\n"
                     "    -3: fake keys; -2: stdin buffered; -1: /dev/tty; 0: stdin etc.\n"
                     "--hlt-ok: Allow the hlt instruction.\n",
-                    argv0);
+                    pre_msg, argv0, usage_extra, post_msg);
     exit(argv0 && argv[1] ? 0 : 1);
   }
 
@@ -3574,7 +3571,7 @@ int main(int argc, char **argv) {
   }
 
   { int exit_code;
-    const char *ext= get_linux_ext(prog_filename);
+    const char *ext = get_linux_ext(prog_filename);
     EmuState emu;
     init_emu(&emu);  /* This is lightweight, it doesn't initialized KVM. */
     if (is_same_ascii_nocase(ext, "bat", 4)) {
@@ -3585,4 +3582,14 @@ int main(int argc, char **argv) {
     if (DEBUG) fprintf(stderr, "debug: DOS program exited with code: 0x%02x", exit_code);
     return exit_code;
   }
+}
+
+/* --- */
+
+int main(int argc, char **argv) {
+  (void)argc;
+  return parse_args_and_run_dos(
+      argv,
+      "kvikdos: run DOS programs headless (a very fast DOS emulator)\nUsage: ", "",
+      "This is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.\n");
 }
