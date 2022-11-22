@@ -1314,25 +1314,31 @@ static char should_skip_exec_program(char const *dos_filename, const char *args,
   char had_ml_env = 0;
   const char *p, *env_end = *env_end_inout;
   /* Detect Microsoft Macro Assembler 6.00B driver masm.exe. */
-  if (!had_get_first_mcb || *args != '\0') return 1;
   dos_filename_size = strlen(dos_filename);
   for (p = dos_filename + dos_filename_size; p != dos_filename && p[-1] != '\\'; --p) {}
-  if (strcmp(p, "ML.EXE") != 0) return 2;
-  for (p = env; *p != '\0';) {
-    char *q = memchr(p, '\0', env_end - p);
-    if (!q) return 3;  /* env too long. */
-    if (DEBUG) fprintf(stderr, "debug: load env line: (%s)\n", p);
-    if (strncmp(p, "ML= ", 4) == 0) had_ml_env = 1;
-    p = q + 1;
+  if (strcmp(p, "ML.EXE") == 0) {
+    if (!had_get_first_mcb || !args || *args != '\0') return 1;
+    for (p = env; *p != '\0';) {
+      char *q = memchr(p, '\0', env_end - p);
+      if (!q) return 3;  /* env too long. */
+      if (DEBUG) fprintf(stderr, "debug: load env line: (%s)\n", p);
+      if (strncmp(p, "ML= ", 4) == 0) had_ml_env = 1;
+      p = q + 1;
+    }
+    if (!had_ml_env) return 4;
+    if (++p + 4 > env_end) return 5;
+    if (*(const unsigned short*)p != 1) return 6;
+    p += 2;
+    if (p + dos_filename_size >= env_end) return 7;
+    if (strcmp(p, dos_filename) != 0) return 8;
+    *env_end_inout = p - 2;  /* Not: p + dos_filename_size + 1; */
+    return 0;  /* exec() it. */
+  } else if (strcmp(p, "tlink.exe") == 0) {  /* Borland C++ 2.0 compiler bcc.exe executing TLINK 4.0 linker tlink.exe */
+    if (!args || strcmp(args, "@turboc.$ln") != 0) return 11;
+    return -1;  /* exec() it, but delete file "turboc.$ln" later. */
+  } else {
+    return 2;
   }
-  if (!had_ml_env) return 4;
-  if (++p + 4 > env_end) return 5;
-  if (*(const unsigned short*)p != 1) return 6;
-  p += 2;
-  if (p + dos_filename_size >= env_end) return 7;
-  if (strcmp(p, dos_filename) != 0) return 8;
-  *env_end_inout = p - 2;  /* Not: p + dos_filename_size + 1; */
-  return 0;
 }
 
 typedef struct TtyState {
@@ -1592,6 +1598,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   char is_stdout_write_cursor;
   enum malloc_strategy_t { MS_FIRST_FIT = 0, MS_BEST_FIT = 1, MS_LAST_FIT = 2 };
   unsigned malloc_strategy;
+  char cleanup_fn[16];
 
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
   { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
@@ -1611,6 +1618,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   video_byte_written = 0;  /* Pacify uninitialized warnings. */
   stdout_write_p = NULL;  /* Pacify uninitialized warnings. */
   stdout_write_end = NULL;  /* Pacify uninitialized warnings. */
+  cleanup_fn[0] = '\0';
 
  do_exec:
   header_size = detect_dos_executable_program(img_fd, prog_filename, header);
@@ -1809,10 +1817,13 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           }
           (void)!write(1, stdout_write_p, stdout_write_end - stdout_write_p);
         } else if (int_num == 0x20) {
-          return 0;  /* EXIT_SUCCESS. */
+          *(unsigned char*)&regs.rax = 0;  /* EXIT_SUCCESS. */
+          goto do_exit;
         } else if (int_num == 0x21) {  /* DOS file and memory sevices. */
           /* !! Should we set CF=0 by default? What does MS-DOS do? */
-          if (ah == 0x4c) {
+          if (ah == 0x4c) {  /* Exit to DOS. */
+            if (cleanup_fn[0] != '\0') unlink(get_linux_filename(cleanup_fn));
+           do_exit:
             return (unsigned char)regs.rax;
           } else if (ah == 0x06) {  /* Direct console I/O. */
            func_0x06:
@@ -1837,8 +1848,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             process_key(tty_state, 0, &result_ax, (unsigned short*)&regs.rflags);  /* Read. */
             *(unsigned char*)&regs.rax = (unsigned char)result_ax;  /* Return only the keycode. */
           } else if (ah == 0x02) {  /* Display output. */
-              stdout_write_p = (const char*)&regs.rdx;
-              goto do_stdout_write1;
+            stdout_write_p = (const char*)&regs.rdx;
+            goto do_stdout_write1;
           } else if (ah == 0x04) {  /* Output to STDAUX. */
             const char c = (unsigned char)regs.rdx;
             (void)!write(2, &c, 1);  /* Emulate STDAUX with stderr. */
@@ -2592,25 +2603,41 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               char * const args = al == 0 ?  (char*)mem + (((unsigned short*)params)[2] << 4) + ((unsigned short*)params)[1] + 1  /* (args - 1) is Pascal string with terminating '\r'. */
                                 : psp ? psp + 0x81 : NULL;
               const unsigned char args_size = args ? (unsigned char)args[-1] : 0;
-              const char is_args_ok = args && (
-                  (args_size < 0x7f && args[args_size] == '\r') ||
-                  (args_size == '\n' && args[0] == '\n' && args[1] == '.'));  /* Power C 2.2.0 compiler pc.exe. Copy all 128 bytes to new PSP. */
+              const char is_args_normal = args && (args_size < 0x7f && args[args_size] == '\0'); /* '\0' for al == 0 when Borland C++ 2.0 compiler bcc.exe is running tlink.exe */
+              const char is_args_ok = is_args_normal || (args && args_size == '\n' && args[0] == '\n' && args[1] == '.');  /* Power C 2.2.0 compiler pc.exe. Copy all 128 bytes to new PSP. */
+              const char is_dos_filename_high = sregs.ds.selector + (*(unsigned short*)&regs.rdx >> 4) >= PSP_PARA;  /* So that dos_filename won't overlap new_env below. */
               char *new_env;
               char new_prog_drive;
               int reason;
-              if (!(env && is_args_ok &&
-                    sregs.ds.selector + (*(unsigned short*)&regs.rdx >> 4) >= PSP_PARA)) {  /* So that dos_filename won't overlap new_env below. */
-                fprintf(stderr, "fatal: bounds check failed when loading program: %s\n", dos_filename);
+              if (is_args_normal) args[args_size] = '\0';  /* It was '\r'. */
+              if (!(env && is_args_ok && is_dos_filename_high)) {
+                if (is_args_normal) args[args_size] = '\0';
+                fprintf(stderr, "fatal: bounds check failed (env_ok=%d args_ok=%d, fn_ok=%d) env when loading program=(%s) with args=(%s)\n",
+                        env != NULL, is_args_ok, is_dos_filename_high,
+                        dos_filename, is_args_normal ? args : NULL);
+                if (is_args_normal) args[args_size] = '\r';
+                goto fatal_int;
               }
-              if (al == 0) {
+              if (0 && al == 0) {  /* TODO(pts): Why stop? */
                 /* Power C 2.2.0 compiler pc.exe. */
                 fprintf(stderr, "fatal: unsupported exec with al:%02d: %s\n", al, dos_filename);
                 goto fatal_int;
               }
-              args[args_size] = '\0';  /* It was '\r'. */
-              if ((reason = should_skip_exec_program(dos_filename, args, env, &env_end, had_get_first_mcb)) != 0) {
-                fprintf(stderr, "fatal: unsupported program to load with al:%02d reason=%d: %s\n", al, reason, dos_filename);
+              /* Even with al == 0, the correct behavior would be resuming
+               * execution of the parent proess (e.g. Borland C++ 2.0
+               * compiler bcc.exe) after the child process (e.g. TLINK 4.0
+               * linker tlink.exe) has finished (and then e.g. print the
+               * ``Available memory'' message and remove the `turboc.$ln'
+               * file). However, kvikdos is not smart enough for that, so it
+               * just does an exec() and forgets about the parent process.
+               */
+              if ((reason = should_skip_exec_program(dos_filename, is_args_normal ? args : NULL, env, &env_end, had_get_first_mcb)) > 0) {
+                fprintf(stderr, "fatal: unsupported program to load: al:%02x reason=%d program=(%s) args=(%s)\n", al, reason, dos_filename, is_args_normal ? args : NULL);
                 goto fatal_int;
+              }
+              if (reason == -1 && is_args_normal && cleanup_fn[0] == '\0' && args[0] == '@' && strlen(args) <= sizeof(cleanup_fn)) {
+                strcpy(cleanup_fn, args + 1);  /* Example args: "@turboc.$ln". */
+                if (DEBUG) fprintf(stderr, "debug: will remove file at exit: %s\n", cleanup_fn);
               }
               dir_state->dos_prog_abs = dos_prog_abs;  /* For loading the overlay from prog_filename, even if not mounted. */
               prog_filename = get_linux_filename_r(dos_filename, dir_state, exec_fnbuf, NULL);
@@ -2627,6 +2654,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               }
               *(char*)env_end = '\0';  /* Hide counter for absolute program pathname. */
               memcpy(new_env = (char*)mem + (ENV_PARA << 4), env, env_end + 2 - env);
+              if (!is_args_normal) {
+                fprintf(stderr, "fatal: bad args when loading: %s\n", dos_filename);
+                goto fatal_int;
+              }
               strcpy(fnbuf2, args);  /* Large enough to hold 0x7f bytes. */
               args_str = fnbuf2;
               dos_prog_abs = get_dos_abs_filename_r(prog_filename, new_prog_drive, dir_state, dosfnbuf);
