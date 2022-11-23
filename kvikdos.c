@@ -1964,7 +1964,6 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   }
   dos_prog_abs = dir_state->dos_prog_abs;
   if (!dos_prog_abs) dos_prog_abs = "";
-  if (dos_prog_abs[0] == '\0') dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
   dir_state->dos_prog_abs = NULL;  /* For security, use dos_prog_abs mapping only for read-only opens below. */
 
   video_write_step = 0;
@@ -2042,14 +2041,18 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         env = add_env(env, env_end, *envp0++, 1);
       }
       if (do_set_dos_path) {  /* Set %PATH% to the directory of dos_prog_abs. Set once. */
-        const char *p = dos_prog_abs + strlen(dos_prog_abs);
-        const char *p_base = dos_prog_abs + 3;
         size_t size;
-        for (; p != p_base && p[-1] != '\\'; --p) {}
-        if (p != p_base) --p;
-        if ((size_t)(env_end - env) < (size = p - dos_prog_abs) + 1 + 5) {
-          fprintf(stderr, "fatal: DOS environment too long for PATH\n");
-          exit(252);
+        if (dos_prog_abs[0] == '\0') {
+          size = 0;
+        } else {
+          const char *p = dos_prog_abs + strlen(dos_prog_abs);
+          const char *p_base = dos_prog_abs + 3;
+          for (; p != p_base && p[-1] != '\\'; --p) {}
+          if (p != p_base) --p;
+          if ((size_t)(env_end - env) < (size = p - dos_prog_abs) + 1 + 5) {
+            fprintf(stderr, "fatal: DOS environment too long for PATH\n");
+            exit(252);
+          }
         }
         memcpy(env, "PATH=", 5);
         memcpy(env += 5, dos_prog_abs, size);
@@ -2061,6 +2064,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
     if (env == env0) env = add_env(env, env_end, "$=", 1);  /* Some programs such as pbc.exe would fail with an empty environment, so we create a fake variable. */
     env = add_env(env, env_end, "", 0);  /* Empty var marks end of env. */
     env = add_env(env, env_end, "\1", 0);  /* Number of subsequent variables (1). */
+    if (dos_prog_abs[0] == '\0') dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
     env = add_env(env, env_end, dos_prog_abs, 0);  /* Full program pathname. */
     if (do_clear_after_env) memset(env, '\0', env_end - env);
   }
