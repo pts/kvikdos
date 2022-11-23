@@ -79,7 +79,7 @@
 #define CASE_MODE_LOWERCASE 1
 #define CASE_MODE_UNSPECIFIED 2
 
-#define DRIVE_COUNT 6
+#define DRIVE_COUNT 8
 static const char *skip_dot_slash(const char *p) {
   while (p[0] == '.' && p[1] == '/') {  /* Skip ./ at the beginning. */
     for (p += 2; p[0] == '/'; ++p) {}
