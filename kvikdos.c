@@ -182,7 +182,7 @@ static const char *get_dos_abs_filename_r(const char *p, char drive, const DirSt
       const char *mp = dir_state->linux_mount_dir[drive - 'A'];
       if (mp) {
         const size_t mp_size = strlen(mp);
-        if (strncmp(p0, mp, mp_size) == 0 && mp_size + 1 > best_mp_size) {  /* Upon equality, use the earlier drive. */
+        if ((p0[0] != '/' || mp[0] == '/') && strncmp(p0, mp, mp_size) == 0 && mp_size + 1 > best_mp_size) {  /* Upon equality, use the earlier drive. */
           best_drive = drive;
           best_mp_size = mp_size + 1;
         }
@@ -194,7 +194,7 @@ static const char *get_dos_abs_filename_r(const char *p, char drive, const DirSt
     const char *mp = dir_state->linux_mount_dir[drive - 'A'];
     if (mp) {
       const size_t mp_size = strlen(mp);
-      if (strncmp(p0, mp, mp_size) != 0) goto error;  /* File not on the mount point of drive. */
+      if (!((p0[0] != '/' || mp[0] == '/') && strncmp(p0, mp, mp_size) == 0)) goto error;  /* File not on the mount point of drive. */
     } else {
       goto error;  /* No such drive. */
     }
