@@ -448,6 +448,7 @@ typedef struct ParsedCmdArgs {
   int tty_in_fd;
   const char* const *args;  /* NULL-terminated list of NUL-terminated strings. Overlaps the program main(...) argv. */
   const char* const *envp0;  /* NULL-terminated list of NUL-terminated strings. Overlaps the program main(...) argv. */
+  const char *dpmi_prog;
 } ParsedCmdArgs;
 
 static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const char *pre_msg, const char *usage_extra, const char *post_msg) {
@@ -495,6 +496,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
   }
 
   envp = envp0 = ++argv;
+  cmd_args.dpmi_prog = NULL;
   cmd_args.tty_in_fd = -1;
   cmd_args.emu_params.mem_mb = 1;
   cmd_args.emu_params.is_hlt_ok = 0;
@@ -531,6 +533,14 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
     } else if (0 == strncmp(arg, "--prog=", 7)) {
       arg += 7;
       goto do_prog;
+    } else if (0 == strcmp(arg, "--dpmi")) {  /* Typical example: --dpmi=E:hdpmi32.exe */
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+     do_dpmi:
+      cmd_args.dpmi_prog = (const char*)arg;
+    } else if (0 == strncmp(arg, "--dpmi=", 7)) {
+      arg += 7;
+      goto do_dpmi;
     } else if (0 == strcmp(arg, "--mount")) {  /* Can be specified multiple times. */
       if (!argv[0]) goto missing_argument;
       arg = *argv++;
@@ -3686,6 +3696,10 @@ int main(int argc, char **argv) {
     printf("mem_mb: %d\n", cmd_args.emu_params.mem_mb);
     printf("is_hlt_ok: %d\n", cmd_args.emu_params.is_hlt_ok);
     return 0;
+  }
+  if (cmd_args.dpmi_prog) {  /* pts-fast-dosbox does support it, kvikdos doesn't. */
+    fprintf(stderr, "fatal: DPMI not supported: %s\n", cmd_args.dpmi_prog);
+    exit(1);
   }
   { int exit_code;
     const char *ext = get_linux_ext(cmd_args.prog_filename);
