@@ -341,6 +341,11 @@ Alternatives of kvikdos:
   Unix Makefile example using EMU2 headless:
   https://gist.github.com/dmsc/28d7f4900e7adaf60427a95f9b471813
 
+* MS-DOS Player: https://github.com/cracyc/msdos-player . Uses CPU
+  emulation, implements quote a large subset of the MS-DOS API, including
+  EMS, XMS, VCPI and long filenames. It can also convert a DOS program to a
+  Win32 program by embedding the emulator .exe.
+
 * !! doscmd
 
 * !! dosrun and dosrunner
