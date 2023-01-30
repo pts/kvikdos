@@ -2515,8 +2515,18 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
               if (fd < 0) goto error_invalid_handle;
               *(unsigned short*)&regs.rdx = 0;  /* Drive is local. */
+#if 0
+            } else if (al == 6) {
+              const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
+              if (fd < 0) goto error_invalid_handle;
+#if 0
+              *(unsigned short*)&regs.rax = 0xd;  /* Invalid data. */
+              goto error_on_21;
+#endif
+              *(unsigned short*)&regs.rax = 0xff;  /* Input is ready (0xff). */
+#endif
             } else {
-              fprintf(stderr, "fatal: unsupported DOS ioctl call: 0x%02x\n", al);
+              fprintf(stderr, "fatal: unsupported DOS ioctl call: call=0x%02x dos_fd=%d\n", al, *(unsigned short*)&regs.rbx);
               goto fatal;
             }
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
