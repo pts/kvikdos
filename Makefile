@@ -32,3 +32,6 @@ kvikdos64: $(SRCDEPS)
 
 kvikdos.static: $(SRCDEPS)
 	xstatic gcc -m32 -fno-pic -D_FILE_OFFSET_BITS=64 -DUSE_MINI_KVM -march=i686 -mtune=generic $(CFLAGS) -o $@ $<
+
+kvikdos.diet: $(SRCDEPS)
+	minicc --gcc=4.8 --diet -DUSE_MINI_KVM -fno-strict-aliasing -o kvikdos.diet kvikdos.c
