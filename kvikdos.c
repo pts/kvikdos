@@ -3361,6 +3361,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   close(kvm_fds.kvm_fd);
 #endif
   exit(252);
+  return 0;  /* Not reached. This is just to pacity owcc. */
 }
 
 static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filename, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, const char* const *envp0) {
