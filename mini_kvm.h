@@ -1,5 +1,10 @@
-#include <asm/types.h>  /* E.g. __u64. */
+#include <stdint.h>  /* E.g. uint64_t. */
 #include <sys/ioctl.h>  /* _IO(...). */
+
+typedef uint8_t __u8;
+typedef uint16_t __u16;
+typedef uint32_t __u32;
+typedef uint64_t __u64;
 
 #define KVM_API_VERSION 12
 #define KVMIO 0xAE
