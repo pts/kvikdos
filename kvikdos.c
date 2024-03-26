@@ -2231,7 +2231,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *(unsigned short*)&regs.rbx = al == 1 ? 0x1000 :  /* DOS in HMA. */
                 0xff00;  /* MS-DOS with high 8 bits of OEM serial number in BL. */
             *(unsigned short*)&regs.rcx = 0;  /* Low 16 bits of OEM serial number in CX. */
-          } else if (ah == 0x40) {  /* Write using handle. */
+          } else if (ah == 0x40) {  /* Write using handle or truncate. */
             const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
             if (fd < 0) {
              error_invalid_handle:
@@ -2245,10 +2245,17 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             } else {
               const char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
               const int size = (int)*(unsigned short*)&regs.rcx;
-              const int got = write(fd, p, size);
-              if (got < 0) {
-                *(unsigned short*)&regs.rax = 0x1d;  /* Write fault. */
-                goto error_on_21;
+              int got;
+              if (size == 0) {  /* Truncate. */
+                const int got1 = lseek(fd, 0, SEEK_CUR);
+                got = got1 < 0 ? got1 : ftruncate(fd, got1);
+                if (got != 0) goto write_fault;
+              } else {
+                got = write(fd, p, size);
+                if (got < 0) { write_fault:
+                  *(unsigned short*)&regs.rax = 0x1d;  /* Write fault. */
+                  goto error_on_21;
+                }
               }
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
               *(unsigned short*)&regs.rax = got;
