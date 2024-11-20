@@ -2248,15 +2248,24 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               int got;
               if (size == 0) {  /* Truncate. */
                 const int got1 = lseek(fd, 0, SEEK_CUR);
-                got = got1 < 0 ? got1 : ftruncate(fd, got1);
-                if (got != 0) goto write_fault;
+                if (got1 < 0) {
+                  if (errno == ESPIPE) {  /* Without this hack, A86 4.05 falls to an infinite loop displaying `Sorry, output failed'. */
+                    struct stat st;
+                    if (fstat(fd, &st) == 0 && !S_ISREG(st.st_mode)) { got = 0; goto write_success; }  /* Typically, it's isatty(fd). */
+                  }
+                  got = got1;
+                  goto write_fault;
+                } else {
+                  if ((got = ftruncate(fd, got1)) != 0) goto write_fault;
+                }
               } else {
                 got = write(fd, p, size);
-                if (got < 0) { write_fault:
+                if (got < 0) { write_fault:  /* errno may not be valid now, fstat(2) after lseek(3) failure may have reset it. */
                   *(unsigned short*)&regs.rax = 0x1d;  /* Write fault. */
                   goto error_on_21;
                 }
               }
+             write_success:
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
               *(unsigned short*)&regs.rax = got;
             }
