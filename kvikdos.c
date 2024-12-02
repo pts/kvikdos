@@ -481,6 +481,10 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
                     pre_msg, argv0, usage_extra, post_msg);
     exit(argv0 && argv[1] ? 0 : 1);
   }
+  if (0 == strcmp(argv[1], "--version")) {
+    fprintf(stdout, "kvikdos v1\n");
+    exit(0);
+  }
 
   { unsigned u;
     for (u = 0; u < DRIVE_COUNT; ++u) {
