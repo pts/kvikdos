@@ -89,8 +89,10 @@ static const char *skip_dot_slash(const char *p) {
 
 /* Removes the duplicate slashes in place. */
 static void remove_duplicate_slashes(char *p) {
-  const char *q = p;
+  const char *q;
   char c;
+  for (q = p; (c = *q) != '\0' && c != '/'; ++q) {}
+  if (*q == '\0') return;  /* Avoid writing read-only memory for --kvm-check. */
   while ((c = *q) != '\0') {
     *p++ = c;
     ++q;
@@ -461,6 +463,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
   char **envp0, **envp;
   const char *dos_path;
   char dos_prog_drive;
+  char is_kvm_check;
 
   argv0 = argv[0];
   /* Ignoring instances of the --cmd flage, for pts-fast-dosbox compatibility. */
@@ -468,6 +471,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
   if (!argv0 || !argv[1] || 0 == strcmp(argv[1], "--help")) {
     fprintf(stderr, "%s%s%s [<flag> ...] <dos-executable-file> [<dos-arg> ...]\n%s"
                     "Flags:\n"
+                    "--kvm-check: Just check that KVM works, run a fake true.com\n"
                     "--env=<NAME>=<value>: Adds environment variable.\n"
                     "--prog=<dos-pathname>: Sets DOS pathname of program.\n"
                     "--mount=<drive><case><dirname>/: Makes Linux dir visible as <drive> for DOS program.\n"
@@ -504,6 +508,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
   cmd_args.tty_in_fd = -1;
   cmd_args.emu_params.mem_mb = 1;
   cmd_args.emu_params.is_hlt_ok = 0;
+  is_kvm_check = 0;
   is_drive_specified = 0;
   while (argv[0]) {
     char *arg = *argv++;
@@ -631,13 +636,20 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
     } else if (0 == strncmp(arg, "--mem-mb=", 9)) {
       arg += 9;
       goto do_mem_mb;
+    } else if (0 == strcmp(arg, "--kvm-check")) {
+      is_kvm_check = 1;
     } else {
       fprintf(stderr, "fatal: unknown command-line flag: %s\n", arg);
       exit(1);
     }
   }
   /* Now: argv contains remaining (non-flag) arguments. */
-  if (!argv[0]) {
+  prog_name_arg = *argv++;  /* This is a Linux filename. */
+  if (prog_name_arg) {
+  } else if (is_kvm_check) {
+    --argv;
+    prog_name_arg = "kvmcheck.com";  /* It won't be actually loaded. */
+  } else {
     fprintf(stderr, "fatal: missing <dos-executable-file> DOS program filename\n");
     exit(1);
   }
@@ -649,7 +661,6 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
   fprintf(stderr, "GLF (%s)\n", get_linux_filename(".\\aaa\\.."));
   fprintf(stderr, "GLF (%s)\n", get_linux_filename("C:\\foo\\.\\\\\\.\\bar\\.\\..\\.\\bazzzz\\.."));
 #endif
-  prog_name_arg = *argv++;  /* This is a Linux filename. */
   *envp = NULL;
   /* Remaining arguments in argv will be passed to the DOS program in PSP:0x80. */
   dos_path = getenv_prefix("PATH=", (char const**)envp0, (char const**)envp);
@@ -674,7 +685,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
   }
   dos_prog_drive = '\0';
 
-  prog_filename_type = detect_prog_filename_type(prog_name_arg);
+  prog_filename_type = is_kvm_check ? PFT_LINUX : detect_prog_filename_type(prog_name_arg);
   if (prog_filename_type == PFT_LINUX) {
     prog_name_arg = (char*)skip_dot_slash(prog_name_arg);
     remove_duplicate_slashes(prog_name_arg);
@@ -698,7 +709,11 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
       }
       memcpy(fnbuf, q, q_size);  /* Including the trailing '\0'. */
       cmd_args.prog_filename = fnbuf;
-      *(char*)p = '\0';  /* Modify it in place in argv. */
+      if (p == q) {  /* Avoid writing read-only memory for --kvm-check. */
+        q = "";
+      } else {
+        if (*p != '\0') *(char*)p = '\0';  /* Modify it in place in argv. */
+      }
       cmd_args.dir_state.linux_mount_dir['E' - 'A'] = q;  /* Empty or ends with '/'. */
       dos_prog_drive = 'E';
       if (!is_drive_specified && !cmd_args.dir_state.linux_mount_dir[cmd_args.dir_state.drive - 'A']) cmd_args.dir_state.drive = 'E';
@@ -706,6 +721,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
     if (cmd_args.dir_state.case_mode['D' - 'A'] == CASE_MODE_UNSPECIFIED && cmd_args.dir_state.linux_mount_dir['D' - 'A']) {
       cmd_args.dir_state.case_mode['D' - 'A'] = get_case_mode_from_last_component(cmd_args.prog_filename);  /* Mount as lowercase iff the executable program has at least one lowercase character. */
     }
+    if (is_kvm_check) cmd_args.prog_filename = NULL;
     /* We will set cmd_args.dir_state.case_mode['C' - 'A'] later. */
   } else {
     if (cmd_args.dir_state.linux_mount_dir['E' - 'A'] == placeholder_for_default) cmd_args.dir_state.linux_mount_dir['E' - 'A'] = NULL;  /* Drive E: not mounted by default. */
@@ -754,14 +770,16 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
     fprintf(stderr, "fatal: no mount point for default drive (specify --mount=...): %c:\n", cmd_args.dir_state.drive);
     exit(1);
   }
-  if (cmd_args.dir_state.dos_prog_abs == NULL) {
+  if (cmd_args.dir_state.dos_prog_abs == NULL && cmd_args.prog_filename) {
     cmd_args.dir_state.dos_prog_abs = get_dos_abs_filename_r(cmd_args.prog_filename, dos_prog_drive, &cmd_args.dir_state, dosfnbuf);
     if (CMD_PARSE_DEBUG) fprintf(stderr, "debug: prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", cmd_args.prog_filename, cmd_args.dir_state.dos_prog_abs, dos_prog_drive);
   }
   if (prog_filename_type == PFT_LINUX && cmd_args.dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED && cmd_args.dir_state.linux_mount_dir['C' - 'A']) {
     const char *mount_c = cmd_args.dir_state.linux_mount_dir['C' - 'A'];
     const char *q;
-    if (cmd_args.dir_state.dos_prog_abs[0] == 'C' || strncmp(cmd_args.prog_filename, mount_c, strlen(mount_c)) == 0) {  /* Set case mode from the entire pathname. */
+    if (!cmd_args.prog_filename) {
+      cmd_args.dir_state.case_mode['C' - 'A'] = CASE_MODE_LOWERCASE;
+    } else if (cmd_args.dir_state.dos_prog_abs[0] == 'C' || strncmp(cmd_args.prog_filename, mount_c, strlen(mount_c)) == 0) {  /* Set case mode from the entire pathname. */
       for (q = cmd_args.prog_filename; *q != '\0' && *q - 'a' + 0U > 'z' - 'a' + 0U; ++q) {}
       cmd_args.dir_state.case_mode['C' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;
     } else {  /* Set case mode from the basename only. */
@@ -1052,7 +1070,9 @@ fprintf(stderr, "(%s)\n", (const char *)memmem("foorxbard;", 9, "rd", 2));  /* S
 
 /* Returns an empty string if the specified Linux filename has no extension. */
 static const char *get_linux_ext(const char *p) {
-  const char *ext0 = p + strlen(p), *ext = ext0;
+  const char *ext0, *ext;
+  if (!p) return "";
+  ext0 = ext = p + strlen(p);
   for (; ext != p && ext[-1] != '/' && ext[-1] != '.'; --ext) {}
   return ext == p || ext[-1] == '/' ? ext0 : ext;
 }
@@ -1062,7 +1082,12 @@ static const char *get_linux_ext(const char *p) {
  */
 static int detect_dos_executable_program(int img_fd, const char *prog_filename, char *p) {
   int r;
-  r = read(img_fd, p, PROGRAM_HEADER_SIZE);
+  if (img_fd < 0) {  /* For --kvm-check. */
+    r = 1;
+    *p = '\xc3';  /* `ret' instruction for DOS .com program. It exits successfully. */
+  } else {
+    r = read(img_fd, p, PROGRAM_HEADER_SIZE);
+  }
   if (r < 0) {
     perror("fatal: error reading DOS executable program header");
     exit(252);
@@ -1094,6 +1119,7 @@ static int detect_dos_executable_program(int img_fd, const char *prog_filename, 
     /* Unix script #! shebang detected. */
     fprintf(stderr, "fatal: Unix scripts not supported: %s\n", prog_filename);
     exit(252);  /* TODO(pts): Run them natively, without setting up KVM. */
+  } else if (img_fd < 0) {  /* For --kvm-check. */
   } else {  /* Otherwise it's a DOS .com program, but only if it has .com extension. */
     const char *ext = get_linux_ext(prog_filename);
     const size_t ext_size = strlen(ext) + 1;
@@ -1323,7 +1349,8 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     char * const p = (char *)mem + (PSP_PARA << 4) + 0x100;
     int r;
     memcpy(p, header, header_size);
-    r = read(img_fd, p + header_size, MAX_DOS_COM_SIZE + 1 - header_size);
+    r = img_fd < 0 ? 0 :  /* For --kvm-check. */
+        read(img_fd, p + header_size, MAX_DOS_COM_SIZE + 1 - header_size);
     if (r < 0) { /*read_error:*/
       perror("fatal: error reading DOS executable program");
       exit(252);
@@ -1972,7 +1999,9 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   { struct SA { int StaticAssert_ShortSize : sizeof(short) == 2; }; }  /* Assumed by *(unsigned short*)... in many places. */
   { struct SA { int StaticAssert_IntSize : sizeof(int) == 4; }; }  /* Assumed by *(unsigned*)... in many places. */
 
-  if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
+  if (!prog_filename) {
+    img_fd = -1;
+  } else if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
     fprintf(stderr, "fatal: cannot open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
     exit(252);
   }
@@ -2026,7 +2055,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       psp_args[size] = '\r';
     }
   }
-  close(img_fd);
+  if (img_fd >= 0) close(img_fd);
 
   /* http://www.techhelpmanual.com/346-dos_environment.html */
   { char *env = (char*)mem + (ENV_PARA << 4), *env0 = env;
