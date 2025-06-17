@@ -1486,7 +1486,32 @@ struct kvm_fds {
   int kvm_fd, vm_fd, vcpu_fd;
 };
 
-static int get_linux_handle(unsigned short handle, const struct kvm_fds *kvm_fds) {
+static int mapped_handles[20 - 5];
+
+/* Remap Linux file descriptor to the DOS handle range 5...20 if possible.
+ * This is to accommodate the OpenWatcom libc (used e.g. in DOS .exe
+ * programs created by `owcc -bdos') which works only if fd < 20.
+ */
+static int map_fd_open(int fd) {
+  int *p, *pend;
+  if (fd < 5) return fd;
+  p = mapped_handles;
+  pend = mapped_handles + sizeof(mapped_handles) / sizeof(mapped_handles[0]);
+  for (; p != pend; ++p) {
+    if (!*p) {
+      *p = fd;
+      return p - mapped_handles + 5;
+    }
+  }
+  return fd + 5 + sizeof(mapped_handles) / sizeof(mapped_handles[0]);
+}
+
+static void map_handle_close(unsigned short handle) {
+  if (handle < 5 || handle >= 5 + sizeof(mapped_handles) / sizeof(mapped_handles[0])) return;
+  mapped_handles[handle - 5] = 0;  /* Mark it as available. */
+}
+
+static int get_linux_fd(unsigned short handle, const struct kvm_fds *kvm_fds) {
   /* Redirection (`./kvikdos prog >prog.out') just works and redirects DOS
    * STDOUT (not DOS STDERR), and because of the conditions below, STDPRN as
    * well. This matches the behavior of `pts-fast-dosbox noscreenprn'. In
@@ -1494,12 +1519,16 @@ static int get_linux_handle(unsigned short handle, const struct kvm_fds *kvm_fds
    * DOSBox and MS-DOS 6.22, running `prog >prog.out' in the DOS command line
    * redirects DOS STDOUT only (not DOS STDERR or others).
    */
-  return handle < 5 ? (
-               handle == 3 ? 2  /* Emulate STDAUX with stderr. */
-             : handle == 4 ? 1  /* Emulate STDPRN with stdout. */
-             : handle)
-       : (handle == kvm_fds->kvm_fd || handle == kvm_fds->vm_fd || handle == kvm_fds->vcpu_fd) ? -1  /* Disallow these handles from DOS for security. */
-       : handle;
+  int fd;
+  if (handle < 5) {
+    return handle == 3 ? 2  /* Emulate STDAUX with stderr. */
+         : handle == 4 ? 1  /* Emulate STDPRN with stdout. */
+         : handle;
+  }
+  fd = handle >= 5 + sizeof(mapped_handles) / sizeof(mapped_handles[0]) ? (int)(handle - (5 + sizeof(mapped_handles) / sizeof(mapped_handles[0]))) :
+      mapped_handles[handle - 5] ? mapped_handles[handle - 5] : -1;
+  return (fd == kvm_fds->kvm_fd || fd == kvm_fds->vm_fd || fd == kvm_fds->vcpu_fd) ? -1  /* Disallow these handles from DOS for security. */
+       : fd;
 }
 
 /* p is a DOS pathname. Returns 'A' etc. or '\0' on error. */
@@ -2266,7 +2295,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 0xff00;  /* MS-DOS with high 8 bits of OEM serial number in BL. */
             *(unsigned short*)&regs.rcx = 0;  /* Low 16 bits of OEM serial number in CX. */
           } else if (ah == 0x40) {  /* Write using handle or truncate. */
-            const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
+            const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
             if (fd < 0) {
              error_invalid_handle:
               *(unsigned short*)&regs.rax = 6;  /* Invalid handle. */
@@ -2304,7 +2333,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rax = got;
             }
           } else if (ah == 0x3f) {  /* Read using handle. */
-            const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
+            const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
             if (fd < 0) {
               goto error_invalid_handle;
             } else {
@@ -2412,9 +2441,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rax = get_dos_error_code(errno, 0x1f);  /* By default: General failure. */
               goto error_on_21;
             }
-            /*dup2(fd, 20); close(fd); fd = 20;*/  /* !!! TODO(pts): This breaks .exe files created by `owcc -bdos', which allows fs <= 20. Do some fd remapping. */
+            /*dup2(fd, 20); close(fd); fd = 20;*/  /* This breaks .exe files created by `owcc -bdos', which allows fd < 20. We fix it with map_fd_open(...) below. */
            after_open:
             if (fd < 5) fd = ensure_fd_is_at_least(fd, 5);  /* Skip the first 5 DOS standard handles. */
+            fd = map_fd_open(fd);
             if ((fd + 0U) >> 16) {
               *(unsigned short*)&regs.rax = 4;  /* Too many open files. */
               goto error_on_21;
@@ -2425,7 +2455,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           } else if (ah == 0x57) {  /* Get/set file date and time using handle. */
             const unsigned char al = (unsigned char)regs.rax;
             if (al < 2 ) {
-              const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
+              const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
               if (fd < 0) goto error_invalid_handle;
               if (al == 0) {  /* Get. */
                 struct stat st;
@@ -2444,23 +2474,25 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               goto error_on_21;
             }
           } else if (ah == 0x3e) {  /* Close using handle. */
-            const unsigned dos_handle = *(unsigned short*)&regs.rbx;
-            if (dos_handle >= 5) {  /* Don't close the standard handles, just pretend. */
-              const int fd = get_linux_handle(dos_handle, &kvm_fds);
+            const unsigned short handle = *(unsigned short*)&regs.rbx;
+            if (handle >= 5) {  /* Don't close the standard handles, just pretend. */
+              const int fd = get_linux_fd(handle, &kvm_fds);
               if (fd < 0) goto error_invalid_handle;  /* Not strictly needed, close(...) would check. */
+              map_handle_close(handle);
               if (close(fd) != 0) goto error_from_linux;
             }
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x45) {  /* Duplicate handle (dup()). */
-            const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
+            const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
             int fd2;
             if (fd < 0) goto error_invalid_handle;
             fd2 = dup(fd);
-            if (fd < 0) {
+            if (fd2 < 0) {
               *(unsigned short*)&regs.rax = get_dos_error_code(errno, 4);  /* By default: Too many open files. */
               goto error_on_21;
             }
             if (fd2 < 5) fd2 = ensure_fd_is_at_least(fd2, 5);  /* Skip the first 5 DOS standard handles. */
+            fd2 = map_fd_open(fd2);
             if ((fd2 + 0U) >> 16) {
               *(unsigned short*)&regs.rax = 4;  /* Too many open files. */
               goto error_on_21;
@@ -2519,7 +2551,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *(unsigned char*)&regs.rax = 0;  /* No input ready. 0xff would be input. */
             /* If we detect Ctrl-<Break>, we should run `int 0x23'. */
           } else if (ah == 0x42) {  /* Seek using handle. */
-            const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
+            const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
             if (fd < 0) goto error_invalid_handle;
             {
               const unsigned whence = *(unsigned char*)&regs.rax;  /* SEEK_SET == 0, SEEK_CUR == 1, SEEK_END == 2, same in DOS and Linux. */
@@ -2539,7 +2571,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             const unsigned char al = (unsigned char)regs.rax;
             if (al == 1 && (*(unsigned short*)&regs.rdx >> 8)) goto error_invalid_parameter;
             if (al < 2) {  /* Get device information (1), set device information (2). */
-              const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
+              const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
               struct stat st;
               if (fd < 0) goto error_invalid_handle;
               if (fstat(fd, &st) != 0) goto error_from_linux;
@@ -2562,12 +2594,12 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               if (bl > DRIVE_COUNT || !dir_state->linux_mount_dir[(int)bl - 1]) goto error_invalid_drive;
               *(unsigned char*)&regs.rax = bl > 2;  /* A: (1) and B: (2) are removable (0), C: (3) etc. aren't (1). */
             } else if (al == 0x0a) {  /* Get whether handle is local or remote. */
-              const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
+              const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
               if (fd < 0) goto error_invalid_handle;
               *(unsigned short*)&regs.rdx = 0;  /* Drive is local. */
 #if 0
             } else if (al == 6) {
-              const int fd = get_linux_handle(*(unsigned short*)&regs.rbx, &kvm_fds);
+              const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
               if (fd < 0) goto error_invalid_handle;
 #if 0
               *(unsigned short*)&regs.rax = 0xd;  /* Invalid data. */
