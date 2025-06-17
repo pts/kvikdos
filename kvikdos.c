@@ -93,6 +93,7 @@ static void remove_duplicate_slashes(char *p) {
   char c;
   for (q = p; (c = *q) != '\0' && c != '/'; ++q) {}
   if (*q == '\0') return;  /* Avoid writing read-only memory for --kvm-check. */
+  p += q - p;  /* Using `-' to prevent warning on const pointer. */
   while ((c = *q) != '\0') {
     *p++ = c;
     ++q;
