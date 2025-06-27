@@ -53,6 +53,10 @@
 #define DEBUG_ALLOC 0
 #endif
 
+#ifndef DEBUG_INT
+#define DEBUG_INT 0
+#endif
+
 #ifndef DEBUG_INTVEC
 #define DEBUG_INTVEC 0
 #endif
@@ -2221,7 +2225,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         const unsigned short *csip_ptr = (const unsigned short*)((char*)mem + ((unsigned)sregs.ss.selector << 4) + (*(unsigned short*)&regs.rsp));  /* !! What if rsp wraps around 64 KiB boundary? Test it. Also calculate int_cs again. */
         const unsigned short int_ip = csip_ptr[0], int_cs = csip_ptr[1];  /* Return address. */  /* !! Security: check bounds, also check that rsp <= 0xfffe. */
         const unsigned char ah = ((unsigned)regs.rax >> 8) & 0xff;
-        if (DEBUG) fprintf(stderr, "debug: int 0x%02x ah:%02x cs:%04x ip:%04x\n", int_num, ah, int_cs, int_ip);
+        if (DEBUG || DEBUG_INT) fprintf(stderr, "debug: int 0x%02x ah:%02x al:%02x cs:%04x ip:%04x\n", int_num, ah, (unsigned char)regs.rax, int_cs, int_ip);
         fflush(stdout);
         (void)ah;
         /* Documentation about DOS and BIOS int calls: https://stanislavs.org/helppc/idx_interrupt.html */
