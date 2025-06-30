@@ -1688,7 +1688,11 @@ static const struct {
 static const char *get_dos_basename(const char *fn) {
   const char *fnp;
   if (fn[0] != '\0' && fn[1] == ':') fn += 2;
-  for (fnp = fn + strlen(fn); fnp != fn && fnp[-1] != '\\'; --fnp) {}
+  /* Turbo C++ 1.01 compiler calls findfirst (int 0x21 ah == 0x4e (find
+   * first), which calls get_dos_basename(...). We want it to succeed if the
+   * specified fn contains '/' as directory separator, not only for '\\'.
+   */
+  for (fnp = fn + strlen(fn); fnp != fn && fnp[-1] != '\\' && fnp[-1] != '/'; --fnp) {}
   return fnp;
 }
 
