@@ -61,6 +61,10 @@
 #define DEBUG_INTVEC 0
 #endif
 
+#ifndef DEBUG_EXEC
+#define DEBUG_EXEC 0
+#endif
+
 #define CMD_PARSE_DEBUG DEBUG
 #define CMD_PARSE_MEM_MB_1 1
 
@@ -3085,6 +3089,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 if (is_args_normal) args[args_size] = '\r';
                 goto fatal_int;
               }
+              if (DEBUG || DEBUG_EXEC) fprintf(stderr, "debug: exec: al:%02x reason=%d program=(%s) args=(%s)\n", al, reason, dos_filename, is_args_normal ? args : NULL);
               if (0 && al == 0) {  /* TODO(pts): Why stop? */
                 /* Power C 2.2.0 compiler pc.exe. */
                 fprintf(stderr, "fatal: unsupported exec with al:%02d: %s\n", al, dos_filename);
