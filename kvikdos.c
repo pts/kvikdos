@@ -450,6 +450,7 @@ static char dosfnbuf[DOS_PATH_SIZE];
 typedef struct EmuParams {
   char is_hlt_ok;
   unsigned mem_mb;
+  const char *hlt_dump_filename;
 } EmuParams;
 
 typedef struct ParsedCmdArgs {
@@ -490,7 +491,8 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
                     "--tty-in=<fd>: Selects Linux file descriptor for keyboard input.\n"
                     "    -3: fake keys; -2: stdin buffered; -1: /dev/tty; 0: stdin etc.\n"
                     "--mem-mb=<n>: Use n MiB of memory for DOS. Only 1 is supported.\n"
-                    "--hlt-ok: Allow the hlt instruction.\n",
+                    "--hlt-ok: Allow the hlt instruction.\n"
+                    "--hlt-dump=<filename>: Write memory dump upon hlt instruction.\n",
                     pre_msg, argv0, usage_extra, post_msg);
     exit(argv0 && argv[1] ? 0 : 1);
   }
@@ -517,6 +519,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
   cmd_args.tty_in_fd = -1;
   cmd_args.emu_params.mem_mb = 1;
   cmd_args.emu_params.is_hlt_ok = 0;
+  cmd_args.emu_params.hlt_dump_filename = NULL;
   is_kvm_check = 0;
   is_drive_specified = 0;
   while (argv[0]) {
@@ -559,6 +562,14 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
     } else if (0 == strncmp(arg, "--dpmi=", 7)) {
       arg += 7;
       goto do_dpmi;
+    } else if (0 == strcmp(arg, "--hlt-dump")) {  /* Typical example: --hlt-dump=kvikdos.dmp */
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+     do_hlt_dump:
+      cmd_args.emu_params.hlt_dump_filename = (const char*)arg;
+    } else if (0 == strncmp(arg, "--hlt-dump=", 11)) {
+      arg += 11;
+      goto do_hlt_dump;
     } else if (0 == strcmp(arg, "--mount")) {  /* Can be specified multiple times. */
       if (!argv[0]) goto missing_argument;
       arg = *argv++;
@@ -2025,7 +2036,6 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   unsigned dta_seg_ofs;  /* Disk transfer address (DTA). */
   unsigned ongoing_set_int;
   unsigned short last_dos_error_code;
-  const char is_hlt_ok = emu_params->is_hlt_ok;
   char port_0x40_tick;
   unsigned char video_write_step;
   char video_byte_written;
@@ -3361,18 +3371,31 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         if (csip_ptr[2] & (1 << 9)) *(unsigned short*)&regs.rflags |= (1 << 9);  /* Set IF back to 1 if it was 1. */
         *(unsigned short*)&regs.rsp += 6;  /* pop ip, pop cs, pop flags. */
         goto set_sregs_regs_and_continue;
-      } else if (is_hlt_ok && sregs.cs.selector >= PSP_PARA && (*(unsigned short*)&regs.rflags & (1 << 9))) {  /* IF == 1. */
-        /* The 8253 timer chip increments the counter in each 1 / 1193182s
-         * causing IRQ0 at each 65536th increment. kvikdos doesn't implement
-         * any of this, but now we wait that approximate amount for `hlt' to
-         * wake up.
-         */
-        /* This is not precise enough: poll(&pollfd0, 0, 55);. */
-        usleep(54925);  /* 54925 =~= 1000000.0 / (1193182.0 / 65536). */
-        break;
-      } else {
-        fprintf(stderr, "fatal: unexpected hlt\n");
-        goto fatal;
+      } else {  /* hlt instruction in user code. */
+        if (emu_params->hlt_dump_filename) {
+          const int fd = open(emu_params->hlt_dump_filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+          if (fd >= 0) {
+            if (write(fd, mem, DOS_MEM_LIMIT) != DOS_MEM_LIMIT) {
+              fprintf(stderr, "error: error writing to --hlt-dump=... file: %s\n", emu_params->hlt_dump_filename);
+            }
+            close(fd);
+          } else {
+            fprintf(stderr, "error: error opening --hlt-dump=... file for writing: %s\n", emu_params->hlt_dump_filename);
+          }
+        }
+        if (emu_params->is_hlt_ok && sregs.cs.selector >= PSP_PARA && (*(unsigned short*)&regs.rflags & (1 << 9))) {  /* IF == 1. */
+          /* The 8253 timer chip increments the counter in each 1 / 1193182s
+           * causing IRQ0 at each 65536th increment. kvikdos doesn't implement
+           * any of this, but now we wait that approximate amount for `hlt' to
+           * wake up.
+           */
+          /* This is not precise enough: poll(&pollfd0, 0, 55);. */
+          usleep(54925);  /* 54925 =~= 1000000.0 / (1193182.0 / 65536). */
+          break;
+        } else {
+          fprintf(stderr, "fatal: unexpected hlt\n");
+          goto fatal;
+        }
       }
      case KVM_EXIT_MMIO:
       { const char mmio_len = run->mmio.len;
