@@ -1655,13 +1655,15 @@ static const char *getenv_dos_prefix(const char *name_prefix, const char *env) {
 /* Sets interrupt vector for int_num to value_seg_ofs in IVT. Does some
  * checks. Returns 0 on success.
  */
-static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, char had_get_ints) {
+static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, char had_get_ints, unsigned char *tasm30_bitset) {
   unsigned * const p = (unsigned*)mem + int_num;
   if (DEBUG || DEBUG_INTVEC) {
     fprintf(stderr, "debug: set interrupt vector int:%02x to cs:%04x ip:%04x\n",
             int_num, (unsigned short)(value_seg_ofs >> 16), (unsigned short)value_seg_ofs);
   }
   /* !!! TODO(pts): Make the default permissive in general, and enable these protections only on a flag. */
+  if (int_num == 0x23) *tasm30_bitset |= 4;
+  if (int_num == 0x18) *tasm30_bitset |= 8;
   if (int_num - 0x22 + 0U <= 0x24 - 022 +0U ||  /* Application Ctrl-<Break> handler == 0x23. We allow 0x22..0x24. */
       value_seg_ofs == *p ||  /* Unchanged. */
       value_seg_ofs == MAGIC_INT_VALUE(int_num) ||  /* Set back to original. */
@@ -2029,6 +2031,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   char header[PROGRAM_HEADER_SIZE];
   unsigned header_size;
   char had_get_ints, had_get_first_mcb;
+  unsigned char tasm30_bitset;
   const char *dos_prog_abs;  /* Owned externally: either in args or in dosfnbuf or (after exec) within mem. */
   unsigned tick_count;
   unsigned char sphinx_cmm_flags;
@@ -2180,6 +2183,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   /**(unsigned short*)&regs.rflags |= 1 << 9;*/  /* IF=1, enable interrupts. */
 
   had_get_ints = 0;  /* 1 << 0: int 0x00; 1 << 1: int 0x18; 1 << 2: int 0x06, 1 << 3: Get DOS version, 1 << 4: 0x34. */
+  tasm30_bitset = 0;
   had_get_first_mcb = 0;
   tick_count = 0;
   sphinx_cmm_flags = 0;
@@ -2312,6 +2316,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             const unsigned char al = (unsigned char)regs.rax;
             if (DEBUG || DEBUG_INTVEC) fprintf(stderr, "debug: get DOS version\n");
             had_get_ints |= 8;
+            tasm30_bitset |= 1;
             *(unsigned short*)&regs.rax = 5 | 0 << 8;  /* 5.0. */
             *(unsigned short*)&regs.rbx = al == 1 ? 0x1000 :  /* DOS in HMA. */
                 0xff00;  /* MS-DOS with high 8 bits of OEM serial number in BL. */
@@ -2389,12 +2394,14 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             const unsigned char hundredths = 0;  /* TODO(pts): Use gettimeofday(2) to get it. */
             *(unsigned short*)&regs.rcx = tm->tm_hour << 8 | tm->tm_min;
             *(unsigned short*)&regs.rdx = tm->tm_sec << 8 | hundredths;
+            tasm30_bitset |= 0x40;
           } else if (ah == 0x2a) {  /* Get date. */
             time_t ts = time(0);
             struct tm *tm = localtime(&ts);
             *(unsigned char*)&regs.rax = tm->tm_wday;
             *(unsigned short*)&regs.rcx = tm->tm_year + 1900;
             *(unsigned short*)&regs.rdx = (tm->tm_mon + 1) << 8 | tm->tm_mday;
+            tasm30_bitset |= 0x20;
           } else if (ah == 0x19) {  /* Get current drive. */
             *(unsigned char*)&regs.rax = dir_state->drive - 'A';
           } else if (ah == 0x47) {  /* Get current directory. */
@@ -2476,7 +2483,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *(unsigned short*)&regs.rax = fd;
           } else if (ah == 0x57) {  /* Get/set file date and time using handle. */
             const unsigned char al = (unsigned char)regs.rax;
-            if (al < 2 ) {
+            if (al < 2) {
               const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
               if (fd < 0) goto error_invalid_handle;
               if (al == 0) {  /* Get. */
@@ -2486,6 +2493,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 tm = localtime(&st.st_mtime);
                 *(unsigned short*)&regs.rcx = tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11;
                 *(unsigned short*)&regs.rdx = tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 1980) << 9;
+                tasm30_bitset |= 0x80;
               } else {  /* Set if al == 1. */
                 /* !! Implement this with utime(2). */
                 fprintf(stderr, "fatal: unimplemented: set file date and time: fd=%d cx:%04x dx:%04x\n", fd, *(unsigned short*)&regs.rcx, *(unsigned short*)&regs.rdx);
@@ -2543,15 +2551,14 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             if (fd < 0) goto error_from_linux;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x25) {  /* Set interrupt vector. */
-            if (set_int((unsigned char)regs.rax, *(unsigned short*)&regs.rdx | sregs.ds.selector << 16, mem, had_get_ints)) goto fatal;
+            if (set_int((unsigned char)regs.rax, *(unsigned short*)&regs.rdx | sregs.ds.selector << 16, mem, had_get_ints, &tasm30_bitset)) goto fatal;
           } else if (ah == 0x35) {  /* Get interrupt vector. */
             const unsigned char get_int_num = (unsigned char)regs.rax;
             if (DEBUG || DEBUG_INTVEC) fprintf(stderr, "debug: get interrupt vector int:%02x\n", get_int_num);
             if (get_int_num == 0) had_get_ints |= 1;  /* Turbo Pascal 7.0 programs start with this. */
-            if (get_int_num == 0x18) had_get_ints |= 2;  /* TASM 3.2, Borland C++ 2.0 compiler bcc.exe for memory allocation. */
+            if (get_int_num == 0x18) { had_get_ints |= 2; tasm30_bitset |= 0x10; }  /* TASM 3.0, TASM 3.2, Borland C++ 2.0 compiler bcc.exe for memory allocation. */
             if (get_int_num == 0x06) had_get_ints |= 4;  /* TLINK 4.0. */
             if ((had_get_ints & 8) && get_int_num == 0x34) had_get_ints |= 0x10;  /* JWasm 2.11a jwasmr.exe */
-
             /* !!! TODO(pts): Make the default permissive in general, and enable these protections only on a flag. */
             if ((had_get_ints & 1) ||
                 get_int_num - 0x22 + 0U <= 0x24 - 0x22 + 0U ||  /* Microsoft BASIC Professional Development System 7.10 linker pblink.exe gets interrupt vector 0x24. */
@@ -2928,6 +2935,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             const unsigned char al = (unsigned char)regs.rax;
             char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             if (al == 0x00) {  /* Get. */
+              tasm30_bitset |= 2;
               memcpy(p, &country_info, 0x18);
               *(unsigned short*)&regs.rax = *(unsigned short*)&regs.rbx = 1;
             } else {
@@ -3360,6 +3368,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
            * Example instructions: `xor ax, ax', `div ax'.
            */
           fprintf(stderr, "fatal: unhandled division by zero cs:%04x ip:%04x\n", int_cs, int_ip);
+        } else if (int_num == 0x03 && tasm30_bitset == 0xff)  { /* Turbo Assembler (TASM) 3.0. */
         } else {
          fatal_int:
           fprintf(stderr, "fatal: unsupported int 0x%02x ah:%02x cs:%04x ip:%04x\n", int_num, ah, int_cs, int_ip);
@@ -3440,7 +3449,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               }
             }
           } else { do_set_int:
-            if (set_int(set_int_num, *(unsigned*)run->mmio.data, mem, had_get_ints)) goto fatal;
+            if (set_int(set_int_num, *(unsigned*)run->mmio.data, mem, had_get_ints, &tasm30_bitset)) goto fatal;
           }
         } else if (addr == 0xa003e && mmio_len == 2 && !run->mmio.is_write) {
           /* Microsoft Macro Assembler 6.00B driver masm.exe. */
