@@ -2486,7 +2486,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 tm = localtime(&st.st_mtime);
                 *(unsigned short*)&regs.rcx = tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11;
                 *(unsigned short*)&regs.rdx = tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 1980) << 9;
-              } else if (al == 0) {  /* Set. */
+              } else {  /* Set if al == 1. */
                 /* !! Implement this with utime(2). */
                 fprintf(stderr, "fatal: unimplemented: set file date and time: fd=%d cx:%04x dx:%04x\n", fd, *(unsigned short*)&regs.rcx, *(unsigned short*)&regs.rdx);
                 goto fatal;
