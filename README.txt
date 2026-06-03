@@ -46,9 +46,9 @@ Limitations:
   (last 768 bytes), BIOS Data Area, helper code, the user code written for
   Linux.
 
-  kvikdos doesn't support memory types UMB (up to 384 KiB more), HMA (63
-  KiB more), XMS (up to hundreds of megabytes more) or EMS (also up to
-  hundres of megabytes, overlapping with XMS).
+  kvikdos has partial compatibility support for UMB/XMS/EMS probes and
+  common allocator APIs used by DOS toolchains, but it is not a full
+  memory-manager implementation (no full DPMI/VCPI stack).
 
   If your DOS programs need mre memory, use udosrun or DOSBox instead.
 
@@ -71,6 +71,12 @@ Limitations:
   tools (e.g. compilers and assemblers) released in the 1980s and 1990s
   already work, see the compatibility list below. To get good chances for
   running any random DOS program, use udosrun or DOSBox instead.
+
+* If the target file is Linux-native (ELF or shebang script), kvikdos
+  executes it natively with Linux `fork+execvp` instead of DOS emulation.
+
+* If the target file is a Windows executable format (PE/NE/LE/LX), kvikdos
+  delegates execution to `wine` automatically.
 
 Features and advantages:
 
@@ -146,6 +152,123 @@ How to install kvikdos:
 
   If it displays the dot and the `Hello, World!' message, then it's OK.
 
+Command-line options (structured):
+
+General:
+
+* `--kvm-check' checks KVM only.
+* `--strict' enables strict unsupported-interrupt behavior.
+* `--permissive' enables compatibility fallback behavior (default).
+
+DOS runtime:
+
+* `--toolchain=<name>' applies toolchain presets:
+  `msc4', `msc5', `msc6', `masm5', `bc2', `bcpp1', `bc5', `ic86'.
+* `--env=<NAME>=<value>' adds one DOS environment variable.
+* `--env-file=<file>' loads DOS environment variables from file
+  (`NAME=VALUE' lines).
+* `--path-dos=<pathlist>' sets DOS PATH explicitly.
+* `--prog=<dos-pathname>' sets DOS pathname of the running program.
+* `--cwd-dos=<path>' sets initial DOS current directory.
+
+Mounts:
+
+* `--mount=<drive><case><dirname>/' mounts Linux directory to DOS drive.
+* `--mount=<drive>0' hides DOS drive.
+* `--drive=<drive>' sets initial DOS drive.
+
+Compatibility:
+
+* `--case-fallback=off|prog|all' controls case-insensitive executable
+  lookup fallback. Default: `all'.
+
+Diagnostics:
+
+* `--diag=compat|exec|int|fs|all|off' controls runtime diagnostics.
+  Default: `compat'.
+* `--diag-file=<file>' writes diagnostics to a file.
+
+I/O and memory:
+
+* `--tty-in=<fd>' chooses input source (`-3', `-2', `-1', `>=0').
+* `--mem-mb=<n>' DOS memory size in MiB (currently only `1').
+* `--hlt-ok' and `--hlt-dump=<file>' are low-level debug options.
+
+Best defaults:
+
+* `--permissive'
+* `--case-fallback=all'
+* `--diag=compat'
+* no toolchain preset unless requested
+
+Examples:
+
+* Microsoft C 5.1:
+
+    $ ./kvikdos --toolchain=msc5 /home/xor/inertia_player/dos_compilers/Microsoft\ C\ v5/CL.EXE HELLO.C
+
+* Borland C 2 with explicit DOS PATH and cwd:
+
+    $ ./kvikdos --path-dos=C:\\ --cwd-dos=C:\\ /home/xor/inertia_player/dos_compilers/Borland\ Turbo\ C\ v2/TCC.EXE HELLO.C
+
+* Diagnostics to file:
+
+    $ ./kvikdos --diag=all --diag-file=kvikdos.diag /home/xor/inertia_player/masm/BIN/LINK.EXE
+
+Batch regression tests:
+
+* Run all local tests:
+
+    $ make test
+
+* Current batch suite (`tests/test_batch.sh`) covers commands/patterns used
+  by DOS compiler scripts: `set`, `%VAR%`, `%1..%9`, `shift`, `call`,
+  `if` (`==`, `not`, `errorlevel`, `exist`), `goto`, `mkdir`, `copy`, `del`.
+
+Static analysis and runtime checks:
+
+* cppcheck:
+
+    $ cppcheck --enable=warning,style,performance,portability --std=c89 --force kvikdos.c
+
+* clang static analyzer:
+
+    $ clang --analyze -Xanalyzer -analyzer-output=text -std=c89 -Wall -Wextra kvikdos.c
+
+* ASan+UBSan build and compiler smoke:
+
+    $ gcc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -fno-strict-aliasing -o kvikdos_asan kvikdos.c
+    $ /home/xor/kvikdos/kvikdos_asan /home/xor/inertia_player/dos_compilers/Microsoft\ C\ v5/CL.EXE /c HELLO0.C
+    $ /home/xor/kvikdos/kvikdos_asan /home/xor/inertia_player/dos_compilers/Microsoft\ MASM\ v5/BIN/MASM.EXE HELLO.ASM,HELLO.OBJ,NUL.LST,NUL.CRF
+
+* Valgrind smoke:
+
+    $ valgrind --tool=memcheck --leak-check=full --error-exitcode=101 ./kvikdos /home/xor/inertia_player/dos_compilers/Microsoft\ C\ v5/CL.EXE /c HELLO0.C
+    $ valgrind --tool=memcheck --leak-check=full --error-exitcode=101 ./kvikdos /home/xor/inertia_player/dos_compilers/Microsoft\ MASM\ v5/BIN/MASM.EXE HELLO.ASM,HELLO.OBJ,NUL.LST,NUL.CRF
+
+Readability and stability improvement roadmap (recommended):
+
+* Priority 1 (safety):
+  * Initialize all state structs (`DirState`, `ParsedCmdArgs`, runtime locals)
+    before first use; avoid partial-init patterns.
+  * Keep parser regression tests for option combinations (`--prog`, mounts,
+    drive/cwd/path interactions) and assert "no crash" behavior.
+  * Prefer bounded copy helpers (`copy_cstr0`) over ad-hoc `strncpy` usage.
+
+* Priority 2 (clarity):
+  * Split large functions (`parse_args`, `run_dos_prog`, `run_dos_batch`)
+    into smaller helpers by responsibility:
+    argument parsing, DOS path translation, int21 dispatch, batch command eval.
+  * Replace ambiguous locals (`p`, `q`, `r`) with intent names in new code
+    (`requested_drive`, `active_drive`, `resolved_prog`).
+  * Keep compatibility fallbacks local and commented at point of use.
+
+* Priority 3 (analysis depth):
+  * Add a fast static target in CI: `cppcheck` + `clang --analyze`.
+  * Add sanitizer targets (ASan+UBSan) and valgrind jobs as separate steps.
+  * Add negative tests for malformed paths/env/flags to verify deterministic
+    error messages and exit codes.
+
 About making Linux files available for DOS programs:
 
 * kvikdos emulates DOS drives A: .. F: by exposing directories on the Linux
@@ -216,6 +339,27 @@ About uppercase and lowercase filenames:
   `-mount=E-' for lowercase.
 
 Software compatibility, i.e. DOS programs known to work in kvikdos:
+
+Quick start for DOS compilers and assemblers:
+
+* For practical, copy-paste command lines, see TOOLCHAIN.md in this
+  repository.
+
+* Recommended layout rules:
+  * Use 8.3 filenames for source/object/output files (e.g. HELLO.C).
+  * If a toolchain has BIN/LIB/INCLUDE directories, mount the toolchain
+    root as C: and run the executable from C:\BIN\...
+  * Set DOS environment explicitly with --env=LIB=... and
+    --env=INCLUDE=...
+
+* Recently validated under kvikdos (compile, link, run of a tiny HELLO):
+  * Microsoft C 4.0
+  * Microsoft C 5.1
+  * Microsoft C 6ax (from toolchain root, C:\BIN\CL.EXE, LIB=C:\LIB)
+  * Intel iC-86 Compiler 4.5
+  * Borland Turbo C 2.0
+  * Borland Turbo C++ 1.01 (from toolchain root, C:\BIN\TCC.EXE, LIB=C:\LIB)
+  * Microsoft MASM 5.0 (MASM direct, LINK via prompt answers or stdin)
 
 * Turbo Pascal 7.0 compiler tpc.exe. It produces .exe program files
   directly.

@@ -1,11 +1,11 @@
-.PHONY: all clean run
+.PHONY: all clean run test test-batch test-mem test-cli test-cli-matrix test-static test-sanitizers test-valgrind test-tooling
 .SUFFIXES:
 MAKEFLAGS += -r
 
 ALL = kvikdos guest.com slowp.com malloct.com mallocs.com printenv.com cat.com waitkey.com
 
 # -Werror=int-conversion: GCC 4.8.4 fails.
-CFLAGS = -ansi -pedantic -s -O2 -W -Wall -Wextra -Werror=implicit-function-declaration -fno-strict-aliasing -Wno-overlength-strings $(XCFLAGS)
+CFLAGS = -ansi -pedantic -s -O2 -W -Wall -Wextra -Wuninitialized -Wmaybe-uninitialized -Werror -fno-strict-aliasing -Wno-overlength-strings $(XCFLAGS)
 XCFLAGS =  # To be overridden from the command-line.
 
 SRCDEPS = kvikdos.c mini_kvm.h
@@ -17,6 +17,31 @@ clean:
 
 run: kvikdos guest.com
 	./kvikdos guest.com hello world
+
+test: test-batch test-mem test-cli test-cli-matrix
+
+test-batch: kvikdos
+	./tests/test_batch.sh ./kvikdos
+
+test-mem: kvikdos
+	./tests/test_mem_services.sh ./kvikdos
+
+test-cli: kvikdos
+	./tests/test_cli_parse.sh ./kvikdos
+
+test-cli-matrix: kvikdos
+	./tests/test_cli_matrix.sh ./kvikdos
+
+test-static:
+	./tests/test_static.sh
+
+test-sanitizers:
+	./tests/test_sanitizers.sh
+
+test-valgrind: kvikdos
+	./tests/test_valgrind.sh ./kvikdos
+
+test-tooling: test-static test-sanitizers test-valgrind
 
 %.com: %.nasm
 	nasm -O0 -f bin -o $@ $<

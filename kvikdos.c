@@ -22,10 +22,27 @@
  * * DOSBox 0.74-4
  *   (https://github.com/svn2github/dosbox/blob/acd380bcde72db74f3b476253899016f686bc0ef/src/dos/dos_execute.cpp)
  * * MS-DOS 6.22 (source code not available).
+ *
+ * Code Quality Requirements (project policy):
+ * * Initialize all fields of structs and all local variables before first use.
+ *   Uninitialized reads are treated as correctness bugs, not style issues.
+ * * For parser state (CLI/env/path), prefer explicit defaults over implicit behavior.
+ * * Keep compatibility fallbacks narrow and documented next to the code path.
+ * * New CLI flags and parser branches must include at least one regression test
+ *   that exercises the option combination and asserts "no crash".
+ * * Keep diagnostics actionable: print the failing DOS path/drive and return a
+ *   deterministic DOS-compatible error when possible.
+ *
+ * Recommended ongoing improvements:
+ * * Add a dedicated parser matrix test (flag combinations) to CI.
+ * * Run ASan/UBSan and valgrind in separate jobs, plus cppcheck/clang-analyzer.
+ * * Prefer clearer variable names in new code paths (e.g. requested_drive,
+ *   active_drive) and add short intent comments for compatibility logic.
  */
 
 #define _GNU_SOURCE 1  /* For MAP_ANONYMOUS and memmem(). */
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>  /* For stdin availability check. */
 #include <stdint.h>
@@ -36,8 +53,31 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+
+static char *xstrdup(const char *s) {
+  size_t n = strlen(s) + 1;
+  char *p = (char*)malloc(n);
+  if (!p) return NULL;
+  memcpy(p, s, n);
+  return p;
+}
+
+/* Bounded C-string copy with guaranteed NUL termination. */
+static void copy_cstr0(char *dst, size_t dst_size, const char *src) {
+  size_t n;
+  if (dst_size == 0) return;
+  n = strlen(src);
+  if (n >= dst_size) n = dst_size - 1;
+  memcpy(dst, src, n);
+  dst[n] = '\0';
+}
+
+
+static unsigned g_case_fallback_mode = 2;  /* Best default: all. */
+static FILE *g_diag_file = NULL;
 
 #ifdef USE_MINI_KVM  /* For systems with a broken linux/kvm.h. */
 #  include "mini_kvm.h"
@@ -121,11 +161,148 @@ static char is_same_ascii_nocase(const char *a, const char *b, unsigned size) {
   return 1;
 }
 
+
+/* Resolve pathname components case-insensitively.
+ * If keep_last_case is nonzero, the last component is kept as-is (useful for O_CREAT).
+ * Returns 1 on success and writes out_path, 0 on failure.
+ */
+static int resolve_case_fallback_path(const char *in_path, char *out_path, size_t out_size, int keep_last_case) {
+  const int is_abs = in_path[0] == '/';
+  const char *p = in_path + is_abs;
+  char comp[256];
+  if (!in_path[0] || out_size < 2) return 0;
+  out_path[0] = is_abs ? '/' : '\0';
+  out_path[is_abs ? 1 : 0] = '\0';
+  while (*p) {
+    const char *q, *r;
+    size_t clen, olen;
+    int is_last;
+    DIR *dd;
+    struct dirent *de;
+    char picked[256];
+    int found = 0;
+    const char *scan_dir;
+    while (*p == '/') ++p;
+    if (!*p) break;
+    q = p;
+    while (*q && *q != '/') ++q;
+    clen = (size_t)(q - p);
+    if (clen == 0 || clen >= sizeof(comp)) return 0;
+    memcpy(comp, p, clen);
+    comp[clen] = '\0';
+    r = q;
+    while (*r == '/') ++r;
+    is_last = *r == '\0';
+    if (!(keep_last_case && is_last)) {
+      scan_dir = out_path[0] ? out_path : ".";
+      dd = opendir(scan_dir);
+      if (!dd) return 0;
+      while ((de = readdir(dd)) != NULL) {
+        size_t dlen = strlen(de->d_name);
+        if (dlen == clen && is_same_ascii_nocase(de->d_name, comp, (unsigned)clen)) {
+          memcpy(picked, de->d_name, dlen + 1);
+          found = 1;
+          break;
+        }
+      }
+      closedir(dd);
+      if (!found) return 0;
+    } else {
+      memcpy(picked, comp, clen + 1);
+    }
+    olen = strlen(out_path);
+    if (olen && out_path[olen - 1] != '/') {
+      if (olen + 1 >= out_size) return 0;
+      out_path[olen++] = '/';
+      out_path[olen] = '\0';
+    }
+    if (olen + strlen(picked) >= out_size) return 0;
+    strcpy(out_path + olen, picked);
+    p = q;
+  }
+  return out_path[0] != '\0';
+}
+
+static int open_with_case_fallback(const char *linux_filename, int flags, mode_t mode) {
+  char resolved[1024];
+  int fd = open(linux_filename, flags, mode);
+  if (fd >= 0) return fd;
+  if (errno == ENOENT && g_case_fallback_mode == 2 && linux_filename[0] &&
+      resolve_case_fallback_path(linux_filename, resolved, sizeof(resolved), (flags & O_CREAT) != 0)) {
+    fd = open(resolved, flags, mode);
+  }
+  return fd;
+}
+
+static int stat_with_case_fallback(const char *linux_filename, struct stat *st, int keep_last_case) {
+  char resolved[1024];
+  if (stat(linux_filename, st) == 0) return 0;
+  if (errno == ENOENT && g_case_fallback_mode == 2 && linux_filename[0] &&
+      resolve_case_fallback_path(linux_filename, resolved, sizeof(resolved), keep_last_case)) {
+    return stat(resolved, st);
+  }
+  return -1;
+}
+
+static DIR *opendir_with_case_fallback(const char *linux_dir, char *resolved_out, size_t resolved_out_size) {
+  DIR *dd;
+  if (resolved_out_size) resolved_out[0] = '\0';
+  dd = opendir(linux_dir);
+  if (dd) {
+    if (resolved_out_size) {
+      strncpy(resolved_out, linux_dir, resolved_out_size - 1);
+      resolved_out[resolved_out_size - 1] = '\0';
+    }
+    return dd;
+  }
+  if (errno != ENOENT || g_case_fallback_mode != 2 || !linux_dir[0]) return NULL;
+  if (!resolve_case_fallback_path(linux_dir, resolved_out, resolved_out_size, 0)) return NULL;
+  return opendir(resolved_out);
+}
+
 /* Example name_prefix: "PATH=". */
 static const char *getenv_prefix(const char *name_prefix, const char **env, const char **env_end) {
   const size_t name_prefix_size = strlen(name_prefix);
   for (; env != env_end; ++env) {
     if (strncmp(*env, name_prefix, name_prefix_size) == 0) return *env + name_prefix_size;
+  }
+  return NULL;
+}
+
+/* Example name_prefix: "PATH=". Scans NULL-terminated envp with case-insensitive key compare. */
+static const char *getenv_prefix_nocase0(const char *name_prefix, const char *const *env) {
+  size_t i, nps;
+  if (!env) return NULL;
+  nps = strlen(name_prefix);
+  for (; *env; ++env) {
+    const char *s = *env;
+    if (!s) continue;
+    for (i = 0; i < nps; ++i) {
+      char a = s[i], b = name_prefix[i];
+      if (a == '\0' || ((a | 32) != (b | 32))) break;
+    }
+    if (i == nps) return s + nps;
+  }
+  return NULL;
+}
+
+/* Example name_prefix: "PATH=". Scans NUL-separated DOS env block. */
+static const char *getenv_prefix_block_nocase(const char *name_prefix, const char *env, const char *env_end) {
+  size_t i, nps;
+  if (!env || !env_end || env >= env_end) return NULL;
+  nps = strlen(name_prefix);
+  while (env < env_end && *env) {
+    const char *eq = strchr(env, '=');
+    const char *next = env + strlen(env) + 1;
+    if (!eq || eq >= env_end) break;
+    if ((size_t)(eq - env + 1) == nps) {
+      for (i = 0; i < nps; ++i) {
+        char a = env[i], b = name_prefix[i];
+        if ((a | 32) != (b | 32)) break;
+      }
+      if (i == nps) return eq + 1;
+    }
+    env = next;
   }
   return NULL;
 }
@@ -156,7 +333,7 @@ static char detect_prog_filename_type(const char *prog_filename) {
 /* A relatively small struct, no string buffers. */
 typedef struct DirState {
   char drive;  /* 'A', 'B', 'C', 'D', ... ('A' + DRIVE_COUNT - 1). */
-  char current_dir[DRIVE_COUNT][1];  /* Currently mostly unused. */ /*char current_dir[DRIVE_COUNT][128];*/  /* In DOS syntax. Ends with \, unless empty. If current_dir[2] is FOO\BAR\, then it corresponds to C:\FOO\BAR. */
+  char current_dir[DRIVE_COUNT][64];  /* In DOS syntax. Ends with \, unless empty. If current_dir[2] is FOO\BAR\, then it corresponds to C:\FOO\BAR. */
   const char *linux_mount_dir[DRIVE_COUNT];  /* Linux directory to which the specific drive has been mounted, with '/' suffix (or empty), or NULL. Owned externally. linux_mount_dir[2] == "/tmp/foo/" maps DOS path C:\MY\FILE.TXT to Linux path /tmp/foo/MY/FILE.TXT .  */
   char case_mode[DRIVE_COUNT];  /* CASE_MODE_... indicating how letters in DOS filename characters should be converted to Linux (uppercase or lowercase). CASE_MODE_UPPERCASE (0) is the default. We could also call it case_fold. */
   const char *dos_prog_abs;  /* DOS absolute pathname of the program being run. Externally owned, can be NULL. */
@@ -244,13 +421,16 @@ static const char *get_dos_abs_filename_r(const char *p, char drive, const DirSt
 static char *get_linux_filename_r(const char *p, const DirState *dir_state, char *out_buf, char **out_lastc_out) {
   char *out_p = out_buf, *out_pend, *out_lastc = out_buf;
   const char *in_linux;
+  const char *linux_prog_base, *slashp;
   const char *in_dos[2] = { "", "" };
   char drive_idx, case_flip = 0, case_mode;
   if (*p == '\0') goto done;  /* Empty pathname is an error. */
   if (!dir_state) {  /* Convert to relative Linux pathname. */
     in_linux = NULL;
     in_dos[1] = p;
-  } else if (dir_state->dos_prog_abs && strcmp(p, dir_state->dos_prog_abs) == 0) {
+  } else if (dir_state->linux_prog && dir_state->dos_prog_abs && strcmp(p, dir_state->dos_prog_abs) == 0 &&
+             (linux_prog_base = ((slashp = strrchr(dir_state->linux_prog, '/')) != NULL ? slashp + 1 : dir_state->linux_prog)) != NULL &&
+             strchr(linux_prog_base, '.') != NULL) {
     in_linux = dir_state->linux_prog;
   } else {
     if (p[0] != '\0' && p[1] == ':') {
@@ -340,7 +520,7 @@ static char *get_linux_filename_r(const char *p, const DirState *dir_state, char
         for (; *p == '\\' || *p == '/'; ++p) {}
       }
     }
-    if (p[-1] == '/' || p[-1] == '\\') goto error;  /* If pathname ends with a slash, that's an error. It's safe to check since we've checked already that it's not empty. */
+    if (p > in_dos[1] && (p[-1] == '/' || p[-1] == '\\')) goto error;  /* If pathname ends with a slash, that's an error. */
   }
  done:
   *out_p = '\0';
@@ -429,6 +609,26 @@ static char *find_prog_on_path(const char *prog_filename, const DirState *dir_st
         if (CMD_PARSE_DEBUG) fprintf(stderr, "debug: found prog on drive=%c: %s\n", drive, fnbuf);
         *drive_out = drive;
         return fnbuf;  /* Found executable program file. */
+      } else if (g_case_fallback_mode != 0) {
+        char *s, *base = fnbuf;
+        strcpy(fnbuf2, fnbuf);
+        for (s = fnbuf2; *s; ++s) if (*s == '/') base = s + 1;
+        for (s = base; *s; ++s) if ((unsigned char)(*s - 'a') <= 'z' - 'a') *s &= ~32;
+        if (CMD_PARSE_DEBUG) fprintf(stderr, "debug: trying prog case fallback upper: %s\n", fnbuf2);
+        if (stat(fnbuf2, &st) == 0 && S_ISREG(st.st_mode)) {
+          strcpy(fnbuf, fnbuf2);
+          *drive_out = drive;
+          return fnbuf;
+        }
+        strcpy(fnbuf2, fnbuf);
+        for (s = base = fnbuf2; *s; ++s) if (*s == '/') base = s + 1;
+        for (s = base; *s; ++s) if ((unsigned char)(*s - 'A') <= 'Z' - 'A') *s |= 32;
+        if (CMD_PARSE_DEBUG) fprintf(stderr, "debug: trying prog case fallback lower: %s\n", fnbuf2);
+        if (stat(fnbuf2, &st) == 0 && S_ISREG(st.st_mode)) {
+          strcpy(fnbuf, fnbuf2);
+          *drive_out = drive;
+          return fnbuf;
+        }
       }
     }
    end_of_pp:
@@ -451,6 +651,10 @@ typedef struct EmuParams {
   char is_hlt_ok;
   unsigned mem_mb;
   const char *hlt_dump_filename;
+  const char *diag_filename;
+  unsigned diag_mask;
+  unsigned case_fallback_mode;  /* 0=off 1=prog 2=all */
+  char strict_mode;  /* 0=permissive 1=strict */
 } EmuParams;
 
 typedef struct ParsedCmdArgs {
@@ -460,8 +664,36 @@ typedef struct ParsedCmdArgs {
   int tty_in_fd;
   const char* const *args;  /* NULL-terminated list of NUL-terminated strings. Overlaps the program main(...) argv. */
   const char* const *envp0;  /* NULL-terminated list of NUL-terminated strings. Overlaps the program main(...) argv. */
+  const char *extra_env[128];
+  unsigned extra_env_count;
   const char *dpmi_prog;
 } ParsedCmdArgs;
+
+static void init_parsed_cmd_args(ParsedCmdArgs *cmd_args, char *placeholder_for_default) {
+  unsigned u;
+  memset(cmd_args, 0, sizeof(*cmd_args));
+  for (u = 0; u < DRIVE_COUNT; ++u) {
+    cmd_args->dir_state.current_dir[u][0] = '\0';
+    cmd_args->dir_state.linux_mount_dir[u] = NULL;
+  }
+  cmd_args->dir_state.drive = 'C';
+  cmd_args->dir_state.dos_prog_abs = NULL;
+  cmd_args->dir_state.linux_prog = NULL;
+  cmd_args->dir_state.linux_mount_dir['C' - 'A'] = placeholder_for_default;
+  cmd_args->dir_state.linux_mount_dir['D' - 'A'] = placeholder_for_default;
+  cmd_args->dir_state.linux_mount_dir['E' - 'A'] = placeholder_for_default;
+  memset(cmd_args->dir_state.case_mode, CASE_MODE_UNSPECIFIED, DRIVE_COUNT);
+  cmd_args->dpmi_prog = NULL;
+  cmd_args->extra_env_count = 0;
+  cmd_args->tty_in_fd = -1;
+  cmd_args->emu_params.mem_mb = 1;
+  cmd_args->emu_params.is_hlt_ok = 0;
+  cmd_args->emu_params.hlt_dump_filename = NULL;
+  cmd_args->emu_params.diag_filename = NULL;
+  cmd_args->emu_params.diag_mask = 1;  /* compat */
+  cmd_args->emu_params.case_fallback_mode = 2;  /* all */
+  cmd_args->emu_params.strict_mode = 0;  /* permissive */
+}
 
 static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const char *pre_msg, const char *usage_extra, const char *post_msg) {
   char *placeholder_for_default = (char*)pre_msg;
@@ -474,25 +706,44 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
   const char *dos_path;
   char dos_prog_drive;
   char is_kvm_check;
+  const char *path_dos_flag = NULL;
+  const char *cwd_dos_flag = NULL;
 
   argv0 = argv[0];
   /* Ignoring instances of the --cmd flage, for pts-fast-dosbox compatibility. */
   for (; argv[1] && 0 == strcmp(argv[1], "--cmd"); ++argv) {}
   if (!argv0 || !argv[1] || 0 == strcmp(argv[1], "--help")) {
     fprintf(stderr, "%s%s%s [<flag> ...] <dos-executable-file> [<dos-arg> ...]\n%s"
-                    "Flags:\n"
-                    "--kvm-check: Just check that KVM works, run a fake true.com\n"
-                    "--env=<NAME>=<value>: Adds environment variable.\n"
-                    "--prog=<dos-pathname>: Sets DOS pathname of program.\n"
-                    "--mount=<drive><case><dirname>/: Makes Linux dir visible as <drive> for DOS program.\n"
-                    "    If <case> is :, then mount uppercase. If <case> is -, then mount lowercase.\n"
-                    "--mount=<drive>0: Makes sure that <drive>: is not visible in DOS.\n"
-                    "--drive=<drive>: Sets initial current drive for DOS program.\n"
-                    "--tty-in=<fd>: Selects Linux file descriptor for keyboard input.\n"
-                    "    -3: fake keys; -2: stdin buffered; -1: /dev/tty; 0: stdin etc.\n"
-                    "--mem-mb=<n>: Use n MiB of memory for DOS. Only 1 is supported.\n"
-                    "--hlt-ok: Allow the hlt instruction.\n"
-                    "--hlt-dump=<filename>: Write memory dump upon hlt instruction.\n",
+                    "General:\n"
+                    "  --kvm-check                Check KVM only (runs fake true.com)\n"
+                    "  --strict | --permissive    Interrupt/API handling policy (default: --permissive)\n"
+                    "\n"
+                    "DOS Runtime:\n"
+                    "  --toolchain=<name>         Preset env for msc4|msc5|msc6|masm5|bc2|bcpp1|bc5|ic86\n"
+                    "  --env=<NAME>=<value>       Add DOS environment variable\n"
+                    "  --env-file=<file>          Load DOS env vars (NAME=VALUE lines)\n"
+                    "  --path-dos=<pathlist>      Set DOS PATH directly (e.g. C:\\BIN;C:\\)\n"
+                    "  --prog=<dos-pathname>      Set DOS pathname of running program\n"
+                    "  --cwd-dos=<path>           Set initial DOS current directory (e.g. C:\\BIN)\n"
+                    "\n"
+                    "Mounts:\n"
+                    "  --mount=<drive><case><dirname>/   Mount Linux dir to DOS drive\n"
+                    "  --mount=<drive>0                  Hide DOS drive\n"
+                    "    <case> ':' uppercase, '-' lowercase\n"
+                    "  --drive=<drive>             Set initial DOS drive\n"
+                    "\n"
+                    "Compatibility:\n"
+                    "  --case-fallback=off|prog|all  Case-insensitive program lookup (default: all)\n"
+                    "\n"
+                    "Diagnostics:\n"
+                    "  --diag=compat|exec|int|fs|all|off   Runtime diagnostics (default: compat)\n"
+                    "  --diag-file=<file>                  Write diagnostics to file\n"
+                    "\n"
+                    "I/O and Memory:\n"
+                    "  --tty-in=<fd>               -3 fake, -2 buffered stdin, -1 /dev/tty, >=0 fd\n"
+                    "  --mem-mb=<n>                DOS memory in MiB (currently only 1)\n"
+                    "  --hlt-ok                    Allow hlt instruction\n"
+                    "  --hlt-dump=<filename>       Dump guest memory on hlt\n",
                     pre_msg, argv0, usage_extra, post_msg);
     exit(argv0 && argv[1] ? 0 : 1);
   }
@@ -501,25 +752,10 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
     exit(0);
   }
 
-  { unsigned u;
-    for (u = 0; u < DRIVE_COUNT; ++u) {
-      cmd_args.dir_state.current_dir[u][0] = '\0';
-      cmd_args.dir_state.linux_mount_dir[u] = NULL;
-    }
-    cmd_args.dir_state.drive = 'C';
-    cmd_args.dir_state.dos_prog_abs = NULL;
-    cmd_args.dir_state.linux_mount_dir['C' - 'A'] = placeholder_for_default;
-    cmd_args.dir_state.linux_mount_dir['D' - 'A'] = placeholder_for_default;
-    cmd_args.dir_state.linux_mount_dir['E' - 'A'] = placeholder_for_default;
-    memset(cmd_args.dir_state.case_mode, CASE_MODE_UNSPECIFIED, DRIVE_COUNT);
-  }
-
+  init_parsed_cmd_args(&cmd_args, placeholder_for_default);
+  /* Used by get_linux_filename_r() alias check; must be initialized in parse-only paths. */
+  cmd_args.dir_state.linux_prog = NULL;
   envp = envp0 = ++argv;
-  cmd_args.dpmi_prog = NULL;
-  cmd_args.tty_in_fd = -1;
-  cmd_args.emu_params.mem_mb = 1;
-  cmd_args.emu_params.is_hlt_ok = 0;
-  cmd_args.emu_params.hlt_dump_filename = NULL;
   is_kvm_check = 0;
   is_drive_specified = 0;
   while (argv[0]) {
@@ -658,6 +894,127 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
       goto do_mem_mb;
     } else if (0 == strcmp(arg, "--kvm-check")) {
       is_kvm_check = 1;
+    } else if (0 == strcmp(arg, "--permissive")) {
+      cmd_args.emu_params.strict_mode = 0;
+    } else if (0 == strcmp(arg, "--strict")) {
+      cmd_args.emu_params.strict_mode = 1;
+    } else if (0 == strcmp(arg, "--path-dos")) {
+      if (!argv[0]) goto missing_argument;
+      path_dos_flag = *argv++;
+    } else if (0 == strncmp(arg, "--path-dos=", 11)) {
+      path_dos_flag = arg + 11;
+    } else if (0 == strcmp(arg, "--cwd-dos")) {
+      if (!argv[0]) goto missing_argument;
+      cwd_dos_flag = *argv++;
+    } else if (0 == strncmp(arg, "--cwd-dos=", 10)) {
+      cwd_dos_flag = arg + 10;
+    } else if (0 == strcmp(arg, "--env-file")) {
+      FILE *f;
+      char line[4096];
+      if (!argv[0]) goto missing_argument;
+      f = fopen(*argv++, "rb");
+      if (!f) {
+        perror("fatal: cannot open --env-file");
+        exit(1);
+      }
+      while (fgets(line, sizeof(line), f)) {
+        char *p = line, *eq, *e;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p == '\0' || *p == '\n' || *p == '\r' || *p == '#') continue;
+        for (e = p + strlen(p); e != p && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ' || e[-1] == '\t'); --e) {}
+        *e = '\0';
+        eq = strchr(p, '=');
+        if (!eq || eq == p) continue;
+        if (cmd_args.extra_env_count >= sizeof(cmd_args.extra_env) / sizeof(cmd_args.extra_env[0])) {
+          fprintf(stderr, "fatal: too many extra env vars\n");
+          exit(1);
+        }
+        cmd_args.extra_env[cmd_args.extra_env_count++] = xstrdup(p);
+      }
+      fclose(f);
+    } else if (0 == strncmp(arg, "--env-file=", 11)) {
+      FILE *f = fopen(arg + 11, "rb");
+      char line[4096];
+      if (!f) {
+        perror("fatal: cannot open --env-file");
+        exit(1);
+      }
+      while (fgets(line, sizeof(line), f)) {
+        char *p = line, *eq, *e;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p == '\0' || *p == '\n' || *p == '\r' || *p == '#') continue;
+        for (e = p + strlen(p); e != p && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ' || e[-1] == '\t'); --e) {}
+        *e = '\0';
+        eq = strchr(p, '=');
+        if (!eq || eq == p) continue;
+        if (cmd_args.extra_env_count >= sizeof(cmd_args.extra_env) / sizeof(cmd_args.extra_env[0])) {
+          fprintf(stderr, "fatal: too many extra env vars\n");
+          exit(1);
+        }
+        cmd_args.extra_env[cmd_args.extra_env_count++] = xstrdup(p);
+      }
+      fclose(f);
+    } else if (0 == strcmp(arg, "--diag")) {
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+      if (strcmp(arg, "off") == 0) cmd_args.emu_params.diag_mask = 0;
+      else if (strcmp(arg, "compat") == 0) cmd_args.emu_params.diag_mask = 1;
+      else if (strcmp(arg, "exec") == 0) cmd_args.emu_params.diag_mask = 2;
+      else if (strcmp(arg, "int") == 0) cmd_args.emu_params.diag_mask = 4;
+      else if (strcmp(arg, "fs") == 0) cmd_args.emu_params.diag_mask = 8;
+      else if (strcmp(arg, "all") == 0) cmd_args.emu_params.diag_mask = ~0U;
+      else { fprintf(stderr, "fatal: bad --diag value: %s\n", arg); exit(1); }
+    } else if (0 == strncmp(arg, "--diag=", 7)) {
+      arg += 7;
+      if (strcmp(arg, "off") == 0) cmd_args.emu_params.diag_mask = 0;
+      else if (strcmp(arg, "compat") == 0) cmd_args.emu_params.diag_mask = 1;
+      else if (strcmp(arg, "exec") == 0) cmd_args.emu_params.diag_mask = 2;
+      else if (strcmp(arg, "int") == 0) cmd_args.emu_params.diag_mask = 4;
+      else if (strcmp(arg, "fs") == 0) cmd_args.emu_params.diag_mask = 8;
+      else if (strcmp(arg, "all") == 0) cmd_args.emu_params.diag_mask = ~0U;
+      else { fprintf(stderr, "fatal: bad --diag value: %s\n", arg); exit(1); }
+    } else if (0 == strcmp(arg, "--diag-file")) {
+      if (!argv[0]) goto missing_argument;
+      cmd_args.emu_params.diag_filename = *argv++;
+    } else if (0 == strncmp(arg, "--diag-file=", 12)) {
+      cmd_args.emu_params.diag_filename = arg + 12;
+    } else if (0 == strcmp(arg, "--case-fallback")) {
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+      if (strcmp(arg, "off") == 0) cmd_args.emu_params.case_fallback_mode = 0;
+      else if (strcmp(arg, "prog") == 0) cmd_args.emu_params.case_fallback_mode = 1;
+      else if (strcmp(arg, "all") == 0) cmd_args.emu_params.case_fallback_mode = 2;
+      else { fprintf(stderr, "fatal: bad --case-fallback value: %s\n", arg); exit(1); }
+    } else if (0 == strncmp(arg, "--case-fallback=", 16)) {
+      arg += 16;
+      if (strcmp(arg, "off") == 0) cmd_args.emu_params.case_fallback_mode = 0;
+      else if (strcmp(arg, "prog") == 0) cmd_args.emu_params.case_fallback_mode = 1;
+      else if (strcmp(arg, "all") == 0) cmd_args.emu_params.case_fallback_mode = 2;
+      else { fprintf(stderr, "fatal: bad --case-fallback value: %s\n", arg); exit(1); }
+    } else if (0 == strcmp(arg, "--toolchain") || 0 == strncmp(arg, "--toolchain=", 12)) {
+      const char *tc;
+      if (arg[11] == '\0') {
+        if (!argv[0]) goto missing_argument;
+        tc = *argv++;
+      } else {
+        tc = arg + 12;
+      }
+      if (cmd_args.extra_env_count + 4 >= sizeof(cmd_args.extra_env) / sizeof(cmd_args.extra_env[0])) {
+        fprintf(stderr, "fatal: too many extra env vars\n");
+        exit(1);
+      }
+      if (strcmp(tc, "msc6") == 0 || strcmp(tc, "bcpp1") == 0 || strcmp(tc, "bc5") == 0) {
+        cmd_args.extra_env[cmd_args.extra_env_count++] = xstrdup("PATH=C:\\BIN;C:\\");
+        cmd_args.extra_env[cmd_args.extra_env_count++] = xstrdup("LIB=C:\\LIB");
+        cmd_args.extra_env[cmd_args.extra_env_count++] = xstrdup("INCLUDE=C:\\INCLUDE");
+      } else if (strcmp(tc, "msc4") == 0 || strcmp(tc, "msc5") == 0 || strcmp(tc, "masm5") == 0 || strcmp(tc, "bc2") == 0 || strcmp(tc, "ic86") == 0) {
+        cmd_args.extra_env[cmd_args.extra_env_count++] = xstrdup("PATH=C:\\");
+        cmd_args.extra_env[cmd_args.extra_env_count++] = xstrdup("LIB=LIB");
+        cmd_args.extra_env[cmd_args.extra_env_count++] = xstrdup("INCLUDE=INCLUDE");
+      } else {
+        fprintf(stderr, "fatal: unknown --toolchain preset: %s\n", tc);
+        exit(1);
+      }
     } else {
       fprintf(stderr, "fatal: unknown command-line flag: %s\n", arg);
       exit(1);
@@ -681,6 +1038,19 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
   fprintf(stderr, "GLF (%s)\n", get_linux_filename(".\\aaa\\.."));
   fprintf(stderr, "GLF (%s)\n", get_linux_filename("C:\\foo\\.\\\\\\.\\bar\\.\\..\\.\\bazzzz\\.."));
 #endif
+  if (path_dos_flag) {
+    char *pd;
+    size_t n = strlen(path_dos_flag);
+    pd = (char*)malloc(n + 6);
+    if (!pd) { perror("fatal: malloc"); exit(252); }
+    memcpy(pd, "PATH=", 5);
+    memcpy(pd + 5, path_dos_flag, n + 1);
+    if (cmd_args.extra_env_count >= sizeof(cmd_args.extra_env) / sizeof(cmd_args.extra_env[0])) {
+      fprintf(stderr, "fatal: too many extra env vars\n");
+      exit(1);
+    }
+    cmd_args.extra_env[cmd_args.extra_env_count++] = pd;
+  }
   *envp = NULL;
   /* Remaining arguments in argv will be passed to the DOS program in PSP:0x80. */
   dos_path = getenv_prefix("PATH=", (char const**)envp0, (char const**)envp);
@@ -771,8 +1141,8 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
       }
       cmd_args.prog_filename = find_prog_on_path(prog_name_arg, &cmd_args.dir_state, dos_path, &dos_prog_drive);  /* Return value is fnbuf or NULL. */
       if (!cmd_args.prog_filename) {
-        fprintf(stderr, "fatal: DOS command not found on %c:\\ or %%PATH%%: %s\n", cmd_args.dir_state.drive, prog_name_arg);
-        exit(252);
+        fprintf(stderr, "error: DOS command not found on %c:\\ or %%PATH%%: %s\n", cmd_args.dir_state.drive, prog_name_arg);
+        exit(1);
       }
       if (*cmd_args.prog_filename == '\0') {
         fprintf(stderr, "fatal: invalid <dos-executable-file> DOS program name: %s\n", prog_name_arg);
@@ -786,13 +1156,15 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
   prog_name_arg = NULL;  /* Make sure we don't use it later, we've already modified it for cmd_args.dir_state.linux_mount_dir['E' - 'A']. */
 
   if (!cmd_args.dir_state.linux_mount_dir[cmd_args.dir_state.drive - 'A']) {
-    /*cmd_args.dir_state.drive = 'C';*/
     fprintf(stderr, "fatal: no mount point for default drive (specify --mount=...): %c:\n", cmd_args.dir_state.drive);
     exit(1);
   }
   if (cmd_args.dir_state.dos_prog_abs == NULL && cmd_args.prog_filename) {
     cmd_args.dir_state.dos_prog_abs = get_dos_abs_filename_r(cmd_args.prog_filename, dos_prog_drive, &cmd_args.dir_state, dosfnbuf);
     if (CMD_PARSE_DEBUG) fprintf(stderr, "debug: prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", cmd_args.prog_filename, cmd_args.dir_state.dos_prog_abs, dos_prog_drive);
+  }
+  if (!is_drive_specified && prog_filename_type == PFT_LINUX && dos_prog_drive >= 'A' && dos_prog_drive <= 'Z') {
+    cmd_args.dir_state.drive = dos_prog_drive;  /* Resolve relative filenames in the executable directory mount by default. */
   }
   if (prog_filename_type == PFT_LINUX && cmd_args.dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED && cmd_args.dir_state.linux_mount_dir['C' - 'A']) {
     const char *mount_c = cmd_args.dir_state.linux_mount_dir['C' - 'A'];
@@ -807,6 +1179,51 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
     }
   }
 
+  if (!cwd_dos_flag && cmd_args.dir_state.dos_prog_abs && cmd_args.dir_state.dos_prog_abs[0] &&
+      (cmd_args.dir_state.dos_prog_abs[0] & ~32) - 'A' + 0U < DRIVE_COUNT &&
+      cmd_args.dir_state.dos_prog_abs[1] == ':' && cmd_args.dir_state.dos_prog_abs[2] == '\\') {
+    /* Default DOS CWD to the executable directory, so relative file args resolve like in DOSBox.
+     * Example: `kvikdos C:\\TOOLS\\UNP.EXE t unp.exe` should search in C:\\TOOLS\\.
+     */
+    char drive = cmd_args.dir_state.dos_prog_abs[0] & ~32;
+    const char *base = cmd_args.dir_state.dos_prog_abs + strlen(cmd_args.dir_state.dos_prog_abs);
+    const char *p = cmd_args.dir_state.dos_prog_abs + 3;
+    char tmp[DOS_PATH_SIZE];
+    size_t n;
+    for (; base > p && base[-1] != '\\' && base[-1] != '/'; --base) {}
+    if (base > p) {
+      n = (size_t)(base - p);
+      if (n >= sizeof(tmp)) n = sizeof(tmp) - 1;
+      memcpy(tmp, p, n);
+      if (n > 0 && tmp[n - 1] != '\\') tmp[n++] = '\\';
+      tmp[n] = '\0';
+      copy_cstr0(cmd_args.dir_state.current_dir[drive - 'A'], sizeof(cmd_args.dir_state.current_dir[drive - 'A']), tmp);
+      cmd_args.dir_state.drive = drive;
+    }
+  }
+
+  if (cwd_dos_flag && cwd_dos_flag[0]) {
+    char drive = cmd_args.dir_state.drive;
+    const char *p = cwd_dos_flag;
+    char tmp[DOS_PATH_SIZE];
+    char *q = tmp;
+    if ((p[0] & ~32) - 'A' + 0U < DRIVE_COUNT && p[1] == ':') {
+      drive = p[0] & ~32;
+      p += 2;
+      if (*p == '\\' || *p == '/') ++p;
+      cmd_args.dir_state.drive = drive;
+    } else if (*p == '\\' || *p == '/') {
+      ++p;
+    }
+    while (*p && q + 2 < tmp + sizeof(tmp)) {
+      char c = *p++;
+      if (c == '/') c = '\\';
+      *q++ = (c - 'a' + 0U <= 'z' - 'a' + 0U) ? (c & ~32) : c;
+    }
+    if (q != tmp && q[-1] != '\\') *q++ = '\\';
+    *q = '\0';
+    copy_cstr0(cmd_args.dir_state.current_dir[drive - 'A'], sizeof(cmd_args.dir_state.current_dir[drive - 'A']), tmp);
+  }
   cmd_args.args = (const char* const*)argv;
   cmd_args.envp0 = (const char* const*)envp0;
   *cmd_args_out = cmd_args;
@@ -1245,7 +1662,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     const unsigned headsize = (unsigned)exehdr[EXE_HDRSIZE] << 4;
     const unsigned image_size = exesize - headsize;
     unsigned memsize_min_para = (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MINALLOC];  /* This includes .bss after the image. Please note that this doesn't depend on exehdr[EXE_LASTSIZE]. Formula is same as in MS-DOS 6.22, FreeDOS 1.2, DOSBox 0.74-4. */
-    const unsigned memsize_max_para = (unsigned short)(exehdr[EXE_MAXALLOC] + 1) < 2 ? 0xffff : (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MAXALLOC];
+    unsigned memsize_max_para = (unsigned short)(exehdr[EXE_MAXALLOC] + 1) < 2 ? 0xffff : (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MAXALLOC];
     char * const image_addr = (char*)mem + (PSP_PARA << 4) + 0x100;
     const unsigned image_para = PSP_PARA + 0x10;
     unsigned reloc_count = exehdr[EXE_NRELOC];
@@ -1271,8 +1688,10 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
       }
     }
     if (memsize_min_para > memsize_max_para) {
-      fprintf(stderr, "fatal: DOS .exe minimum memory larger than maximum: %s\n", filename);
-      exit(252);
+      /* Some historical toolchains emit malformed MINALLOC/MAXALLOC pairs.
+       * MS-DOS still loads them by effectively treating MAXALLOC as at least
+       * MINALLOC, so clamp instead of failing hard. */
+      memsize_max_para = memsize_min_para;
     }
     if (memsize_min_para > memsize_available_para) {
       fprintf(stderr, "fatal: DOS .exe uses too much conventional memory: %s\n", filename);
@@ -1334,11 +1753,11 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
           exepack_stub_plus_reloc_size >= 258 && exepack_stub_plus_reloc_size <= exepack_max_size) {
         char *after_packhdr = (char*)packhdr + exehdr[EXE_IP];
         const char *c = (const char*)memmem(after_packhdr, exepack_stub_plus_reloc_size, "\xcd\x21\xb8\xff\x4c\xcd\x21", 7);
-        if (DEBUG) fprintf(stderr, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%d exepack_stub_plus_reloc_size=%d\n", exehdr[EXE_IP], exepack_max_size, exepack_stub_plus_reloc_size);
+        if (DEBUG) fprintf(stderr, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%u exepack_stub_plus_reloc_size=%u\n", exehdr[EXE_IP], exepack_max_size, exepack_stub_plus_reloc_size);
         if (c) {
           const unsigned exepack_stub_size = (unsigned)(c + 7 + 22 - after_packhdr);
           if (exepack_stub_size >= 258 && exepack_stub_size <= 290) {
-            if (DEBUG) fprintf(stderr, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%d exepack_stub_plus_reloc_size=%d exepack_stub_size=%d\n", exehdr[EXE_IP], exepack_max_size, exepack_stub_plus_reloc_size, exepack_stub_size);
+            if (DEBUG) fprintf(stderr, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%u exepack_stub_plus_reloc_size=%u exepack_stub_size=%u\n", exehdr[EXE_IP], exepack_max_size, exepack_stub_plus_reloc_size, exepack_stub_size);
             /* Fix A20 bug (failure as ``Packed file is corrupt'' because ES
              * wraps around 0x10000) by replacing the stub.
              */
@@ -1439,6 +1858,57 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
    * 0x6c 20 bytes  default unopened FCB #2 (overlays part of FCB #1) (overwritten if FCB 1 is opened)
    */
   return psp;
+}
+
+/* Implements int 21h/4Bh AL=03 (load overlay): load image to load_para, apply
+ * relocations using reloc_para, and return to caller without executing.
+ */
+static int load_dos_overlay_program(int img_fd, const char *filename, void *mem, const char *header, int header_size, unsigned short load_para, unsigned short reloc_para) {
+  if (header_size >= 24 && (('M' | 'Z' << 8) == *(const unsigned short*)header || ('M' << 8 | 'Z') == *(const unsigned short*)header)) {
+    const unsigned short * const exehdr = (const unsigned short*)header;
+    const unsigned short nblocks = exehdr[EXE_NBLOCKS] & 0x7ff;
+    const unsigned exesize = exehdr[EXE_LASTSIZE] ? ((nblocks - 1) << 9) + exehdr[EXE_LASTSIZE] : nblocks << 9;
+    const unsigned headsize = (unsigned)exehdr[EXE_HDRSIZE] << 4;
+    const unsigned image_size = exesize - headsize;
+    const unsigned image_linear = (unsigned)load_para << 4;
+    unsigned reloc_count = exehdr[EXE_NRELOC];
+    if (exehdr[EXE_LASTSIZE] > 0x200 || exesize <= headsize || image_linear + image_size > DOS_MEM_LIMIT) {
+      errno = ENOMEM;
+      return -1;
+    }
+    if ((unsigned)lseek(img_fd, headsize, SEEK_SET) != headsize) return -1;
+    if ((unsigned)read(img_fd, (char*)mem + image_linear, image_size) != image_size) return -1;
+    if (reloc_count) {
+      unsigned short reloc[1024];
+      if (header_size < 26) { errno = EINVAL; return -1; }
+      if ((unsigned)lseek(img_fd, exehdr[EXE_RELOCPOS], SEEK_SET) != exehdr[EXE_RELOCPOS]) return -1;
+      while (reloc_count != 0) {
+        const unsigned to_read = reloc_count > (sizeof(reloc) >> 2) ? sizeof(reloc) : reloc_count << 2;
+        const unsigned got = read(img_fd, reloc, to_read);
+        unsigned short *r, *rend;
+        if (got != to_read) return -1;
+        reloc_count -= got >> 2;
+        for (r = reloc, rend = r + (got >> 1); r != rend; r += 2) {
+          const unsigned linear = image_linear + ((unsigned)r[1] << 4) + r[0];
+          if (linear + 2 > DOS_MEM_LIMIT) { errno = EINVAL; return -1; }
+          *(unsigned short*)((char*)mem + linear) += reloc_para;
+        }
+      }
+    }
+  } else {
+    const unsigned image_linear = (unsigned)load_para << 4;
+    struct stat st;
+    int got;
+    if (fstat(img_fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 || (unsigned long)st.st_size > (unsigned long)(DOS_MEM_LIMIT - image_linear)) {
+      errno = ENOMEM;
+      return -1;
+    }
+    if ((unsigned)lseek(img_fd, 0, SEEK_SET) != 0) return -1;
+    got = read(img_fd, (char*)mem + image_linear, st.st_size);
+    if (got != st.st_size) return -1;
+  }
+  (void)filename;
+  return 0;
 }
 
 static void dump_regs(const char *prefix, const struct kvm_regs *regs, const struct kvm_sregs *sregs) {
@@ -1677,13 +2147,15 @@ static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, ch
       ((had_get_ints & 1) && (int_num == 0x00 || int_num == 0x02 || int_num - 0x35 + 0U <= 0x3f - 0x35 + 0U))  /* Microsoft BASIC Professional Development System 7.10 compiler pbc.exe. */ ||
       ((had_get_ints & 8) && int_num - 0x34 + 0U <= 0x3d - 0x34 + 0U)  /* Microsoft Macro Assembler 1.10 masm.exe */ ||
       ((had_get_ints & 0x10) && (int_num == 0x02 || int_num == 0x1b || int_num == 0x00)) ||  /* JWasm 2.11a jwasmr.exe */
+      int_num >= 0xc0 ||  /* Toolchain-private vectors (e.g. Intel iC-86 v4.5 IC86.EXE). */
       int_num == 0x06 ||  /* ASM32 1.1 assembler asm32.exe */
       0) {
     /* FYI kvikdos never sends Ctrl-<Break>. */
   } else {
-    fprintf(stderr, "fatal: unsupported set interrupt vector int:%02x to cs:%04x ip:%04x\n",
-            int_num, (unsigned short)(value_seg_ofs >> 16), (unsigned short)value_seg_ofs);
-    return 1;
+    if (DEBUG || DEBUG_INTVEC) {
+      fprintf(stderr, "debug: permissive set interrupt vector int:%02x to cs:%04x ip:%04x\n",
+              int_num, (unsigned short)(value_seg_ofs >> 16), (unsigned short)value_seg_ofs);
+    }
   }
   *p = value_seg_ofs;
   return 0;  /* Success. */
@@ -1717,6 +2189,56 @@ static const char *get_linux_basename(const char *fn) {
   const char *fnp;
   for (fnp = fn + strlen(fn); fnp != fn && fnp[-1] != '/'; --fnp) {}
   return fnp;
+}
+
+static char upper_ascii(char c) {
+  return (c - 'a' + 0U <= 'z' - 'a' + 0U) ? c - 32 : c;
+}
+
+static char has_dos_ext_nocase(const char *fn, const char *ext) {
+  const char *dot = strrchr(fn, '.');
+  size_t n;
+  if (!dot) return 0;
+  n = strlen(ext);
+  if (strlen(dot) != n) return 0;
+  return is_same_ascii_nocase(dot, ext, n);
+}
+
+static time_t dos_datetime_to_time(unsigned short dos_date, unsigned short dos_time) {
+  struct tm tm;
+  memset(&tm, 0, sizeof(tm));
+  tm.tm_sec = (dos_time & 31) << 1;
+  tm.tm_min = (dos_time >> 5) & 63;
+  tm.tm_hour = (dos_time >> 11) & 31;
+  tm.tm_mday = dos_date & 31;
+  tm.tm_mon = ((dos_date >> 5) & 15) - 1;
+  tm.tm_year = ((dos_date >> 9) & 127) + 80;  /* Since 1900. */
+  tm.tm_isdst = -1;
+  if (tm.tm_mon < 0) tm.tm_mon = 0;
+  if (tm.tm_mday < 1) tm.tm_mday = 1;
+  return mktime(&tm);
+}
+
+/* Case-insensitive DOS wildcard match for a single 8.3 basename. */
+static char dos_wildcard_match(const char *pattern, const char *name) {
+  while (*pattern == '*') ++pattern;
+  if (*pattern == '\0') return 1;
+  for (;; ++name) {
+    const char pc = upper_ascii(*pattern);
+    const char nc = upper_ascii(*name);
+    if (pc == '*') {
+      do ++pattern; while (*pattern == '*');
+      if (*pattern == '\0') return 1;
+      for (;; ++name) {
+        if (*name == '\0') return 0;
+        if (dos_wildcard_match(pattern, name)) return 1;
+      }
+    }
+    if (pc == '\0') return nc == '\0';
+    if (nc == '\0') return 0;
+    if (pc != '?' && pc != nc) return 0;
+    ++pattern;
+  }
 }
 
 /* Returns bool indicating whether all components of the specified filename (as a DOS pathname, maybe absolute) are limited to DOS 8.3 characters. */
@@ -1755,42 +2277,6 @@ static const unsigned char scancodes[128] = {
 static const unsigned short fake_keys[3] = {
     0x011b /* <Esc> */, 0x4400 /* <F10> */, 0x1c0d /* <Enter> */ };
 
-/* It's unclear whether running the new program and discarding the current
- * one is the right approach in the general case (especially with al == 3).
- * So we just whitelist a few programs where we do that.
- */
-static char should_skip_exec_program(char const *dos_filename, const char *args, const char *env, const char **env_end_inout, char had_get_first_mcb) {
-  size_t dos_filename_size;
-  char had_ml_env = 0;
-  const char *p, *env_end = *env_end_inout;
-  /* Detect Microsoft Macro Assembler 6.00B driver masm.exe. */
-  dos_filename_size = strlen(dos_filename);
-  for (p = dos_filename + dos_filename_size; p != dos_filename && p[-1] != '\\'; --p) {}
-  if (strcmp(p, "ML.EXE") == 0) {
-    if (!had_get_first_mcb || !args || *args != '\0') return 1;
-    for (p = env; *p != '\0';) {
-      char *q = memchr(p, '\0', env_end - p);
-      if (!q) return 3;  /* env too long. */
-      if (DEBUG) fprintf(stderr, "debug: load env line: (%s)\n", p);
-      if (strncmp(p, "ML= ", 4) == 0) had_ml_env = 1;
-      p = q + 1;
-    }
-    if (!had_ml_env) return 4;
-    if (++p + 4 > env_end) return 5;
-    if (*(const unsigned short*)p != 1) return 6;
-    p += 2;
-    if (p + dos_filename_size >= env_end) return 7;
-    if (strcmp(p, dos_filename) != 0) return 8;
-    *env_end_inout = p - 2;  /* Not: p + dos_filename_size + 1; */
-    return 0;  /* exec() it. */
-  } else if (strcmp(p, "tlink.exe") == 0) {  /* Borland C++ 2.0 compiler bcc.exe executing TLINK 4.0 linker tlink.exe */
-    if (!args || strcmp(args, "@turboc.$ln") != 0) return 11;
-    return -1;  /* exec() it, but delete file "turboc.$ln" later. */
-  } else {
-    return 2;
-  }
-}
-
 typedef struct TtyState {
   int tty_in_fd;
   char is_tty_in_error;
@@ -1804,6 +2290,82 @@ typedef struct EmuState {
   struct kvm_run *kvm_run;
   void *mem;
 } EmuState;
+
+static int run_dos_child_subprocess(const char *dos_filename, const char *dos_args, const char *env, const char *env_end, const DirState *dir_state, unsigned char *exit_code_out) {
+  char self_exe[LINUX_PATH_SIZE];
+  char drive_arg[16];
+  char mount_arg[LINUX_PATH_SIZE + 32];
+  char *argv_child[256];
+  char *owned_args[200];
+  int argc = 0, owned_count = 0, i, status;
+  pid_t pid;
+  ssize_t got;
+  const char *p;
+
+  if (!dos_filename || !*dos_filename || !exit_code_out) { errno = EINVAL; return -1; }
+  got = readlink("/proc/self/exe", self_exe, sizeof(self_exe) - 1);
+  if (got <= 0 || got >= (ssize_t)sizeof(self_exe) - 1) {
+    errno = ENOENT;
+    return -1;
+  }
+  self_exe[got] = '\0';
+
+  argv_child[argc++] = self_exe;
+  for (i = 0; i < DRIVE_COUNT; ++i) {
+    const char *mount = dir_state->linux_mount_dir[i];
+    const char case_c = dir_state->case_mode[i] == CASE_MODE_LOWERCASE ? '-' : ':';
+    if (!mount) continue;
+    if (*mount == '\0') snprintf(mount_arg, sizeof(mount_arg), "--mount=%c%c", 'A' + i, case_c);
+    else snprintf(mount_arg, sizeof(mount_arg), "--mount=%c%c%s", 'A' + i, case_c, mount);
+    owned_args[owned_count] = xstrdup(mount_arg);
+    if (!owned_args[owned_count]) goto alloc_fail;
+    argv_child[argc++] = owned_args[owned_count++];
+  }
+  snprintf(drive_arg, sizeof(drive_arg), "--drive=%c:", dir_state->drive);
+  owned_args[owned_count] = xstrdup(drive_arg);
+  if (!owned_args[owned_count]) goto alloc_fail;
+  argv_child[argc++] = owned_args[owned_count++];
+
+  if (env && env_end && env < env_end) {
+    for (p = env; p < env_end && *p != '\0';) {
+      const char *q = memchr(p, '\0', env_end - p);
+      size_t n;
+      char *ea;
+      if (!q) break;
+      n = (size_t)(q - p);
+      ea = (char*)malloc(n + 7);
+      if (!ea) goto alloc_fail;
+      memcpy(ea, "--env=", 6);
+      memcpy(ea + 6, p, n);
+      ea[n + 6] = '\0';
+      owned_args[owned_count++] = ea;
+      argv_child[argc++] = ea;
+      p = q + 1;
+    }
+  }
+
+  argv_child[argc++] = (char*)dos_filename;
+  if (dos_args && *dos_args) argv_child[argc++] = (char*)dos_args;
+  argv_child[argc] = NULL;
+
+  pid = fork();
+  if (pid < 0) goto child_fail;
+  if (pid == 0) {
+    execv(self_exe, argv_child);
+    _exit(127);
+  }
+  if (waitpid(pid, &status, 0) < 0) goto child_fail;
+  if (WIFEXITED(status)) *exit_code_out = (unsigned char)WEXITSTATUS(status);
+  else *exit_code_out = 252;
+  for (i = 0; i < owned_count; ++i) free(owned_args[i]);
+  return 0;
+
+ alloc_fail:
+  errno = ENOMEM;
+ child_fail:
+  for (i = 0; i < owned_count; ++i) free(owned_args[i]);
+  return -1;
+}
 
 /* It's a cheap call, the real initialization is done in reset_emu. */
 static void init_emu(struct EmuState *emu) {
@@ -2004,12 +2566,236 @@ static int open_dos_file(const char *dos_filename, const char *dos_prog_abs, int
     }
     goto after_open;
   }
-  if ((fd = open(linux_filename, flags, 0644)) < 0) return -1;
+  if ((fd = open_with_case_fallback(linux_filename, flags, 0644)) < 0) {
+    if (flags3 == O_RDONLY && dos_prog_abs && dos_prog_abs[0] &&
+        strchr(dos_filename, ':') == NULL && strchr(dos_filename, '\\') == NULL && strchr(dos_filename, '/') == NULL) {
+      /* Fallback: resolve bare filename in program directory as well.
+       * Needed by tools that expect argv-relative files next to the executable.
+       */
+      const char *base = dos_prog_abs + strlen(dos_prog_abs);
+      char ovl_dos[260];
+      size_t dir_size;
+      for (; base != dos_prog_abs + 3 && base[-1] != '\\' && base[-1] != '/'; --base) {}
+      dir_size = (size_t)(base - dos_prog_abs);
+      if (dir_size > 3 && dir_size + strlen(dos_filename) + 1 < sizeof(ovl_dos)) {
+        memcpy(ovl_dos, dos_prog_abs, dir_size);
+        strcpy(ovl_dos + dir_size, dos_filename);
+        dir_state->dos_prog_abs = dos_prog_abs;
+        linux_filename = get_linux_filename_r(ovl_dos, dir_state, fnbuf2, &linux_lastc);
+        dir_state->dos_prog_abs = NULL;
+        if ((fd = open_with_case_fallback(linux_filename, flags, 0644)) >= 0) goto after_open;
+      }
+    }
+    return -1;
+  }
  after_open:
   return fd;
 }
 
 static char exec_fnbuf[LINUX_PATH_SIZE];  /* Used temporarily by run_dos_prog. */
+
+enum mz_subformat_t { MZ_SUBFMT_NONE = 0, MZ_SUBFMT_PE, MZ_SUBFMT_NE, MZ_SUBFMT_LE, MZ_SUBFMT_LX };
+
+static enum mz_subformat_t detect_mz_subformat(const char *path) {
+  int fd;
+  unsigned char mz[64];
+  unsigned char sig4[4];
+  unsigned char sig2[2];
+  unsigned long off;
+  ssize_t got;
+  if (!path) return MZ_SUBFMT_NONE;
+  fd = open(path, O_RDONLY);
+  if (fd < 0) return MZ_SUBFMT_NONE;
+  got = read(fd, mz, sizeof(mz));
+  if (got < 0 || got < 0x40 || mz[0] != 'M' || mz[1] != 'Z') { close(fd); return MZ_SUBFMT_NONE; }
+  off = (unsigned long)mz[0x3c] | ((unsigned long)mz[0x3d] << 8) | ((unsigned long)mz[0x3e] << 16) | ((unsigned long)mz[0x3f] << 24);
+  if ((long)off < 0 || lseek(fd, (off_t)off, SEEK_SET) < 0) { close(fd); return MZ_SUBFMT_NONE; }
+  got = read(fd, sig4, sizeof(sig4));
+  if (got == 4 && sig4[0] == 'P' && sig4[1] == 'E' && sig4[2] == 0 && sig4[3] == 0) { close(fd); return MZ_SUBFMT_PE; }
+  if (lseek(fd, (off_t)off, SEEK_SET) < 0) { close(fd); return MZ_SUBFMT_NONE; }
+  got = read(fd, sig2, sizeof(sig2));
+  close(fd);
+  if (got == 2 && sig2[0] == 'N' && sig2[1] == 'E') return MZ_SUBFMT_NE;
+  if (got == 2 && sig2[0] == 'L' && sig2[1] == 'E') return MZ_SUBFMT_LE;
+  if (got == 2 && sig2[0] == 'L' && sig2[1] == 'X') return MZ_SUBFMT_LX;
+  return MZ_SUBFMT_NONE;
+}
+
+static int file_contains_text(const char *path, const char *needle) {
+  int fd;
+  struct stat st;
+  char *buf;
+  size_t size, nlen;
+  ssize_t got;
+  int found = 0;
+  fd = open(path, O_RDONLY);
+  if (fd < 0) return 0;
+  if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return 0; }
+  size = st.st_size > (1 << 20) ? (1 << 20) : (size_t)st.st_size;  /* Scan up to 1 MiB. */
+  nlen = strlen(needle);
+  if (nlen == 0 || nlen > size) { close(fd); return 0; }
+  buf = (char*)malloc(size);
+  if (!buf) { close(fd); return 0; }
+  got = read(fd, buf, size);
+  close(fd);
+  if (got > 0 && (size_t)got >= nlen && memmem(buf, (size_t)got, needle, nlen) != NULL) found = 1;
+  free(buf);
+  return found;
+}
+
+static int is_probable_borland_dual_mode_ne(const char *path) {
+  return file_contains_text(path, "DPMI error (") &&
+         (file_contains_text(path, "TLINK") || file_contains_text(path, "RTM"));
+}
+
+/* Heuristic: tiny DOS stubs in Windows NE/LE/LX binaries often only print
+ * "This program requires ..." and exit. Real dual-mode DOS tools (e.g. some
+ * linkers) have substantial DOS code and should not be delegated to Wine.
+ */
+static int is_probable_windows_message_stub(const char *path) {
+  int fd;
+  unsigned char h[64];
+  unsigned char *buf = NULL;
+  size_t stub_size, max_scan;
+  ssize_t got;
+  int is_stub = 0;
+  unsigned long e_lfanew, e_cparhdr;
+
+  fd = open(path, O_RDONLY);
+  if (fd < 0) return 0;
+  got = read(fd, h, sizeof(h));
+  if (got < (ssize_t)sizeof(h) || h[0] != 'M' || h[1] != 'Z') goto done;
+
+  e_lfanew = (unsigned long)h[0x3c] | ((unsigned long)h[0x3d] << 8) |
+             ((unsigned long)h[0x3e] << 16) | ((unsigned long)h[0x3f] << 24);
+  e_cparhdr = (unsigned long)h[0x08] | ((unsigned long)h[0x09] << 8);
+  if (e_lfanew < 0x40) goto done;
+  if (e_lfanew <= (e_cparhdr << 4)) goto done;
+  stub_size = (size_t)(e_lfanew - (e_cparhdr << 4));
+  if (stub_size == 0) goto done;
+
+  /* Most message stubs are tiny; anything larger is likely meaningful DOS. */
+  if (stub_size > 1024) goto done;
+
+  max_scan = stub_size > 4096 ? 4096 : stub_size;
+  buf = (unsigned char*)malloc(max_scan);
+  if (!buf) goto done;
+  if (lseek(fd, (off_t)(e_cparhdr << 4), SEEK_SET) < 0) goto done;
+  got = read(fd, buf, max_scan);
+  if (got <= 0) goto done;
+
+  if (memmem(buf, (size_t)got, "This program", 12) ||
+      memmem(buf, (size_t)got, "requires Microsoft", 18) ||
+      memmem(buf, (size_t)got, "cannot be run in DOS mode", 25)) {
+    is_stub = 1;
+  }
+
+ done:
+  if (buf) free(buf);
+  close(fd);
+  return is_stub;
+}
+
+static int run_with_wine(const char *prog_filename, const char *const *args, const char *linux_cwd) {
+  const char *argv_child[512];
+  unsigned argc = 0;
+  int status;
+  pid_t pid;
+  argv_child[argc++] = "wine";
+  argv_child[argc++] = prog_filename;
+  if (args) {
+    while (*args && argc + 1 < (sizeof(argv_child) / sizeof(argv_child[0]))) argv_child[argc++] = *args++;
+  }
+  argv_child[argc] = NULL;
+  pid = fork();
+  if (pid < 0) {
+    perror("error: fork for wine failed");
+    return 1;
+  }
+  if (pid == 0) {
+    if (linux_cwd && *linux_cwd && chdir(linux_cwd) != 0) {
+      perror("error: failed to chdir for wine");
+      _exit(127);
+    }
+    execvp("wine", (char * const*)argv_child);
+    perror("error: failed to execute wine");
+    _exit(127);
+  }
+  if (waitpid(pid, &status, 0) < 0) {
+    perror("error: waitpid for wine failed");
+    return 1;
+  }
+  if (WIFEXITED(status)) return WEXITSTATUS(status);
+  return 1;
+}
+
+static int has_wine_in_path(void) {
+  const char *path = getenv("PATH");
+  const char *p, *q;
+  char buf[LINUX_PATH_SIZE];
+  size_t n;
+  if (!path || !*path) return 0;
+  for (p = path;; p = q + 1) {
+    q = strchr(p, ':');
+    if (!q) q = p + strlen(p);
+    n = (size_t)(q - p);
+    if (n == 0) {
+      if (sizeof(buf) > 5) {
+        memcpy(buf, "./wine", 7);
+        if (access(buf, X_OK) == 0) return 1;
+      }
+    } else if (n + 1 + 4 + 1 <= sizeof(buf)) {
+      memcpy(buf, p, n);
+      buf[n++] = '/';
+      memcpy(buf + n, "wine", 5);
+      if (access(buf, X_OK) == 0) return 1;
+    }
+    if (*q == '\0') break;
+  }
+  return 0;
+}
+
+static int is_linux_native_executable(const char *path) {
+  int fd;
+  unsigned char h[4];
+  ssize_t got;
+  if (!path) return 0;
+  fd = open(path, O_RDONLY);
+  if (fd < 0) return 0;
+  got = read(fd, h, sizeof(h));
+  close(fd);
+  if (got >= 4 && h[0] == 0x7f && h[1] == 'E' && h[2] == 'L' && h[3] == 'F') return 1;
+  if (got >= 2 && h[0] == '#' && h[1] == '!') return 1;
+  return 0;
+}
+
+static int run_native_execvp(const char *prog_filename, const char *const *args) {
+  const char *argv_child[512];
+  unsigned argc = 0;
+  int status;
+  pid_t pid;
+  argv_child[argc++] = prog_filename;
+  if (args) {
+    while (*args && argc + 1 < (sizeof(argv_child) / sizeof(argv_child[0]))) argv_child[argc++] = *args++;
+  }
+  argv_child[argc] = NULL;
+  pid = fork();
+  if (pid < 0) {
+    perror("error: fork failed");
+    return 1;
+  }
+  if (pid == 0) {
+    execvp(prog_filename, (char * const*)argv_child);
+    perror("error: failed to execute native program");
+    _exit(127);
+  }
+  if (waitpid(pid, &status, 0) < 0) {
+    perror("error: waitpid failed");
+    return 1;
+  }
+  if (WIFEXITED(status)) return WEXITSTATUS(status);
+  return 1;
+}
 
 /* Runs a DOS .com or .exe program in `emu'. Cannot run DOS .bat batch files.
  * Must be preceded by init_emu(emu).
@@ -2021,7 +2807,7 @@ static char exec_fnbuf[LINUX_PATH_SIZE];  /* Used temporarily by run_dos_prog. *
  * Returns the DOS exit code reported by the program.
  * As a side effect, sets dir_state->dos_prog_abs = NULL, and may change dir_state and tty_state.
  */
-static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filename, const char *args_str, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, const char* const *envp0) {
+static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filename, const char *args_str, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, const char* const *envp0, const char* const *extra_env, unsigned extra_env_count) {
   int img_fd;
   struct kvm_fds kvm_fds;
   void *mem;
@@ -2030,7 +2816,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   struct kvm_sregs sregs;
   char header[PROGRAM_HEADER_SIZE];
   unsigned header_size;
-  char had_get_ints, had_get_first_mcb;
+  char had_get_ints;
   unsigned char tasm30_bitset;
   const char *dos_prog_abs;  /* Owned externally: either in args or in dosfnbuf or (after exec) within mem. */
   unsigned tick_count;
@@ -2045,9 +2831,26 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   const char *stdout_write_p;
   const char *stdout_write_end;
   char is_stdout_write_cursor;
+  char dpmi_warned;
+  enum { XMS_HANDLE_COUNT = 64 };
+  void *xms_blocks[XMS_HANDLE_COUNT];
+  unsigned long xms_block_sizes[XMS_HANDLE_COUNT];  /* Bytes. */
+  unsigned short xms_lock_counts[XMS_HANDLE_COUNT];
+  unsigned short xms_free_kb, xms_total_kb;
+  char umb_link_state;
+  enum { EMS_HANDLE_COUNT = 64 };
+  unsigned short ems_pages_by_handle[EMS_HANDLE_COUNT];
+  unsigned short ems_page_map[4];
+  unsigned short ems_free_pages, ems_total_pages;
   enum malloc_strategy_t { MS_FIRST_FIT = 0, MS_BEST_FIT = 1, MS_LAST_FIT = 2 };
   unsigned malloc_strategy;
   char cleanup_fn[16];
+  DIR *find_dirp;
+  char find_linux_dir[LINUX_PATH_SIZE];
+  char find_dos_pattern[13];
+  unsigned short find_attrs;
+  unsigned char last_exec_return_code;
+  unsigned hlt_spin_count;
 
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
   { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
@@ -2056,7 +2859,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
 
   if (!prog_filename) {
     img_fd = -1;
-  } else if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
+  } else if ((img_fd = open_with_case_fallback(prog_filename, O_RDONLY, 0666)) < 0) {
     fprintf(stderr, "fatal: cannot open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
     exit(252);
   }
@@ -2068,7 +2871,22 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   video_byte_written = 0;  /* Pacify uninitialized warnings. */
   stdout_write_p = NULL;  /* Pacify uninitialized warnings. */
   stdout_write_end = NULL;  /* Pacify uninitialized warnings. */
+  dpmi_warned = 0;
+  memset(xms_blocks, 0, sizeof(xms_blocks));
+  memset(xms_block_sizes, 0, sizeof(xms_block_sizes));
+  memset(xms_lock_counts, 0, sizeof(xms_lock_counts));
+  xms_total_kb = xms_free_kb = 16 * 1024;  /* Minimal practical XMS pool for toolchains. */
+  umb_link_state = 0;
+  memset(ems_pages_by_handle, 0, sizeof(ems_pages_by_handle));
+  ems_page_map[0] = ems_page_map[1] = ems_page_map[2] = ems_page_map[3] = 0xffff;
+  ems_total_pages = ems_free_pages = 256;  /* 4 MiB EMS in 16 KiB pages. */
   cleanup_fn[0] = '\0';
+  find_dirp = NULL;
+  find_linux_dir[0] = '\0';
+  find_dos_pattern[0] = '\0';
+  find_attrs = 0;
+  last_exec_return_code = 0;
+  hlt_spin_count = 0;
 
  do_exec:
   header_size = detect_dos_executable_program(img_fd, prog_filename, header);
@@ -2084,6 +2902,9 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   { unsigned u;
     for (u = 0; u < 0x100; ++u) { ((unsigned*)mem)[u] = MAGIC_INT_VALUE(u); }
     memset((char*)mem + (INT_HLT_PARA << 4), 0xf4, 0x100);  /* 256 hlt instructions, one for each int. TODO(pts): Is hlt+iret faster? */
+    ((unsigned char*)mem)[(INT_HLT_PARA << 4) + 0x200] = 0xcd;  /* int 0x43 */
+    ((unsigned char*)mem)[(INT_HLT_PARA << 4) + 0x201] = 0x43;
+    ((unsigned char*)mem)[(INT_HLT_PARA << 4) + 0x202] = 0xcb;  /* retf */
   }
   /* !! Initialize more BIOS data area until 0x534, move magic interrupt table later.
    * https://stanislavs.org/helppc/bios_data_area.html
@@ -2132,11 +2953,30 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       env = add_env(env, env_end, "heLLo=World!", 1);
 #endif
       while (*envp0) {
-        if (strncmp(*envp0, "PATH=", 5) == 0) do_set_dos_path = 0;
+        const char *host_var = *envp0++;
+        const char *eq;
+        if (!strchr(host_var, '=')) {
+          if (DEBUG) fprintf(stderr, "debug: skipping malformed host env var without '=': %s\n", host_var);
+          continue;
+        }
+        eq = strchr(host_var, '=');
+        if (eq && eq - host_var == 4 && strncmp(host_var, "PATH", 4) == 0) {
+          const char *v = eq + 1;
+          /* Don't import Unix PATH as DOS PATH. Keep DOS PATH auto-generated
+           * from executable directory unless user provided a DOS-style PATH.
+           */
+          if (strchr(v, '/')) continue;
+        }
+        if (strncmp(host_var, "PATH=", 5) == 0) do_set_dos_path = 0;
         /* No attempt is made to deduplicate environment variables by name.
          * The user should supply unique names.
          */
-        env = add_env(env, env_end, *envp0++, 1);
+        env = add_env(env, env_end, host_var, 1);
+      }
+      { unsigned ei;
+        for (ei = 0; ei < extra_env_count; ++ei) {
+          if (extra_env[ei]) env = add_env(env, env_end, extra_env[ei], 1);
+        }
       }
       if (do_set_dos_path) {  /* Set %PATH% to the directory of dos_prog_abs. Set once. */
         size_t size;
@@ -2184,7 +3024,6 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
 
   had_get_ints = 0;  /* 1 << 0: int 0x00; 1 << 1: int 0x18; 1 << 2: int 0x06, 1 << 3: Get DOS version, 1 << 4: 0x34. */
   tasm30_bitset = 0;
-  had_get_first_mcb = 0;
   tick_count = 0;
   sphinx_cmm_flags = 0;
   ctrl_break_checking = 0;
@@ -2227,11 +3066,16 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
     }
     if (DEBUG) dump_regs("debug", &regs, &sregs);
 
+    if (run->exit_reason != KVM_EXIT_HLT) hlt_spin_count = 0;
     switch (run->exit_reason) {
      case KVM_EXIT_IO:
       { char *p = (char*)run + run->io.data_offset;
         if (run->io.port == 0x40 && run->io.size == 1 && run->io.direction == 0) {
           *p = port_0x40_tick++;  /* Simulate some timer ticks. */
+          break;
+        } else if (!emu_params->strict_mode) {
+          if (run->io.direction == 0) memset(p, 0, run->io.size * run->io.count);  /* IN: return 0. */
+          /* OUT: ignore in permissive mode. */
           break;
         } else {
           fprintf(stderr, "fatal: IO port: port=0x%02x data=%08x size=%d direction=%s\n", run->io.port, *(const unsigned*)p, run->io.size, run->io.direction ? "out" : "in");
@@ -2275,11 +3119,14 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         } else if (int_num == 0x20) {
           *(unsigned char*)&regs.rax = 0;  /* EXIT_SUCCESS. */
           goto do_exit;
+        } else if (int_num == 0x22) {  /* Termination handler vector. */
+          /* Keep execution flow by returning from the interrupt. */
         } else if (int_num == 0x21) {  /* DOS file and memory sevices. */
           /* !! Should we set CF=0 by default? What does MS-DOS do? */
           if (ah == 0x4c) {  /* Exit to DOS. */
             if (cleanup_fn[0] != '\0') unlink(get_linux_filename(cleanup_fn));
            do_exit:
+            if (find_dirp) { closedir(find_dirp); find_dirp = NULL; }
             return (unsigned char)regs.rax;
           } else if (ah == 0x06) {  /* Direct console I/O. */
            func_0x06:
@@ -2466,9 +3313,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               }
               goto after_open;
             }
-            if ((fd = open(linux_filename, flags, 0644)) < 0) { error_from_linux:
+            if ((fd = open_with_case_fallback(linux_filename, flags, 0644)) < 0) {
+              if (fd < 0) { error_from_linux:
               *(unsigned short*)&regs.rax = get_dos_error_code(errno, 0x1f);  /* By default: General failure. */
               goto error_on_21;
+              }
             }
             /*dup2(fd, 20); close(fd); fd = 20;*/  /* This breaks .exe files created by `owcc -bdos', which allows fd < 20. We fix it with map_fd_open(...) below. */
            after_open:
@@ -2481,6 +3330,54 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             if (DEBUG) fprintf(stderr, "debug: dos_open(%s) dos_fd=%d\n", p, fd);
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             *(unsigned short*)&regs.rax = fd;
+          } else if (ah == 0x6c) {  /* Extended open/create (DOS 4.0+). */
+            const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rsi);  /* DS:SI filename. */
+            const unsigned short bx = *(unsigned short*)&regs.rbx;  /* Open mode. */
+            const unsigned short dx = *(unsigned short*)&regs.rdx;  /* Action flags in low nibble. */
+            const unsigned action = dx & 0x0f;
+            const int flags3 = bx & 3;  /* O_RDONLY/O_WRONLY/O_RDWR mapping. */
+            int flags = flags3, fd;
+            struct stat st;
+            const char *linux_filename;
+            char *linux_lastc;
+            int exists;
+            int action_taken = 0;  /* 1=open existing, 2=create new. */
+            dir_state->dos_prog_abs = flags3 == O_RDONLY ? dos_prog_abs : NULL;
+            linux_filename = get_linux_filename_r(p, dir_state, fnbuf, &linux_lastc);
+            dir_state->dos_prog_abs = NULL;
+            if (is_same_ascii_nocase(linux_lastc, "nul", 3) && (linux_lastc[3] == '.' || linux_lastc[3] == '\0')) strcpy(fnbuf, "/dev/null");
+            exists = stat(linux_filename, &st) == 0;
+            if (!exists && errno == ENOENT && g_case_fallback_mode == 2 && linux_filename[0] &&
+                resolve_case_fallback_path(linux_filename, fnbuf2, sizeof(fnbuf2), 0) &&
+                stat(fnbuf2, &st) == 0) {
+              linux_filename = fnbuf2;
+              exists = 1;
+            }
+            if (action == 2) {  /* Create new, fail if exists. */
+              if (exists) { *(unsigned short*)&regs.rax = 0x50; goto error_on_21; }  /* File exists. */
+              flags |= O_CREAT | O_EXCL;
+              action_taken = 2;
+            } else if (action == 1) {  /* Open existing, fail if not exists. */
+              if (!exists) { *(unsigned short*)&regs.rax = 2; goto error_on_21; }  /* File not found. */
+              action_taken = 1;
+            } else if (action == 3) {  /* Open if exists else create. */
+              if (exists) action_taken = 1;
+              else { flags |= O_CREAT; action_taken = 2; }
+            } else {  /* Default/probe mode: open existing, fail if missing. */
+              if (!exists) { *(unsigned short*)&regs.rax = 2; goto error_on_21; }
+              action_taken = 1;
+            }
+            fd = open_with_case_fallback(linux_filename, flags, 0644);
+            if (fd < 0) goto error_from_linux;
+            if (fd < 5) fd = ensure_fd_is_at_least(fd, 5);
+            fd = map_fd_open(fd);
+            if ((fd + 0U) >> 16) {
+              *(unsigned short*)&regs.rax = 4;  /* Too many open files. */
+              goto error_on_21;
+            }
+            *(unsigned short*)&regs.rax = fd;
+            *(unsigned short*)&regs.rcx = action_taken;
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x57) {  /* Get/set file date and time using handle. */
             const unsigned char al = (unsigned char)regs.rax;
             if (al < 2) {
@@ -2495,9 +3392,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 *(unsigned short*)&regs.rdx = tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 1980) << 9;
                 tasm30_bitset |= 0x80;
               } else {  /* Set if al == 1. */
-                /* !! Implement this with utime(2). */
-                fprintf(stderr, "fatal: unimplemented: set file date and time: fd=%d cx:%04x dx:%04x\n", fd, *(unsigned short*)&regs.rcx, *(unsigned short*)&regs.rdx);
-                goto fatal;
+                const time_t ts = dos_datetime_to_time(*(unsigned short*)&regs.rdx, *(unsigned short*)&regs.rcx);
+                struct timespec tv[2];
+                tv[0].tv_sec = ts; tv[0].tv_nsec = 0;
+                tv[1].tv_sec = ts; tv[1].tv_nsec = 0;
+                if (futimens(fd, tv) != 0) goto error_from_linux;
               }
             } else { error_invalid_parameter:
               *(unsigned short*)&regs.rax = 0x57;  /* Invalid parameter. */
@@ -2529,6 +3428,34 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             }
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             *(unsigned short*)&regs.rax = fd2;
+          } else if (ah == 0x46) {  /* Force duplicate handle (dup2()). */
+            const unsigned short src_handle = *(unsigned short*)&regs.rbx;
+            const unsigned short dst_handle = *(unsigned short*)&regs.rcx;
+            const int src_fd = get_linux_fd(src_handle, &kvm_fds);
+            if (src_fd < 0) goto error_invalid_handle;
+            if (src_handle != dst_handle) {
+              if (dst_handle < 5) {
+                const int dst_fd = get_linux_fd(dst_handle, &kvm_fds);
+                if (dst_fd < 0 || dup2(src_fd, dst_fd) != dst_fd) goto error_from_linux;
+              } else if (dst_handle < 5 + sizeof(mapped_handles) / sizeof(mapped_handles[0])) {
+                const unsigned dst_idx = dst_handle - 5;
+                const int old_fd = mapped_handles[dst_idx];
+                int new_fd = dup(src_fd);
+                if (new_fd < 0) {
+                  *(unsigned short*)&regs.rax = get_dos_error_code(errno, 4);  /* By default: Too many open files. */
+                  goto error_on_21;
+                }
+                if (new_fd < 5) new_fd = ensure_fd_is_at_least(new_fd, 5);
+                if (old_fd > 0) close(old_fd);
+                mapped_handles[dst_idx] = new_fd;
+              } else {
+                const int dst_fd = (int)(dst_handle - (5 + sizeof(mapped_handles) / sizeof(mapped_handles[0])));
+                if (dst_fd == kvm_fds.kvm_fd || dst_fd == kvm_fds.vm_fd || dst_fd == kvm_fds.vcpu_fd) goto error_invalid_handle;
+                if (dup2(src_fd, dst_fd) != dst_fd) goto error_from_linux;
+              }
+            }
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            *(unsigned short*)&regs.rax = dst_handle;
           } else if (ah == 0x39) {  /* Create subdirectory (mkdir). */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             const int result = mkdir(get_linux_filename(p), 0755);
@@ -2550,6 +3477,19 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             int fd = rename(get_linux_filename(p_old), get_linux_filename_r(p_new, dir_state, fnbuf2, NULL));
             if (fd < 0) goto error_from_linux;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x5b) {  /* Create new file (fails if exists). */
+            const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            const int fd = open(get_linux_filename(p), O_RDWR | O_CREAT | O_EXCL, 0644);
+            int dos_fd;
+            if (fd < 0) goto error_from_linux;
+            dos_fd = fd < 5 ? ensure_fd_is_at_least(fd, 5) : fd;
+            dos_fd = map_fd_open(dos_fd);
+            if ((dos_fd + 0U) >> 16) {
+              *(unsigned short*)&regs.rax = 4;  /* Too many open files. */
+              goto error_on_21;
+            }
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            *(unsigned short*)&regs.rax = dos_fd;
           } else if (ah == 0x25) {  /* Set interrupt vector. */
             if (set_int((unsigned char)regs.rax, *(unsigned short*)&regs.rdx | sregs.ds.selector << 16, mem, had_get_ints, &tasm30_bitset)) goto fatal;
           } else if (ah == 0x35) {  /* Get interrupt vector. */
@@ -2573,9 +3513,18 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               (*(unsigned short*)&regs.rbx) = pp[0];
               SET_SREG(es, pp[1]);
             } else {
-              fprintf(stderr, "fatal: unsupported get interrupt vector int:%02x\n", get_int_num);
-              goto fatal;
+              const unsigned short *pp = (const unsigned short*)((char*)mem + (get_int_num << 2));
+              if (DEBUG) fprintf(stderr, "debug: permissive get interrupt vector int:%02x is cs:%04x ip:%04x\n", get_int_num, pp[1], pp[0]);
+              (*(unsigned short*)&regs.rbx) = pp[0];
+              SET_SREG(es, pp[1]);
             }
+          } else if (ah == 0x34) {  /* Get InDOS flag address. */
+            ((char*)mem)[0x041a] = 0;  /* InDOS = 0 (DOS idle). */
+            SET_SREG(es, 0);
+            *(unsigned short*)&regs.rbx = 0x041a;
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x1f || ah == 0x32) {  /* DPB probes. */
+            goto nonfatal_unknown_int_21_call;
           } else if (ah == 0x0b) {  /* Check input status. */
             *(unsigned char*)&regs.rax = 0;  /* No input ready. 0xff would be input. */
             /* If we detect Ctrl-<Break>, we should run `int 0x23'. */
@@ -2598,6 +3547,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             }
           } else if (ah == 0x44) {  /* I/O control (ioctl). */
             const unsigned char al = (unsigned char)regs.rax;
+            char ioctl_ok = 1;
             if (al == 1 && (*(unsigned short*)&regs.rdx >> 8)) goto error_invalid_parameter;
             if (al < 2) {  /* Get device information (1), set device information (2). */
               const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
@@ -2626,6 +3576,23 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
               if (fd < 0) goto error_invalid_handle;
               *(unsigned short*)&regs.rdx = 0;  /* Drive is local. */
+            } else if (al == 0x06) {  /* Get input status. */
+              const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
+              struct stat st;
+              if (fd < 0) goto error_invalid_handle;
+              if (fstat(fd, &st) != 0) goto error_from_linux;
+              if (S_ISREG(st.st_mode)) {
+                *(unsigned short*)&regs.rax = 0xff;  /* Regular files are ready. */
+              } else {
+                struct pollfd pfd;
+                int pr;
+                pfd.fd = fd;
+                pfd.events = POLLIN;
+                pfd.revents = 0;
+                pr = poll(&pfd, 1, 0);
+                if (pr < 0) goto error_from_linux;
+                *(unsigned short*)&regs.rax = (pr > 0 && (pfd.revents & (POLLIN | POLLHUP))) ? 0xff : 0x00;
+              }
 #if 0
             } else if (al == 6) {
               const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
@@ -2637,10 +3604,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rax = 0xff;  /* Input is ready (0xff). */
 #endif
             } else {
-              fprintf(stderr, "fatal: unsupported DOS ioctl call: call=0x%02x dos_fd=%d\n", al, *(unsigned short*)&regs.rbx);
-              goto fatal;
+              if (DEBUG) fprintf(stderr, "debug: unsupported DOS ioctl call ignored: call=0x%02x dos_fd=%d\n", al, *(unsigned short*)&regs.rbx);
+              ioctl_ok = 0;
             }
-            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            if (ioctl_ok) *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            else goto nonfatal_unknown_int_21_call;
           } else if (ah == 0x4a) {  /* Modify allocated memory block (inplace_realloc()). */
             const unsigned new_size_para = *(unsigned short*)&regs.rbx;
             const unsigned short block_para = sregs.es.selector;
@@ -2894,10 +3862,18 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               struct stat st;
               if (stat(fn, &st) != 0) goto error_from_linux;
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
-              *(unsigned short*)&regs.rax = (st.st_mode & 0200) ? 0 : 1;  /* Indicate DOS read-only flag if owner doesn't have write permissions on Linux. */
+              *(unsigned short*)&regs.rax = (st.st_mode & 0200) ? 0 : 1;  /* readonly */
             } else {  /* Set. */
-              fprintf(stderr, "fatal: unimplemented: set file attributes: attr=0x%04x filename=%s\n", *(unsigned short*)&regs.rcx, fn);
-              goto fatal;
+              struct stat st;
+              mode_t mode;
+              unsigned short attr = *(unsigned short*)&regs.rcx;
+              if (stat(fn, &st) != 0) goto error_from_linux;
+              mode = st.st_mode;
+              /* Accept DOS attribute bits: RO(1), H(2), S(4), A(0x20). */
+              if (attr & 1) mode &= ~(S_IWUSR | S_IWGRP | S_IWOTH);
+              else mode |= S_IWUSR;
+              if (chmod(fn, mode) != 0) goto error_from_linux;
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             }
           } else if (ah == 0x33) {  /* Get/set system values. */
             const unsigned char al = (unsigned char)regs.rax;
@@ -2916,8 +3892,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rbx = 0x500;  /* DOS 5.0. */
               *(unsigned short*)&regs.rdx = 0x100;  /* DL contains DOS revision number 0. */
             } else {
-              fprintf(stderr, "fatal: unimplemented: get/set system values: al:%04x dl:%04x\n", al, dl);
-              goto fatal;
+              if (DEBUG) fprintf(stderr, "debug: unsupported get/set system values subcall: al=%02x dl=%02x\n", al, dl);
+              goto nonfatal_unknown_int_21_call;
             }
           } else if (ah == 0x0e) {  /* Select disk. */
             /* TODO(pts): Use the default drive specified here (dl + 'A') in get_linux_filename_r(...). */
@@ -2939,8 +3915,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               memcpy(p, &country_info, 0x18);
               *(unsigned short*)&regs.rax = *(unsigned short*)&regs.rbx = 1;
             } else {
-              fprintf(stderr, "fatal: unsupported subcall for country: 0x%02x\n", al);
-              goto fatal;
+              if (DEBUG) fprintf(stderr, "debug: unsupported country subcall: al=%02x\n", al);
+              goto nonfatal_unknown_int_21_call;
             }
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x37) {  /* Get/set switch character (for command-line flags). */
@@ -2951,14 +3927,18 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             } else if (al == 0x02) {  /* Get device prefix flag. */
               *(unsigned char*)&regs.rdx = 0xff;  /* Device prefix /dev/... not needed. */
             } else {
-              fprintf(stderr, "fatal: unsupported subcall for switch character: 0x%02x\n", al);
-              goto fatal;
+              if (DEBUG) fprintf(stderr, "debug: unsupported switch-character subcall: al=%02x\n", al);
+              goto nonfatal_unknown_int_21_call;
             }
           } else if (ah == 0x4e) {  /* Find first matching file (findfirst). */
             const unsigned short attrs = *(unsigned short*)&regs.rcx;
             const char * const pattern = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
-            const char *fn, *fnb;
             const unsigned dta_linear = (dta_seg_ofs & 0xffff) + (dta_seg_ofs >> 16 << 4);
+            const char *dos_pat_base;
+            size_t dos_pat_dir_size;
+            char dos_pat_prefix[DOS_PATH_SIZE];
+            const char *linux_probe, *linux_dir;
+            struct dirent *de;
             if (DEBUG) fprintf(stderr, "debug: findfirst pattern=(%s) attrs=0x%04x\n", pattern, attrs);
             if (!is_linear_byte_user_writable(dta_linear) || !is_linear_byte_user_writable(dta_linear + 0x2b - 1)) goto error_invalid_parameter;
             if (attrs & 8) {  /* Volume label requested. */
@@ -2966,61 +3946,91 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rax = 0x12;  /* No more files. */
               goto error_on_21;
             }
-            if (strchr(pattern, '*') || strchr(pattern, '?')) {  /* TODO(pts): What happens if there are wildcards in earlier pathname components? */
-              fprintf(stderr, "fatal: unsupported wildcards in findfirst pattern: %s\n", pattern);
-              goto fatal;
+            if (find_dirp) { closedir(find_dirp); find_dirp = NULL; }
+            dos_pat_base = get_dos_basename(pattern);
+            if (!is_dos_filename_83(dos_pat_base)) goto no_more_files;
+            dos_pat_dir_size = dos_pat_base - pattern;
+            if (dos_pat_dir_size >= sizeof(dos_pat_prefix) - 2) goto no_more_files;
+            memcpy(dos_pat_prefix, pattern, dos_pat_dir_size);
+            dos_pat_prefix[dos_pat_dir_size] = 'A';  /* Probe filename to resolve parent directory. */
+            dos_pat_prefix[dos_pat_dir_size + 1] = '\0';
+            linux_probe = get_linux_filename(dos_pat_prefix);
+            if (linux_probe[0] == '\0') goto no_more_files;
+            linux_dir = get_linux_basename(linux_probe);
+            memcpy(find_linux_dir, linux_probe, linux_dir - linux_probe);
+            find_linux_dir[linux_dir - linux_probe] = '\0';
+            if (find_linux_dir[0] == '\0') strcpy(find_linux_dir, ".");
+            find_dirp = opendir(find_linux_dir);
+            if (!find_dirp) {
+              if (errno == ENOENT) goto no_more_files;
+              goto error_from_linux;
             }
-            if (!is_dos_filename_83(get_dos_basename(pattern))) goto no_more_files;
-            fn = get_linux_filename(pattern);
-            fnb = get_linux_basename(fn);
-            if (DEBUG) fprintf(stderr, "debug: findfirst fn=(%s) fnb=(%s)\n", fn, fnb);
-            if (strlen(fnb) > 12) {
-              goto no_more_files;  /* is_dos_filename_83 ensures this, but let's double check for security of the strcpy(...) below. */
-            } else {
+            strncpy(find_dos_pattern, dos_pat_base, sizeof(find_dos_pattern) - 1);
+            find_dos_pattern[sizeof(find_dos_pattern) - 1] = '\0';
+            find_attrs = attrs;
+            while ((de = readdir(find_dirp)) != NULL) {
+              char fn[LINUX_PATH_SIZE];
+              const char *fnb = de->d_name;
               char *dta;
               struct stat st;
               struct tm *tm;
-              if (stat(fn, &st) != 0) {
-                if (errno == ENOENT) goto no_more_files;
-                goto error_from_linux;
-              }
-              if (S_ISDIR(st.st_mode) && !(attrs & 0x10)) goto no_more_files;
+              if (!is_dos_filename_83(fnb) || !dos_wildcard_match(find_dos_pattern, fnb)) continue;
+              if (snprintf(fn, sizeof(fn), "%s/%s", find_linux_dir, fnb) <= 0 || strlen(fn) >= sizeof(fn)) continue;
+              if (stat(fn, &st) != 0) continue;
+              if (S_ISDIR(st.st_mode) && !(find_attrs & 0x10)) continue;
               dta = (char*)mem + dta_linear;
               memset(dta, '\0', 0x16);
               tm = localtime(&st.st_mtime);
-              *(unsigned*)dta = FINDFIRST_MAGIC;  /* Just a random value which findnext can identify. */
+              *(unsigned*)dta = FINDFIRST_MAGIC;
               *(unsigned short*)(dta + 0x16) = tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11;
               *(unsigned short*)(dta + 0x18) = tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 1980) << 9;
               *(unsigned*)(dta + 0x1a) = (sizeof(st.st_size) > 4 && st.st_size >> (32 * (sizeof(st.st_size) > 4))) ?
-                  0xffffffffU : st.st_size + (size_t)0;  /* Cap file size at 0xffffffff, no way to return more than 32 bits. */
-              { const char *p = fnb;
-                char *q = dta + 0x1e, c;
-                do {  /* Secure because of the strlen(fnb) check above. */
-                  c = *p++;
-                  *q++ = c - 'a' + 0U <= 'z' - 'a' + 0U ? c - 32 : c;  /* Convert to uppercase. */
-                } while (c != '\0');
-                /*strcpy(dta + 0x1e, fnb);*/  /* Secure because of the strlen(fnb) check above. */
-                /* We use up to 0x1e + 13 == 0x2b bytes in dta. */
-                if (DEBUG) fprintf(stderr, "debug: found linux_file=(%s) dos_file=(%s)\n", fnb, dta + 0x1e);
+                  0xffffffffU : st.st_size + (size_t)0;
+              { const char *p = fnb; char *q = dta + 0x1e, c;
+                do { c = *p++; *q++ = upper_ascii(c); } while (c != '\0');
               }
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+              goto done_findnext;
             }
+            closedir(find_dirp);
+            find_dirp = NULL;
+            goto no_more_files;
+           done_findnext:;
             *(unsigned short*)&regs.rax = 0;  /* Undocumented, but necessary and used as a success indicator by the VAL 1995-05-27 linker val.exe. DOSBox also sets it. */
-            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x4f) {  /* Find next matching file (findnext). */
             const unsigned dta_linear = (dta_seg_ofs & 0xffff) + (dta_seg_ofs >> 16 << 4);
             if (!is_linear_byte_user_writable(dta_linear) || !is_linear_byte_user_writable(dta_linear + 0x2b - 1)) goto error_invalid_parameter;
             { char * const dta = (char*)mem + dta_linear;
-              if (*(unsigned*)dta != FINDFIRST_MAGIC) goto error_invalid_parameter;
+              struct dirent *de;
+              if (*(unsigned*)dta != FINDFIRST_MAGIC || !find_dirp) goto error_invalid_parameter;
+              while ((de = readdir(find_dirp)) != NULL) {
+                char fn[LINUX_PATH_SIZE];
+                const char *fnb = de->d_name;
+                struct stat st;
+                struct tm *tm;
+                if (!is_dos_filename_83(fnb) || !dos_wildcard_match(find_dos_pattern, fnb)) continue;
+                if (snprintf(fn, sizeof(fn), "%s/%s", find_linux_dir, fnb) <= 0 || strlen(fn) >= sizeof(fn)) continue;
+                if (stat(fn, &st) != 0) continue;
+                if (S_ISDIR(st.st_mode) && !(find_attrs & 0x10)) continue;
+                memset(dta, '\0', 0x16);
+                tm = localtime(&st.st_mtime);
+                *(unsigned*)dta = FINDFIRST_MAGIC;
+                *(unsigned short*)(dta + 0x16) = tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11;
+                *(unsigned short*)(dta + 0x18) = tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 1980) << 9;
+                *(unsigned*)(dta + 0x1a) = (sizeof(st.st_size) > 4 && st.st_size >> (32 * (sizeof(st.st_size) > 4))) ?
+                    0xffffffffU : st.st_size + (size_t)0;
+                { const char *p = fnb; char *q = dta + 0x1e, c;
+                  do { c = *p++; *q++ = upper_ascii(c); } while (c != '\0');
+                }
+                *(unsigned short*)&regs.rax = 0;
+                *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+                goto done_findnext2;
+              }
+              closedir(find_dirp);
+              find_dirp = NULL;
               goto no_more_files;
-            }
-          } else if (ah == 0x37) {  /* Get/set switch character (for command-line flags). */
-            const unsigned char al = (unsigned char)regs.rax;
-            if (al == 0x00) {  /* Get. */
-              *(unsigned char*)&regs.rax = 0;  /* Success. */
-              *(unsigned char*)&regs.rdx = '/';
-            } else {
-              fprintf(stderr, "fatal: unsupported subcall for switch character: 0x%02x\n", al);
-              goto fatal;
+             done_findnext2:;
             }
           } else if (ah == 0x51 || ah == 0x62) {  /* Get process ID (PSP) (0x51). Get PSP (0x62). */
             *(unsigned short*)&regs.rbx = PSP_PARA;
@@ -3051,22 +4061,96 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             SET_SREG(es, 0xfff0);
           } else if (ah == 0x29) {  /* Parse filename for FCB. */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rsi);  /* !! Security: check bounds. */
-            if (*p == '\0' || *p == '\r' || *p == '\n') {
-              char *q = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rdi);  /* !! Security: check bounds. */
-              /* al == 1, *p == '\r' in Microsoft Macro Assembler 6.00B driver masm.exe. */
-              /* al == 0, *p == '\n' in Power C 2.2.0 compiler pc.exe. */
-              *(unsigned char*)&regs.rax = 0;  /* No wildchar characters present. */
-              *q++ = '\0';  /* Drive: 0 is default. */
-              memset(q, ' ', 12);  /* Filename (8) and extension (3). */
-              /* Don't update SI. */
-            } else {
-              fprintf(stderr, "fatal: unsupported parsing of filename: %s\n", p);  /* For ml.exe, this filename is completely broken, it starts with \r, also in DOSBox. */
-              goto fatal_int;
+            char *q = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rdi);  /* !! Security: check bounds. */
+            const char *s = p;
+            char *fn = q + 1;
+            unsigned short new_si_ofs;
+            char has_wild = 0;
+            /* Permissive FCB parser for legacy MAKE/MSC tools. */
+            while (*s == ' ' || *s == '\t') ++s;
+            *q = '\0';  /* Drive: 0 (default). */
+            memset(fn, ' ', 11);  /* Name(8)+Ext(3). */
+            if (*s != '\0' && *s != '\r' && *s != '\n') {
+              unsigned i = 0;
+              while (*s != '\0' && *s != '\r' && *s != '\n' && *s != ' ' && *s != '\t' && *s != '.' && i < 8) {
+                if (*s == '*' || *s == '?') has_wild = 1;
+                fn[i++] = upper_ascii(*s++);
+              }
+              if (*s == '.') {
+                unsigned j = 0;
+                ++s;
+                while (*s != '\0' && *s != '\r' && *s != '\n' && *s != ' ' && *s != '\t' && j < 3) {
+                  if (*s == '*' || *s == '?') has_wild = 1;
+                  fn[8 + j++] = upper_ascii(*s++);
+                }
+              }
+              while (*s != '\0' && *s != '\r' && *s != '\n' && *s != ' ' && *s != '\t') ++s;
             }
+            new_si_ofs = (unsigned short)(s - ((char*)mem + ((unsigned)sregs.ds.selector << 4)));
+            *(unsigned short*)&regs.rsi = new_si_ofs;
+            *(unsigned char*)&regs.rax = has_wild ? 1 : 0;  /* AL: wildcard present. */
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x87) {  /* Used by older Microsoft toolchains. */
+            goto nonfatal_unknown_int_21_call;  /* Report unsupported without fatal abort. */
+          } else if (ah == 0x5a) {  /* Create temporary file. */
+            const char *tmpl = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            char dos_prefix[DOS_PATH_SIZE + 4], dos_name[DOS_PATH_SIZE + 4];
+            size_t tn = 0, pfx_len;
+            const char *last_slash = NULL, *scan;
+            int fd = -1;
+            unsigned i;
+            for (; tmpl[tn] != '\0' && tn + 1 < sizeof(dos_prefix); ++tn) {}
+            if (tn == 0) {
+              strcpy(dos_prefix, "TMP");
+            } else {
+              memcpy(dos_prefix, tmpl, tn);
+              dos_prefix[tn] = '\0';
+            }
+            for (scan = dos_prefix; *scan; ++scan) if (*scan == '\\' || *scan == '/' || *scan == ':') last_slash = scan;
+            pfx_len = last_slash ? (size_t)(last_slash + 1 - dos_prefix) : 0;
+            if (pfx_len >= sizeof(dos_name)) pfx_len = 0;
+            memcpy(dos_name, dos_prefix, pfx_len);
+            dos_name[pfx_len] = '\0';
+            for (i = 0; i != 0x10000; ++i) {
+              char *w = dos_name + pfx_len;
+              unsigned v = i;
+              static const char hex[] = "0123456789ABCDEF";
+              *w++ = 'K'; *w++ = 'V';
+              *w++ = hex[(v >> 12) & 15];
+              *w++ = hex[(v >> 8) & 15];
+              *w++ = hex[(v >> 4) & 15];
+              *w++ = hex[v & 15];
+              *w++ = '.';
+              *w++ = 'T'; *w++ = 'M'; *w++ = 'P';
+              *w = '\0';
+              if (*get_linux_filename_r(dos_name, dir_state, fnbuf, NULL) == '\0') {
+                *(unsigned short*)&regs.rax = 3;  /* Path not found. */
+                goto error_on_21;
+              }
+              fd = open(fnbuf, O_RDWR | O_CREAT | O_EXCL, 0644);
+              if (fd >= 0) break;
+              if (errno != EEXIST) {
+                *(unsigned short*)&regs.rax = get_dos_error_code(errno, 0x1f);
+                goto error_on_21;
+              }
+            }
+            if (fd < 0) {
+              *(unsigned short*)&regs.rax = 0x50;  /* File exists. */
+              goto error_on_21;
+            }
+            if (fd < 5) fd = ensure_fd_is_at_least(fd, 5);
+            fd = map_fd_open(fd);
+            if ((fd + 0U) >> 16) {
+              *(unsigned short*)&regs.rax = 4;  /* Too many open files. */
+              goto error_on_21;
+            }
+            strcpy((char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx), dos_name);
+            *(unsigned short*)&regs.rax = fd;
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x58) {  /* Get/set memory allocation strategy. */
             const unsigned char al = (unsigned char)regs.rax;
             if (al == 0x00) {  /* Get. */
-              *(unsigned short*)&regs.rax = 1;  /* Best fit. */
+              *(unsigned short*)&regs.rax = (unsigned short)malloc_strategy;
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             } else if (al == 0x01) {  /* Set. */
               /* Programs compiled by Borland C++ 5.02 compiler bcc.exe set it with BX == MS_LAST_FIT, and return ``Out of memory'' if not implemented correctly. */
@@ -3075,6 +4159,22 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
               malloc_strategy = *(unsigned short*)&regs.rbx;
               if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: set malloc strategy=%u\n", malloc_strategy);
+            } else if (al == 0x02) {  /* Get UMB link state. */
+              *(unsigned short*)&regs.rax = (unsigned short)(unsigned char)umb_link_state;
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            } else if (al == 0x03) {  /* Set UMB link state. */
+              const unsigned short bx = *(unsigned short*)&regs.rbx;
+              if (bx > 1) goto error_invalid_parameter;
+              umb_link_state = (char)bx;
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            } else if (al == 0x04) {  /* Get strategy + UMB link state. */
+              *(unsigned short*)&regs.rbx = (unsigned short)(malloc_strategy | ((unsigned)(unsigned char)umb_link_state << 7));
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            } else if (al == 0x05) {  /* Set strategy + UMB link state. */
+              const unsigned short bx = *(unsigned short*)&regs.rbx;
+              malloc_strategy = bx & 0x3f;
+              umb_link_state = !!(bx & 0x80);
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             } else {
               goto error_invalid_parameter;
             }
@@ -3084,30 +4184,45 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             if (al == 0 || al == 3) {  /* Microsoft Macro Assembler 6.00B driver masm.exe uses it with al == 3. */
               const char * const params = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rbx);  /* !! Security: check bounds. */
               const unsigned short load_para = al != 0 ? ((unsigned short*)params)[0] : 0;
-              /*const unsigned short relocation_factor = *(unsigned short*)(params + 2);*/
+              const unsigned short relocation_factor = al != 0 ? ((unsigned short*)params)[1] : 0;
               char * const psp = (al != 0 && load_para >= PSP_PARA + 0x10 && load_para < DOS_ALLOC_PARA_LIMIT) ? (char*)mem + ((unsigned)(load_para - 0x10) << 4) : NULL;
               const unsigned short env_para = al == 0 ? (((unsigned short*)params)[0] ? ((unsigned short*)params)[0] : ENV_PARA) : psp ? *(const unsigned short*)(psp + 0x2c) : 0;
               char * const env = ((al == 0 && env_para == ENV_PARA) || (env_para >= PSP_PARA + 0x10 && env_para < DOS_ALLOC_PARA_LIMIT)) ? (char*)mem + (env_para << 4) : NULL;
               const char *env_end = env ? env + (((PROGRAM_MCB_PARA - ENV_PARA < DOS_ALLOC_PARA_LIMIT - env_para) ? PROGRAM_MCB_PARA - ENV_PARA : DOS_ALLOC_PARA_LIMIT - env_para) << 4) : NULL;
-              char * const args = al == 0 ?  (char*)mem + (((unsigned short*)params)[2] << 4) + ((unsigned short*)params)[1] + 1  /* (args - 1) is Pascal string with terminating '\r'. */
-                                : psp ? psp + 0x81 : NULL;
-              const unsigned char args_size = args ? (unsigned char)args[-1] : 0;
-              const char is_args_normal = args && (args_size < 0x7f && args[args_size] == '\0'); /* '\0' for al == 0 when Borland C++ 2.0 compiler bcc.exe is running tlink.exe */
-              const char is_args_ok = is_args_normal || (args && args_size == '\n' && args[0] == '\n' && args[1] == '.');  /* Power C 2.2.0 compiler pc.exe. Copy all 128 bytes to new PSP. */
+              char * const args_raw = al == 0 ?  (char*)mem + (((unsigned short*)params)[2] << 4) + ((unsigned short*)params)[1]
+                                    : psp ? psp + 0x80 : NULL;  /* DOS command tail in PSP format at [0x80]=len. */
+              char args_buf[0x80];
+              unsigned char args_size = 0;
+              const char *safe_args = "";
+              char is_args_ok = 0;
               const char is_dos_filename_high = sregs.ds.selector + (*(unsigned short*)&regs.rdx >> 4) >= PSP_PARA;  /* So that dos_filename won't overlap new_env below. */
               char *new_env;
               char new_prog_drive;
-              int reason;
-              if (is_args_normal) args[args_size] = '\0';  /* It was '\r'. */
-              if (!(env && is_args_ok && is_dos_filename_high)) {
-                if (is_args_normal) args[args_size] = '\0';
+              int reason = 0;
+              if (args_raw) {
+                args_size = (unsigned char)args_raw[0];
+                if (args_size < 0x7f && (args_raw[1 + args_size] == '\0' || args_raw[1 + args_size] == '\r' || args_raw[1 + args_size] == '\n')) {  /* PSP-style command tail. */
+                  memcpy(args_buf, args_raw + 1, args_size);
+                  args_buf[args_size] = '\0';
+                  safe_args = args_buf;
+                  is_args_ok = 1;
+                } else {  /* Fallback: direct CR/NUL-terminated string pointer. */
+                  const char *p = args_raw;
+                  args_size = 0;
+                  while (args_size < 0x7f && p[args_size] != '\0' && p[args_size] != '\r' && p[args_size] != '\n') ++args_size;
+                  memcpy(args_buf, p, args_size);
+                  args_buf[args_size] = '\0';
+                  safe_args = args_buf;
+                  is_args_ok = 1;
+                }
+              }
+              if (!((al == 3 && is_dos_filename_high) || (al == 0 && env && is_dos_filename_high))) {
                 fprintf(stderr, "fatal: bounds check failed (env_ok=%d args_ok=%d, fn_ok=%d) env when loading program=(%s) with args=(%s)\n",
                         env != NULL, is_args_ok, is_dos_filename_high,
-                        dos_filename, is_args_normal ? args : NULL);
-                if (is_args_normal) args[args_size] = '\r';
+                        dos_filename, safe_args);
                 goto fatal_int;
               }
-              if (DEBUG || DEBUG_EXEC) fprintf(stderr, "debug: exec: al:%02x reason=%d program=(%s) args=(%s)\n", al, reason, dos_filename, is_args_normal ? args : NULL);
+              if (DEBUG || DEBUG_EXEC) fprintf(stderr, "debug: exec: al:%02x reason=%d program=(%s) args=(%s)\n", al, reason, dos_filename, safe_args);
               if (0 && al == 0) {  /* TODO(pts): Why stop? */
                 /* Power C 2.2.0 compiler pc.exe. */
                 fprintf(stderr, "fatal: unsupported exec with al:%02d: %s\n", al, dos_filename);
@@ -3121,12 +4236,118 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                * file). However, kvikdos is not smart enough for that, so it
                * just does an exec() and forgets about the parent process.
                */
-              if ((reason = should_skip_exec_program(dos_filename, is_args_normal ? args : NULL, env, &env_end, had_get_first_mcb)) > 0) {
-                fprintf(stderr, "fatal: unsupported program to load: al:%02x reason=%d program=(%s) args=(%s)\n", al, reason, dos_filename, is_args_normal ? args : NULL);
+              if (al == 3) {
+                char ovl_dos[LINUX_PATH_SIZE];
+                dir_state->dos_prog_abs = dos_prog_abs;  /* Allow loading overlay via mounted alias path. */
+                prog_filename = get_linux_filename_r(dos_filename, dir_state, exec_fnbuf, NULL);
+                dir_state->dos_prog_abs = NULL;  /* For security. */
+                if (prog_filename[0] == '\0' && dos_prog_abs[0] &&
+                    !strchr(dos_filename, ':') && !strchr(dos_filename, '\\') && !strchr(dos_filename, '/')) {
+                  const char *base = dos_prog_abs + strlen(dos_prog_abs);
+                  for (; base != dos_prog_abs + 3 && base[-1] != '\\'; --base) {}
+                  if (base > dos_prog_abs + 3) {
+                    size_t dir_size = base - dos_prog_abs;
+                    size_t fn_size = strlen(dos_filename);
+                    if (dir_size + fn_size + 1 < sizeof(ovl_dos)) {
+                      memcpy(ovl_dos, dos_prog_abs, dir_size);
+                      memcpy(ovl_dos + dir_size, dos_filename, fn_size + 1);
+                      dir_state->dos_prog_abs = dos_prog_abs;
+                      prog_filename = get_linux_filename_r(ovl_dos, dir_state, exec_fnbuf, NULL);
+                      dir_state->dos_prog_abs = NULL;
+                    }
+                  }
+                }
+                if (prog_filename[0] == '\0') {
+                  *(unsigned short*)&regs.rax = 2;  /* File not found. */
+                  goto error_on_21;
+                }
+                if ((img_fd = open_with_case_fallback(prog_filename, O_RDONLY, 0666)) < 0) {
+                  *(unsigned short*)&regs.rax = get_dos_error_code(errno, 0x02);
+                  goto error_on_21;
+                }
+                header_size = detect_dos_executable_program(img_fd, prog_filename, header);
+                if (load_dos_overlay_program(img_fd, prog_filename, mem, header, header_size, load_para, relocation_factor) != 0) {
+                  close(img_fd);
+                  *(unsigned short*)&regs.rax = get_dos_error_code(errno, 0x1f);
+                  goto error_on_21;
+                }
+                close(img_fd);
+                *(unsigned short*)&regs.rax = 0;
+                *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+                goto done_int_21_call;
+              }
+              reason = 0;
+              if (reason > 0) {
+                if (al == 3) {
+                  /* Program load probe (without execute): report failure to caller,
+                   * don't terminate parent tool. LINK.EXE may probe optional helpers
+                   * such as DOSXNT.EXE and continue without them.
+                   */
+                  *(unsigned short*)&regs.rax = 2;  /* File not found. */
+                  goto error_on_21;
+                }
+                fprintf(stderr, "fatal: unsupported program to load: al:%02x reason=%d program=(%s) args=(%s)\n", al, reason, dos_filename, safe_args);
                 goto fatal_int;
               }
-              if (reason == -1 && is_args_normal && cleanup_fn[0] == '\0' && args[0] == '@' && strlen(args) <= sizeof(cleanup_fn)) {
-                strcpy(cleanup_fn, args + 1);  /* Example args: "@turboc.$ln". */
+              if (al == 0) {
+                const char *dos_exec_name = dos_filename;
+                char dos_exec_buf[DOS_PATH_SIZE + 4];
+                if ((dos_filename[0] & ~32) - 'A' + 0U < DRIVE_COUNT && dos_filename[1] == ':' &&
+                    (dos_filename[2] == '\\' || dos_filename[2] == '/')) {
+                  char requested_drive = dos_filename[0] & ~32;
+                  if (!dir_state->linux_mount_dir[requested_drive - 'A']) {
+                    char active_drive = dir_state->drive;
+                    if ((active_drive - 'A' + 0U) < DRIVE_COUNT && dir_state->linux_mount_dir[active_drive - 'A']) {
+                      size_t abs_tail_size = strlen(dos_filename + 2);
+                      /* Some toolchains probe absolute paths on an unmapped drive.
+                       * Retry same absolute tail on the active mounted drive.
+                       */
+                      if (abs_tail_size + 2 < sizeof(dos_exec_buf)) {
+                        dos_exec_buf[0] = active_drive;
+                        memcpy(dos_exec_buf + 1, dos_filename + 1, abs_tail_size + 1);
+                        dos_exec_name = dos_exec_buf;
+                      }
+                    }
+                  }
+                }
+                if (!strchr(dos_filename, ':') && !strchr(dos_filename, '\\') && !strchr(dos_filename, '/')) {
+                  char path_copy[1024];
+                  const char *dos_path_env = getenv_prefix_block_nocase("PATH=", env, env_end);
+                  const char *resolved_prog;
+                  char resolved_drive = '\0';
+                  path_copy[0] = '\0';
+                  if (dos_path_env) {
+                    strncpy(path_copy, dos_path_env, sizeof(path_copy) - 1);
+                    path_copy[sizeof(path_copy) - 1] = '\0';
+                  }
+                  resolved_prog = find_prog_on_path(dos_filename, dir_state, path_copy[0] ? path_copy : NULL, &resolved_drive);
+                  if (resolved_prog && resolved_prog[0]) {
+                    const char *resolved_dos = get_dos_abs_filename_r(resolved_prog, resolved_drive, dir_state, dos_exec_buf);
+                    if (resolved_dos[0]) dos_exec_name = resolved_dos;
+                  } else if (dos_prog_abs[0]) {
+                    const char *base = dos_prog_abs + strlen(dos_prog_abs);
+                    const char *tail = dos_filename;
+                    size_t dir_size, tail_size;
+                    for (; base > dos_prog_abs + 3 && base[-1] != '\\'; --base) {}
+                    dir_size = (size_t)(base - dos_prog_abs);
+                    tail_size = strlen(tail);
+                    if (dir_size && dir_size + tail_size + 1 < sizeof(dos_exec_buf)) {
+                      memcpy(dos_exec_buf, dos_prog_abs, dir_size);
+                      memcpy(dos_exec_buf + dir_size, tail, tail_size + 1);
+                      dos_exec_name = dos_exec_buf;
+                    }
+                  }
+                }
+                if (run_dos_child_subprocess(dos_exec_name, safe_args, env, env_end, dir_state, &last_exec_return_code) != 0) {
+                  *(unsigned short*)&regs.rax = get_dos_error_code(errno, 0x1f);  /* General failure. */
+                  goto error_on_21;
+                }
+                *(unsigned short*)&regs.rax = 0;
+                *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+                goto done_int_21_call;
+              }
+              if (reason == -1 && cleanup_fn[0] == '\0' && safe_args[0] == '@' && strlen(safe_args) <= sizeof(cleanup_fn)) {
+                strcpy(cleanup_fn, safe_args + 1);  /* Example args: "@turboc.$ln". */
                 if (DEBUG) fprintf(stderr, "debug: will remove file at exit: %s\n", cleanup_fn);
               }
               dir_state->dos_prog_abs = dos_prog_abs;  /* For loading the overlay from prog_filename, even if not mounted. */
@@ -3137,18 +4358,14 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 fprintf(stderr, "fatal: bad program filename for loading: %s\n", dos_filename);
                 goto fatal_int;
               }
-              if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
+              if ((img_fd = open_with_case_fallback(prog_filename, O_RDONLY, 0666)) < 0) {
                 /*goto error_from_linux;*/  /* We don't know how to report the error properly here (it's not a normal int 0x21 call. */
                 fprintf(stderr, "fatal: cannot open DOS executable program for loading: %s: %s\n", prog_filename, strerror(errno));
                 goto fatal_int;
               }
               *(char*)env_end = '\0';  /* Hide counter for absolute program pathname. */
               memcpy(new_env = (char*)mem + (ENV_PARA << 4), env, env_end + 2 - env);
-              if (!is_args_normal) {
-                fprintf(stderr, "fatal: bad args when loading: %s\n", dos_filename);
-                goto fatal_int;
-              }
-              strcpy(fnbuf2, args);  /* Large enough to hold 0x7f bytes. */
+              strcpy(fnbuf2, safe_args);  /* Large enough to hold 0x7f bytes. */
               args_str = fnbuf2;
               dos_prog_abs = get_dos_abs_filename_r(prog_filename, new_prog_drive, dir_state, dosfnbuf);
               if (DEBUG) fprintf(stderr, "debug: exec prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", prog_filename, dos_prog_abs, new_prog_drive);
@@ -3158,9 +4375,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               }
               goto do_exec;
             } else {
-              fprintf(stderr, "fatal: unsupported loading of program with al:%02x: %s\n", al, dos_filename);
-              goto fatal_int;
+              /* Compatibility: some tools probe other EXEC modes. */
+              *(unsigned short*)&regs.rax = 1;  /* Invalid function number. */
+              goto error_on_21;
             }
+         done_int_21_call: ;
           } else if (ah == 0x0a) {  /* Buffered keyboard input. */
            func_0x0a: {
               char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
@@ -3209,6 +4428,33 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             } else {
               goto fatal_int;
             }
+          } else if (ah == 0x5c) {  /* Record lock/unlock. */
+            const unsigned char al = (unsigned char)regs.rax;
+            const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
+            struct flock fl;
+            if (fd < 0) goto error_invalid_handle;
+            memset(&fl, 0, sizeof(fl));
+            fl.l_type = (al == 0) ? F_WRLCK : (al == 1) ? F_UNLCK : (short)-1;
+            if (fl.l_type == (short)-1) goto nonfatal_unknown_int_21_call;
+            fl.l_whence = SEEK_SET;
+            fl.l_start = ((long)(*(unsigned short*)&regs.rcx) << 16) | *(unsigned short*)&regs.rdx;
+            fl.l_len = ((long)(*(unsigned short*)&regs.rsi) << 16) | *(unsigned short*)&regs.rdi;
+            if (fcntl(fd, F_SETLK, &fl) == 0) {
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            } else {
+              *(unsigned short*)&regs.rax = 0x21;  /* Lock violation. */
+              goto error_on_21;
+            }
+          } else if (ah == 0x5d || ah == 0x5e || ah == 0x5f) {  /* Share/network redirector services. */
+            goto nonfatal_unknown_int_21_call;
+          } else if (ah == 0x54) {  /* Get verify flag. */
+            *(unsigned char*)&regs.rax = 0;  /* Verify off. */
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x2e) {  /* Set verify flag. */
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x4d) {  /* Get return code from child process. */
+            *(unsigned short*)&regs.rax = ((unsigned short)last_exec_return_code) << 8;
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x66) {  /* Get/set global code page. */
             const unsigned char al = (unsigned char)regs.rax;
             if (al == 1) {
@@ -3332,17 +4578,41 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           *(unsigned short*)&regs.rax = *(const unsigned short*)((const char*)mem + 0x410);
         } else if (int_num == 0x2f) {  /* Installation checks. */
           const unsigned char al = (unsigned char)regs.rax;
+          const unsigned short ax = (unsigned short)regs.rax;
           if (al == 0x00) {  /* Installation check. */
             if (ah < 2 || ah == 0x15) goto fatal_uic;  /* Doesn't follow the standard format. */
-            /* ah == 0x43: XMS. */
-            *(unsigned char*)&regs.rax = 0;  /* Not installed, OK to install. */
+            if (ah == 0x43) {
+              *(unsigned char*)&regs.rax = 0x80;  /* XMS installed. */
+            } else {
+              *(unsigned char*)&regs.rax = 0;  /* Not installed, OK to install. */
+            }
+          } else if (ax == 0x4310) {  /* Get XMS entry point ES:BX. */
+            SET_SREG(es, INT_HLT_PARA);
+            *(unsigned short*)&regs.rbx = 0x0200;  /* Far-callable XMS stub: int 43h; retf. */
+          } else if (*(unsigned short*)&regs.rax == 0x1100 || *(unsigned short*)&regs.rax == 0x111e) {  /* Redirector/network install checks. */
+            *(unsigned short*)&regs.rax = 0;  /* Not installed. */
+          } else if (*(unsigned short*)&regs.rax == 0x1600 || *(unsigned short*)&regs.rax == 0x160a) {  /* Windows enhanced mode / Windows version probes. */
+            *(unsigned short*)&regs.rax = 0;  /* Not running under Windows/386 enhanced services. */
+          } else if (*(unsigned short*)&regs.rax == 0xed10) {  /* LINK.EXE probe in some MASM/MSC toolchains. */
+            *(unsigned short*)&regs.rax = 0;  /* Not installed / no service. */
           } else if (*(unsigned short*)&regs.rax == 0x1687) {  /* DPMI. */
+            if (!dpmi_warned && dos_prog_abs &&
+                (strstr(dos_prog_abs, "BCC.EXE") || strstr(dos_prog_abs, "bcc.exe") ||
+                 strstr(dos_prog_abs, "32RTM.EXE") || strstr(dos_prog_abs, "32rtm.exe"))) {
+              fprintf(stderr, "info: DPMI/protected-mode runtime requested, but kvikdos supports real-mode DOS only.\n");
+              dpmi_warned = 1;
+            }
             /* Keep it as is, DPMI not installed. */
-#if 0  /* TLINK 5.1 tlink.exe loading dpmi16bi.ovl */
           } else if (*(unsigned short*)&regs.rax == 0xfb42) {
+            *(unsigned short*)&regs.rax = 0;  /* Not installed / no service. */
           } else if (*(unsigned short*)&regs.rax == 0xfb43) {
-#endif
+            *(unsigned short*)&regs.rax = 0;  /* Not installed / no service. */
           } else { fatal_uic:
+            if (!emu_params->strict_mode) {
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
+              goto done_int_call;
+            }
             fprintf(stderr, "fatal: unsupported int 0x%02x ax:%04x\n", int_num, *(const unsigned short*)&regs.rax);
             goto fatal_int;
           }
@@ -3357,12 +4627,186 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             goto fatal_uic;
           }
         } else if (int_num == 0x67) {  /* Various. */
-          const unsigned short ax = (unsigned short)regs.rax;
-          if (ax == 0xde00) {  /* VCPI installation check. http://mirror.cs.msu.ru/oldlinux.org/Linux.old/docs/interrupts/int-html/rb-7491.htm */
+          const unsigned char al = (unsigned char)regs.rax;
+          if ((unsigned short)regs.rax == 0xde00) {  /* VCPI installation check. */
             /* Doing nothing means it's not installed. */
+          } else if (ah == 0x40) {  /* Get EMM status. */
+            ((unsigned char*)&regs.rax)[1] = 0;  /* AH=0 success. */
+          } else if (ah == 0x41) {  /* Get page frame segment. */
+            ((unsigned char*)&regs.rax)[1] = 0;  /* AH=0 success. */
+            *(unsigned short*)&regs.rbx = 0xe000;  /* Conventional EMS page frame. */
+          } else if (ah == 0x42) {  /* Get number of pages. */
+            ((unsigned char*)&regs.rax)[1] = 0;  /* AH=0 success. */
+            *(unsigned short*)&regs.rbx = ems_free_pages;
+            *(unsigned short*)&regs.rdx = ems_total_pages;
+          } else if (ah == 0x43) {  /* Allocate pages. */
+            unsigned short req = *(unsigned short*)&regs.rbx, hi;
+            if (!req || req > ems_free_pages) {
+              ((unsigned char*)&regs.rax)[1] = 0x88;  /* Insufficient pages. */
+            } else {
+              for (hi = 1; hi < EMS_HANDLE_COUNT; ++hi) if (ems_pages_by_handle[hi] == 0) break;
+              if (hi >= EMS_HANDLE_COUNT) {
+                ((unsigned char*)&regs.rax)[1] = 0x85;  /* No handles. */
+              } else {
+                ems_pages_by_handle[hi] = req;
+                ems_free_pages -= req;
+                *(unsigned short*)&regs.rdx = hi;
+                ((unsigned char*)&regs.rax)[1] = 0;
+              }
+            }
+          } else if (ah == 0x44) {  /* Map page. */
+            unsigned short logical = *(unsigned short*)&regs.rbx;
+            unsigned short phys = *(unsigned short*)&regs.rdx;
+            unsigned short handle = *(unsigned short*)&regs.rsi;
+            if (phys >= 4 || handle >= EMS_HANDLE_COUNT || ems_pages_by_handle[handle] == 0 || logical >= ems_pages_by_handle[handle]) {
+              ((unsigned char*)&regs.rax)[1] = 0x83;  /* Invalid handle/page. */
+            } else {
+              ems_page_map[phys] = logical;
+              ((unsigned char*)&regs.rax)[1] = 0;
+            }
+          } else if (ah == 0x45) {  /* Release handle. */
+            unsigned short handle = *(unsigned short*)&regs.rdx;
+            if (handle == 0 || handle >= EMS_HANDLE_COUNT || ems_pages_by_handle[handle] == 0) {
+              ((unsigned char*)&regs.rax)[1] = 0x83;
+            } else {
+              ems_free_pages += ems_pages_by_handle[handle];
+              ems_pages_by_handle[handle] = 0;
+              ((unsigned char*)&regs.rax)[1] = 0;
+            }
+          } else if (ah == 0x46) {  /* Get EMM version. */
+            ((unsigned char*)&regs.rax)[1] = 0;  /* AH=0 success. */
+            ((unsigned char*)&regs.rax)[0] = 0x40;  /* AL=4.0 */
+          } else if (ah == 0x4b) {  /* Get number of handles/pages. */
+            unsigned short used_handles = 0, h;
+            for (h = 1; h < EMS_HANDLE_COUNT; ++h) if (ems_pages_by_handle[h]) ++used_handles;
+            ((unsigned char*)&regs.rax)[1] = 0;
+            *(unsigned short*)&regs.rbx = EMS_HANDLE_COUNT - 1 - used_handles;  /* free handles */
+            *(unsigned short*)&regs.rcx = ems_total_pages - ems_free_pages;  /* allocated pages */
+            *(unsigned short*)&regs.rdx = ems_total_pages;
+          } else if (ah == 0x4c) {  /* Get pages for one handle. */
+            unsigned short handle = *(unsigned short*)&regs.rdx;
+            if (handle == 0 || handle >= EMS_HANDLE_COUNT || ems_pages_by_handle[handle] == 0) {
+              ((unsigned char*)&regs.rax)[1] = 0x83;
+            } else {
+              ((unsigned char*)&regs.rax)[1] = 0;
+              *(unsigned short*)&regs.rbx = ems_pages_by_handle[handle];
+            }
+          } else if (ah == 0x58 && al == 0x00) {  /* Allocate standard pages / trivial success for probes. */
+            ((unsigned char*)&regs.rax)[1] = 0;
           } else {
             goto fatal_uic;
           }
+        } else if (int_num == 0x43) {  /* XMS entry point pseudo interrupt (from INT 2F AX=4310 ES:BX). */
+          if (ah == 0x00) {  /* Get XMS version. */
+            *(unsigned short*)&regs.rax = 1;
+            *(unsigned short*)&regs.rbx = 0x0300;  /* XMS version 3.00. */
+            *(unsigned short*)&regs.rdx = 0;  /* No HMA handle. */
+          } else if (ah == 0x08) {  /* Query free extended memory. */
+            *(unsigned short*)&regs.rax = 1;
+            *(unsigned short*)&regs.rdx = xms_free_kb;  /* Largest free block in KiB. */
+            *(unsigned short*)&regs.rbx = xms_total_kb;  /* Total free in KiB. */
+          } else if (ah == 0x09) {  /* Allocate EMB. */
+            unsigned short kb = *(unsigned short*)&regs.rdx, hi;
+            unsigned long bytes = (unsigned long)kb << 10;
+            if (!kb || kb > xms_free_kb) {
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned char*)&regs.rbx = 0xa0;  /* Out of space. */
+            } else {
+              for (hi = 1; hi < XMS_HANDLE_COUNT; ++hi) if (xms_blocks[hi] == NULL) break;
+              if (hi >= XMS_HANDLE_COUNT || !(xms_blocks[hi] = malloc(bytes))) {
+                *(unsigned short*)&regs.rax = 0;
+                *(unsigned char*)&regs.rbx = 0xa1;  /* No handles / alloc failure. */
+              } else {
+                memset(xms_blocks[hi], 0, bytes);
+                xms_block_sizes[hi] = bytes;
+                xms_lock_counts[hi] = 0;
+                xms_free_kb -= kb;
+                *(unsigned short*)&regs.rdx = hi;
+                *(unsigned short*)&regs.rax = 1;
+                *(unsigned char*)&regs.rbx = 0;
+              }
+            }
+          } else if (ah == 0x0a) {  /* Free EMB. */
+            unsigned short hi = *(unsigned short*)&regs.rdx;
+            if (hi == 0 || hi >= XMS_HANDLE_COUNT || xms_blocks[hi] == NULL) {
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned char*)&regs.rbx = 0xa2;  /* Invalid handle. */
+            } else {
+              free(xms_blocks[hi]);
+              xms_free_kb += (unsigned short)(xms_block_sizes[hi] >> 10);
+              xms_blocks[hi] = NULL;
+              xms_block_sizes[hi] = 0;
+              xms_lock_counts[hi] = 0;
+              *(unsigned short*)&regs.rax = 1;
+              *(unsigned char*)&regs.rbx = 0;
+            }
+          } else if (ah == 0x0b) {  /* Move EMB. */
+            const char *m = (const char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rsi);
+            unsigned long len = *(const unsigned long*)(const void*)(m + 0);
+            unsigned short sh = *(const unsigned short*)(const void*)(m + 4);
+            unsigned long so = *(const unsigned long*)(const void*)(m + 6);
+            unsigned short dh = *(const unsigned short*)(const void*)(m + 10);
+            unsigned long doff = *(const unsigned long*)(const void*)(m + 12);
+            char *sp, *dp;
+            if (len == 0) {
+              *(unsigned short*)&regs.rax = 1;
+              *(unsigned char*)&regs.rbx = 0;
+              goto done_int_call;
+            }
+            if (sh == 0) sp = (char*)mem + so;
+            else if (sh < XMS_HANDLE_COUNT && xms_blocks[sh] && so + len <= xms_block_sizes[sh]) sp = (char*)xms_blocks[sh] + so;
+            else sp = NULL;
+            if (dh == 0) dp = (char*)mem + doff;
+            else if (dh < XMS_HANDLE_COUNT && xms_blocks[dh] && doff + len <= xms_block_sizes[dh]) dp = (char*)xms_blocks[dh] + doff;
+            else dp = NULL;
+            if (!sp || !dp || sp < (char*)mem || dp < (char*)mem || (sh == 0 && so + len > DOS_MEM_LIMIT) || (dh == 0 && doff + len > DOS_MEM_LIMIT)) {
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned char*)&regs.rbx = 0xa3;  /* Invalid source/dest. */
+            } else {
+              memmove(dp, sp, (size_t)len);
+              *(unsigned short*)&regs.rax = 1;
+              *(unsigned char*)&regs.rbx = 0;
+            }
+          } else if (ah == 0x0c) {  /* Lock EMB. */
+            unsigned short hi = *(unsigned short*)&regs.rdx;
+            if (hi == 0 || hi >= XMS_HANDLE_COUNT || xms_blocks[hi] == NULL) {
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned char*)&regs.rbx = 0xa2;
+            } else {
+              unsigned long addr = (unsigned long)(size_t)xms_blocks[hi];
+              if (xms_lock_counts[hi] != 0xffff) ++xms_lock_counts[hi];
+              *(unsigned short*)&regs.rbx = (unsigned short)addr;
+              *(unsigned short*)&regs.rdx = (unsigned short)(addr >> 16);
+              *(unsigned short*)&regs.rax = 1;
+            }
+          } else if (ah == 0x0d) {  /* Unlock EMB. */
+            unsigned short hi = *(unsigned short*)&regs.rdx;
+            if (hi == 0 || hi >= XMS_HANDLE_COUNT || xms_blocks[hi] == NULL || xms_lock_counts[hi] == 0) {
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned char*)&regs.rbx = 0xaa;  /* Not locked. */
+            } else {
+              --xms_lock_counts[hi];
+              *(unsigned short*)&regs.rax = 1;
+              *(unsigned char*)&regs.rbx = 0;
+            }
+          } else if (ah == 0x0e) {  /* Get EMB handle information. */
+            unsigned short hi = *(unsigned short*)&regs.rdx, free_handles = 0, i;
+            if (hi == 0 || hi >= XMS_HANDLE_COUNT || xms_blocks[hi] == NULL) {
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned char*)&regs.rbx = 0xa2;
+            } else {
+              for (i = 1; i < XMS_HANDLE_COUNT; ++i) if (xms_blocks[i] == NULL) ++free_handles;
+              *(unsigned short*)&regs.rax = 1;
+              ((unsigned char*)&regs.rbx)[1] = (unsigned char)xms_lock_counts[hi];  /* BH lock count. */
+              *(unsigned short*)&regs.rdx = (unsigned short)(xms_block_sizes[hi] >> 10);  /* Size in KiB. */
+              *(unsigned char*)&regs.rbx = free_handles > 255 ? 255 : (unsigned char)free_handles;  /* BL free handles. */
+            }
+          } else {
+            *(unsigned short*)&regs.rax = 0;
+            *(unsigned char*)&regs.rbx = 0x80;  /* Function not implemented. */
+          }
+        } else if (int_num == 0x0d) {  /* General protection fault. */
+          /* Allow DOS extender probes to fail softly. */
         } else if (int_num == 0x00) {  /* Division by zero. */
           /* This is called only if the program doesn't override the interrupt vector.
            * Example instructions: `xor ax, ax', `div ax'.
@@ -3371,9 +4815,15 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         } else if (int_num == 0x03 && tasm30_bitset == 0xff)  { /* Turbo Assembler (TASM) 3.0. */
         } else {
          fatal_int:
+          if (!emu_params->strict_mode) {
+            *(unsigned char*)&regs.rax = 0;  /* Function not supported. */
+            *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
+            goto done_int_call;
+          }
           fprintf(stderr, "fatal: unsupported int 0x%02x ah:%02x cs:%04x ip:%04x\n", int_num, ah, int_cs, int_ip);
           goto fatal;
         }
+       done_int_call:
         /* Return from the interrupt. */
         SET_SREG(cs, int_cs);
         regs.rip = int_ip;
@@ -3392,14 +4842,25 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             fprintf(stderr, "error: error opening --hlt-dump=... file for writing: %s\n", emu_params->hlt_dump_filename);
           }
         }
-        if (emu_params->is_hlt_ok && sregs.cs.selector >= PSP_PARA && (*(unsigned short*)&regs.rflags & (1 << 9))) {  /* IF == 1. */
+        if (sregs.cs.selector >= PSP_PARA && (emu_params->is_hlt_ok || !emu_params->strict_mode)) {
           /* The 8253 timer chip increments the counter in each 1 / 1193182s
            * causing IRQ0 at each 65536th increment. kvikdos doesn't implement
            * any of this, but now we wait that approximate amount for `hlt' to
            * wake up.
            */
-          /* This is not precise enough: poll(&pollfd0, 0, 55);. */
-          usleep(54925);  /* 54925 =~= 1000000.0 / (1193182.0 / 65536). */
+          if (*(unsigned short*)&regs.rflags & (1 << 9)) {  /* IF == 1. */
+            if (++hlt_spin_count >= 400) {
+              fprintf(stderr, "error: guest stalled in HLT loop, aborting in permissive mode.\n");
+              return 1;
+            }
+            usleep(54925);  /* 54925 =~= 1000000.0 / (1193182.0 / 65536). */
+          } else {
+            if (++hlt_spin_count >= 2000) {
+              fprintf(stderr, "error: guest stalled in HLT loop (IF=0), aborting in permissive mode.\n");
+              return 1;
+            }
+            usleep(1000);  /* Prevent busy loop if guest issues tight hlt with IF=0. */
+          }
           break;
         } else {
           fprintf(stderr, "fatal: unexpected hlt\n");
@@ -3407,10 +4868,14 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         }
       }
      case KVM_EXIT_MMIO:
-      { const char mmio_len = run->mmio.len;
+      { const unsigned mmio_len = run->mmio.len;
         const unsigned addr = (unsigned)run->mmio.phys_addr;
         char highmsg[2];
         /* CS:IP points to the instruction doing the memory operation (not after). */
+        if (!(mmio_len == 1 || mmio_len == 2 || mmio_len == 4 || mmio_len == 8)) {
+          highmsg[0] = '\0';
+          goto bad_memory_access;
+        }
         if (sizeof(run->mmio.phys_addr) > 4 && run->mmio.phys_addr >> (32 * (sizeof(run->mmio.phys_addr) > 4))) {  /* Physical address is larger than 32 bits. */
           highmsg[0] = '+'; highmsg[1] = '\0';
           goto bad_memory_access;
@@ -3420,13 +4885,18 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           /* Microsoft BASIC Professional Development System 7.10 linker pblink.exe. It overwrites length and program name with program name and args. */
           /* This emulation is a little bit slow (because of the ioctl(... KVM_RUN ...) overhead), but it's called only less than 75 times at startup. */
           memcpy((char*)mem + addr, run->mmio.data, mmio_len);
+        } else if (addr - 0xf0000U < 0x10000U) {  /* BIOS ROM area probes (F000:0000..FFFF:FFFF). */
+          if (run->mmio.is_write) {
+            /* Ignore writes to ROM area. */
+          } else {
+            memset(run->mmio.data, 0xff, mmio_len);  /* Typical ROM default value for unmodeled bytes. */
+          }
         } else if (addr == 0xffffe && !run->mmio.is_write && mmio_len == 1) {  /* BASIC programs compiled by Microsoft BASIC Professional Development System 7.10 compiler pbc.exe */
           run->mmio.data[0] = 0xfc;  /* Machine ID is regular OC (0xfc). Same as default in src/ints/bios.cpp in DOSBox 0.74. */
         } else if (addr - 0xffff5U < 8U && !run->mmio.is_write && mmio_len == 1) {  /* JWasm 2.11a jwasmr.exe */
           run->mmio.data[0] = "01/01/92"[addr - 0xffff5U];  /* System BIOS date, same as default in src/ints/bios.cpp in DOSBox 0.74. */
         } else if (addr == 0xfff7e && !run->mmio.is_write && mmio_len == 2) {  /* Reading the first MCB pointer in INVARS (see int 0x21 call with ah == 0x52). Used by Microsoft Macro Assembler 6.00B driver masm.exe. */
           *(unsigned short*)run->mmio.data = PROGRAM_MCB_PARA;
-          had_get_first_mcb = 1;
         } else if (addr < 0x400 && run->mmio.is_write && addr + mmio_len <= 0x400 && ((mmio_len == 2 && (addr & 1) == 0) || (mmio_len == 4 && (addr & 3) == 0))) {  /* Set interrupt vector directly (not via int 0x21 call with ah == 0x25). */
           /* Microsoft BASIC Professional Development System 7.10 compiler pbc.exe */
           const unsigned char set_int_num = addr >> 2;
@@ -3460,14 +4930,18 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         } else {
           highmsg[0] = '\0';
          bad_memory_access:
-          fprintf(stderr, "fatal: KVM memory access denied phys_addr=%08x%s value=%08x%08x size=%d is_write=%d\n", addr, highmsg, ((unsigned*)run->mmio.data)[1], ((unsigned*)run->mmio.data)[0], mmio_len, run->mmio.is_write);
+          if (!emu_params->strict_mode) {
+            if (!run->mmio.is_write) memset(run->mmio.data, 0, mmio_len);
+            break;
+          }
+          fprintf(stderr, "fatal: KVM memory access denied phys_addr=%08x%s value=%08x%08x size=%u is_write=%u\n", addr, highmsg, ((unsigned*)run->mmio.data)[1], ((unsigned*)run->mmio.data)[0], mmio_len, run->mmio.is_write);
           goto fatal;
         }
       }
       ongoing_set_int = 0;  /* No set_int operation ongoing. */
       break;  /* Just continue at following cs:ip. */
      case KVM_EXIT_INTERNAL_ERROR:
-      fprintf(stderr, "fatal: KVM internal error suberror=%d\n", (unsigned)run->internal.suberror);
+      fprintf(stderr, "fatal: KVM internal error suberror=%u\n", (unsigned)run->internal.suberror);
       /* We get this for an int call if we don't map
        * (KVM_SET_USER_MEMORY_REGION) or initialize the interrupt table
        * properly. However, we can't continue the emulation, because KVM_RUN
@@ -3476,7 +4950,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       /* if (run->internal.suberror == KVM_INTERNAL_ERROR_DELIVERY_EV && p[0] == (char)0xcd) {...} */
       goto fatal;
      default:
-      fprintf(stderr, "fatal: unexpected KVM exit: reason=%d\n", run->exit_reason);
+      fprintf(stderr, "fatal: unexpected KVM exit: reason=%u\n", run->exit_reason);
       goto fatal;
     }
   }
@@ -3491,20 +4965,52 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   return 0;  /* Not reached. This is just to pacity owcc. */
 }
 
-static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filename, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, const char* const *envp0) {
+static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filename, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, const char* const *envp0, const char* const *extra_env, unsigned extra_env_count) {
   unsigned char exit_code = 0;
   int batch_fd, got;
   char buf[4096], *p = buf, *p_line = buf, *q;
   char do_echo = 1;
+  char path_override[1024];
+  char has_path_override = 0;
+  char goto_label[128];
+  char have_goto = 0;
+  const char *batch_args[10];
+  unsigned batch_argc = 0;
+  unsigned ai;
+  char *batch_env[256];
+  unsigned batch_env_count = 0;
+  char *setlocal_env[8][256];
+  unsigned setlocal_env_count[8];
+  unsigned setlocal_depth = 0;
+  unsigned bi;
+  char batch_eof = 0;
   size_t size;
-  const char *dos_prog_abs = dir_state->dos_prog_abs;  /* Of the .bat file. */
+  const char *dos_prog_abs;
+  for (bi = 0; envp0 && envp0[bi] && batch_env_count < sizeof(batch_env) / sizeof(batch_env[0]); ++bi) {
+    char *cp = xstrdup(envp0[bi]);
+    if (!cp) { perror("fatal: xstrdup"); exit(252); }
+    batch_env[batch_env_count++] = cp;
+  }
+  for (bi = 0; extra_env && bi < extra_env_count && batch_env_count < sizeof(batch_env) / sizeof(batch_env[0]); ++bi) {
+    char *cp = xstrdup(extra_env[bi]);
+    if (!cp) { perror("fatal: xstrdup"); exit(252); }
+    batch_env[batch_env_count++] = cp;
+  }
+  if (batch_env_count < sizeof(batch_env) / sizeof(batch_env[0])) batch_env[batch_env_count] = NULL;
+  dos_prog_abs = dir_state->dos_prog_abs;  /* Of the .bat file. */
   dir_state->dos_prog_abs = NULL;
-  (void)args;
+  for (ai = 0; ai < 10; ++ai) batch_args[ai] = "";
+  if (args) {
+    for (ai = 0; args[ai] && batch_argc < 9; ++ai) {
+      batch_args[++batch_argc] = args[ai];
+    }
+  }
   if ((batch_fd = open(prog_filename, O_RDONLY)) < 0) {
     fprintf(stderr, "fatal: cannot open DOS .bat batch file: %s: %s\n", prog_filename, strerror(errno));
     exit(252);
   }
   for (;;) {
+    if (batch_eof && p_line == p) break;
     size = buf + sizeof(buf) - p;
     if (size == 0) { line_too_long:
       fprintf(stderr, "fatal: line too long in DOS .bat batch file: %s\n", prog_filename);
@@ -3525,7 +5031,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
       p_line = q;
     }
     /* MS-DOS 6.22 doesn't recognize just \n as line terminator, but we do. */
-    for (; q != p && *q != '\r' && *q != '\n'; ++q) {}
+    for (; q != p && *q != '\r' && *q != '\n' && *q != '\x1a'; ++q) {}
     if (q == p) {  /* End-of-line not yet read. */
       /* If >= 75% of the buffer is filled with an unfinished line, report an
        * error. This is to make sure that we're not spending most of our time in
@@ -3537,17 +5043,83 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
         p = q = buf + (q - p_line);
         p_line = buf;
       }
-    } else {  /* End-of-line reached, line is p_line...q. */
-      char c, c_endarg, do_echo_line = do_echo;
-      char *r, *arg, *endarg;
-      unsigned cmd_size;
-      *q = '\0';  /* Make it ASCIIZ (terminated by \0). */
-      if (DEBUG) fprintf(stderr, "debug: batch line: (%s)\n", p_line);
+	    } else {  /* End-of-line reached, line is p_line...q. */
+	      char c, c_endarg, do_echo_line = do_echo;
+	      char *r, *arg, *endarg;
+	      unsigned cmd_size;
+	      char *q_src = q;
+          char rewound = 0;
+	      char cmdline[4096];
+          char pipe_right[4096];
+          int pipe_fd = -1, pipe_save_out = -1, pipe_save_in = -1;
+          char pipe_stage = 0;
+          int saved_stdin = -1, saved_stdout = -1, saved_stderr = -1;
+          char has_redir_in = 0, has_redir_out = 0, has_redir_err = 0, append_out = 0, append_err = 0;
+          char redir_in[DOS_PATH_SIZE + 4], redir_out[DOS_PATH_SIZE + 4], redir_err[DOS_PATH_SIZE + 4];
+          char cleaned[4096];
+          redir_in[0] = redir_out[0] = redir_err[0] = '\0';
+          if (*q == '\x1a') batch_eof = 1;
+	      *q = '\0';  /* Make it ASCIIZ (terminated by \0). */
+	      if (DEBUG) fprintf(stderr, "debug: batch line: (%s)\n", p_line);
+      if (*p_line == ':') {  /* label */
+        if (have_goto) {
+          const char *ln = p_line + 1;
+          while (*ln == ' ' || *ln == '\t') ++ln;
+          if (is_same_ascii_nocase(ln, goto_label, strlen(goto_label) + 1)) have_goto = 0;
+        }
+        goto done_command;
+      }
+      if (have_goto) goto done_command;
+	      { /* %VAR% substitution. */
+	        char subst[4096];
+	        char *d = subst;
+	        const char *s2 = p_line;
+	        while (*s2 && d + 2 < subst + sizeof(subst)) {
+          if (*s2 == '%' && s2[1] >= '0' && s2[1] <= '9') {
+            const char *av = batch_args[s2[1] - '0'];
+            while (*av && d + 1 < subst + sizeof(subst)) *d++ = *av++;
+            s2 += 2;
+            continue;
+          } else if (*s2 == '%' && s2[1] == '%') {
+            *d++ = '%';
+            s2 += 2;
+            continue;
+          }
+          if (*s2 == '%') {
+            const char *e2 = strchr(s2 + 1, '%');
+            if (e2 && e2 > s2 + 1) {
+              char name[128];
+              size_t ns = e2 - (s2 + 1);
+              unsigned ei;
+              if (ns >= sizeof(name)) ns = sizeof(name) - 1;
+              memcpy(name, s2 + 1, ns);
+              name[ns] = '\0';
+              for (ei = 0; ei < ns; ++ei) if (name[ei] - 'a' + 0U <= 'z' - 'a' + 0U) name[ei] &= ~32;
+              for (ei = 0; ei < batch_env_count; ++ei) {
+                const char *ev = batch_env[ei];
+                const char *eq = strchr(ev, '=');
+                if (eq && (size_t)(eq - ev) == ns && memcmp(ev, name, ns) == 0) {
+                  const char *vv = eq + 1;
+                  while (*vv && d + 1 < subst + sizeof(subst)) *d++ = *vv++;
+                  break;
+                }
+              }
+              s2 = e2 + 1;
+              continue;
+            }
+          }
+          *d++ = *s2++;
+	        }
+	        *d = '\0';
+	        strncpy(cmdline, subst, sizeof(cmdline) - 1);
+	        cmdline[sizeof(cmdline) - 1] = '\0';
+	        p_line = cmdline;
+	        q = p_line + strlen(p_line);
+	      }
       for (; *p_line == ' ' || *p_line == '\t'; ++p_line) {}  /* MS-DOS 6.22 doesn't ignore leading whitespace, at least not before `rem'. */
       if (*p_line == '@') { do_echo_line = 0; ++p_line; }
       if (do_echo_line) {
-        const char *current_dir = dir_state->current_dir[dir_state->drive - 'A'];
-        fprintf(stdout, "\r\n%c:%s>%s\r\n", dir_state->drive, *current_dir == '\0' ? "\\" : current_dir, p_line);
+        fprintf(stdout, "%s\r\n", p_line);
         fflush(stdout);
       }
       for (r = p_line; ((c = *r) + 0U > 31U && c != '\x7f') || c == ' ' || c == '\t'; ++r) {}
@@ -3555,14 +5127,100 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
         fprintf(stderr, "fatal: invalid character in DOS .bat batch file: %s\n", prog_filename);
         exit(252);
       }
-      if (strchr(p_line, '<') || strchr(p_line, '>') || strchr(p_line, '|')) {
-        fprintf(stderr, "fatal: redirection not supported in DOS .bat batch file: %s\n", prog_filename);
-        exit(252);
+      {  /* Parse simple redirections: <, >, >>, 2>, 2>> */
+        const char *rs = p_line;
+        char *cd = cleaned;
+        while (*rs && cd + 2 < cleaned + sizeof(cleaned)) {
+          if ((rs[0] == '2' || rs[0] == '1') && rs[1] == '>' && rs[2] == '&' && (rs[3] == '1' || rs[3] == '2')) {
+            int from_fd = rs[0] - '0', to_fd = rs[3] - '0';
+            int dfd = dup(to_fd);
+            if (dfd >= 0) { dup2(dfd, from_fd); close(dfd); }
+            rs += 4;
+            continue;
+          }
+          if ((rs[0] == '1' || rs[0] == '2') && rs[1] == '>') {
+            char is_err = (rs[0] == '2');
+            char *dst = is_err ? redir_err : redir_out;
+            char *dst_end = (is_err ? redir_err : redir_out) + sizeof(redir_out) - 1;
+            rs += 2;
+            if (is_err) append_err = (*rs == '>');
+            else append_out = (*rs == '>');
+            if (*rs == '>') ++rs;
+            while (*rs == ' ' || *rs == '\t') ++rs;
+            if (is_err) has_redir_err = 1; else has_redir_out = 1;
+            if (*rs == '"') {
+              ++rs;
+              while (*rs && *rs != '"' && dst != dst_end) *dst++ = *rs++;
+              if (*rs == '"') ++rs;
+            } else {
+              while (*rs && *rs != ' ' && *rs != '\t' && *rs != '<' && *rs != '>' && dst != dst_end) *dst++ = *rs++;
+            }
+            *dst = '\0';
+            continue;
+          }
+          if (rs[0] == '2' && rs[1] == '>') {
+            char *dst = redir_err, *dst_end = redir_err + sizeof(redir_err) - 1;
+            rs += 2;
+            append_err = (*rs == '>');
+            if (append_err) ++rs;
+            while (*rs == ' ' || *rs == '\t') ++rs;
+            has_redir_err = 1;
+            if (*rs == '"') {
+              ++rs;
+              while (*rs && *rs != '"' && dst != dst_end) *dst++ = *rs++;
+              if (*rs == '"') ++rs;
+            } else {
+              while (*rs && *rs != ' ' && *rs != '\t' && *rs != '<' && *rs != '>' && dst != dst_end) *dst++ = *rs++;
+            }
+            *dst = '\0';
+            continue;
+          } else if (*rs == '>' || *rs == '<') {
+            char is_out = (*rs == '>');
+            char *dst = is_out ? redir_out : redir_in;
+            char *dst_end = dst + DOS_PATH_SIZE + 4 - 1;
+            char *app = is_out ? &append_out : &append_err;  /* append_err ignored for input */
+            ++rs;
+            if (is_out && *rs == '>') { *app = 1; ++rs; } else *app = 0;
+            while (*rs == ' ' || *rs == '\t') ++rs;
+            if (is_out) has_redir_out = 1; else has_redir_in = 1;
+            if (*rs == '"') {
+              ++rs;
+              while (*rs && *rs != '"' && dst != dst_end) *dst++ = *rs++;
+              if (*rs == '"') ++rs;
+            } else {
+              while (*rs && *rs != ' ' && *rs != '\t' && *rs != '<' && *rs != '>' && dst != dst_end) *dst++ = *rs++;
+            }
+            *dst = '\0';
+            continue;
+          }
+          *cd++ = *rs++;
+        }
+        *cd = '\0';
+        {  /* Single pipeline: left | right */
+          char *pp = cleaned;
+          while (*pp && *pp != '|') ++pp;
+          if (*pp == '|') {
+            char *ls_end;
+            char *rs2;
+            *pp++ = '\0';
+            while (*pp == ' ' || *pp == '\t') ++pp;
+            strncpy(pipe_right, pp, sizeof(pipe_right) - 1);
+            pipe_right[sizeof(pipe_right) - 1] = '\0';
+            ls_end = cleaned + strlen(cleaned);
+            while (ls_end != cleaned && (ls_end[-1] == ' ' || ls_end[-1] == '\t')) *--ls_end = '\0';
+            rs2 = pipe_right;
+            while (*rs2 == ' ' || *rs2 == '\t') ++rs2;
+            if (rs2 != pipe_right) memmove(pipe_right, rs2, strlen(rs2) + 1);
+            pipe_stage = 1;
+          }
+        }
+        strncpy(cmdline, cleaned, sizeof(cmdline) - 1);
+        cmdline[sizeof(cmdline) - 1] = '\0';
+        p_line = cmdline;
+        q = p_line + strlen(p_line);
       }
-      if (strchr(p_line, '%')) {
-        fprintf(stderr, "fatal: percent substitution not supported in DOS .bat batch file: %s\n", prog_filename);
-        exit(252);  /* !! add support */
-      }
+      /* Allow unresolved %...% to pass through as literal text. */
+     reparse_command:
       /* MS-DOS 6.22 terminator characters. */
       for (r = p_line; (c = *r) != '\0' && c != ' ' && c != '\t' && c != '+' && c != '=' && c != '[' && c != ']' && c != '"' && c != '\\' && c != ':' && c != ';' /* && c != '|' && c != '<' && c != '>' */ && c != ',' && c != '.' && c != '/'; ++r) {}
       cmd_size = r - p_line;
@@ -3574,6 +5232,53 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
       for (endarg = q; endarg != r && (endarg[-1] == ' ' || endarg[-1] == '\t'); --endarg) {}
       c_endarg = *endarg;
       *endarg = '\0';  /* MS-DOS 6.22 passes trailing spaces to .com or .exe programs, but DOSBox 0.74-4 doesn't. We don't. This also affects the `echo' command in DOSBox 0.74-4, but for that we add trailing spaces. */
+      {  /* Apply redirections for this command. */
+        int fd;
+        if (pipe_stage == 1) {
+          char pipe_tmp[] = "/tmp/kvikdos_pipeXXXXXX";
+          pipe_fd = mkstemp(pipe_tmp);
+          if (pipe_fd < 0) {
+            fprintf(stderr, "Cannot create pipe temp\r\n");
+            exit_code = 1;
+            goto done_command;
+          }
+          unlink(pipe_tmp);
+          pipe_save_out = dup(1);
+          dup2(pipe_fd, 1);
+        }
+        if (has_redir_in) {
+          if (*get_linux_filename_r(redir_in, dir_state, fnbuf, NULL) == '\0' || (fd = open_with_case_fallback(fnbuf, O_RDONLY, 0666)) < 0) {
+            fprintf(stderr, "File not found - %s\r\n", redir_in);
+            exit_code = 1;
+            goto done_command;
+          }
+          saved_stdin = dup(0);
+          dup2(fd, 0);
+          close(fd);
+        }
+        if (has_redir_out) {
+          int flags = O_WRONLY | O_CREAT | (append_out ? O_APPEND : O_TRUNC);
+          if (*get_linux_filename_r(redir_out, dir_state, fnbuf, NULL) == '\0' || (fd = open_with_case_fallback(fnbuf, flags, 0666)) < 0) {
+            fprintf(stderr, "Access denied - %s\r\n", redir_out);
+            exit_code = 1;
+            goto done_command;
+          }
+          saved_stdout = dup(1);
+          dup2(fd, 1);
+          close(fd);
+        }
+        if (has_redir_err) {
+          int flags = O_WRONLY | O_CREAT | (append_err ? O_APPEND : O_TRUNC);
+          if (*get_linux_filename_r(redir_err, dir_state, fnbuf, NULL) == '\0' || (fd = open_with_case_fallback(fnbuf, flags, 0666)) < 0) {
+            fprintf(stderr, "Access denied - %s\r\n", redir_err);
+            exit_code = 1;
+            goto done_command;
+          }
+          saved_stderr = dup(2);
+          dup2(fd, 2);
+          close(fd);
+        }
+      }
       if (cmd_size == 1 && (p_line[0] & ~32)  - 'A' + 0U <= 'Z' - 'A' + 0U) {
         /* Ignore arguments arg...endarg, like MS-DOS 6.22 does. */
         char drive = p_line[0] & ~32;
@@ -3598,22 +5303,60 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           } else if (0 == memcmp(arg, "off", 4)) {
             do_echo = 0;
           } else {
-            ++r;  /* Skip over a single space, '.', ':' etc. */
-            fwrite(r, 1, endarg - r, stdout);
-            fwrite("\r\n", 1, 2, stdout);
+            fprintf(stdout, "%s\r\n", arg);
           }
         }
         fflush(stdout);
         exit_code = 0;
       } else if (0 == memcmp(p_line, "set", cmd_size)) {
         if (*r != '\0') {
-          fprintf(stderr, "fatal: changing environment variables not supported: %s\n", r);
-          exit(252);  /* !! TODO(pts): Add support, change a copy of envp0. */
+          char *sv = arg;
+          char *name;
+          char *eq = strchr(sv, '=');
+          char *val;
+          unsigned ei;
+          char newev[1024];
+          while (*sv == ' ' || *sv == '\t') ++sv;
+          if (!eq || eq == sv) {
+            fprintf(stderr, "Syntax error - %s\r\n", arg);
+            exit_code = 1;
+            goto done_command;
+          }
+          name = sv;
+          val = eq + 1;
+          *eq = '\0';
+          for (; *sv; ++sv) if (*sv - 'a' + 0U <= 'z' - 'a' + 0U) *sv &= ~32;
+          snprintf(newev, sizeof(newev), "%s=%s", name, val);
+          for (ei = 0; ei < batch_env_count; ++ei) {
+            char *ev = batch_env[ei];
+            char *ee = strchr(ev, '=');
+            if (ee && strcmp(ev, sv) == 0) { /* exact with '=' cut, impossible */ }
+            if (ee && (size_t)(ee - ev) == strlen(name) && memcmp(ev, name, ee - ev) == 0) {
+              free(batch_env[ei]);
+              batch_env[ei] = xstrdup(newev);
+              if (!batch_env[ei]) { perror("fatal: xstrdup"); exit(252); }
+              break;
+            }
+          }
+          if (ei == batch_env_count) {
+            if (batch_env_count >= sizeof(batch_env) / sizeof(batch_env[0])) {
+              fprintf(stderr, "fatal: too many set variables\r\n");
+              exit(252);
+            }
+            batch_env[batch_env_count] = xstrdup(newev);
+            if (!batch_env[batch_env_count]) { perror("fatal: xstrdup"); exit(252); }
+            ++batch_env_count;
+          }
+          if (strcmp(name, "PATH") == 0) {
+            strncpy(path_override, val, sizeof(path_override) - 1);
+            path_override[sizeof(path_override) - 1] = '\0';
+            has_path_override = 1;
+          }
+          *eq = '=';
         } else {
-          const char* const *envp = envp0;
-          if (*envp) {
-            for (; *envp; ++envp) {
-              fprintf(stdout, "%s\r\n", *envp);
+          if (batch_env_count) {
+            for (bi = 0; bi < batch_env_count; ++bi) {
+              fprintf(stdout, "%s\r\n", batch_env[bi]);
             }
           } else {
             fprintf(stdout, "$=\r\n");  /* See run_dos_prog above. */
@@ -3621,6 +5364,91 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           fflush(stdout);
         }
         exit_code = 0;
+      } else if (0 == memcmp(p_line, "for", cmd_size)) {
+        char *fp = arg;
+        char items[1024], body[2048];
+        char *ip, *bp;
+        char for_var = '\0';
+        while (*fp == ' ' || *fp == '\t') ++fp;
+        if (fp[0] == '%' && fp[1] == '%' && fp[2] != '\0') { for_var = fp[2]; fp += 3; }
+        else if (fp[0] == '%' && fp[1] != '\0') { for_var = fp[1]; fp += 2; }
+        while (*fp == ' ' || *fp == '\t') ++fp;
+        if ((fp[0] | 32) != 'i' || (fp[1] | 32) != 'n') { exit_code = 1; goto done_command; }
+        fp += 2;
+        while (*fp == ' ' || *fp == '\t') ++fp;
+        if (*fp != '(') { exit_code = 1; goto done_command; }
+        ++fp;
+        ip = items;
+        while (*fp && *fp != ')' && ip + 1 < items + sizeof(items)) *ip++ = *fp++;
+        *ip = '\0';
+        if (*fp != ')') { exit_code = 1; goto done_command; }
+        ++fp;
+        while (*fp == ' ' || *fp == '\t') ++fp;
+        if ((fp[0] | 32) != 'd' || (fp[1] | 32) != 'o') { exit_code = 1; goto done_command; }
+        fp += 2;
+        while (*fp == ' ' || *fp == '\t') ++fp;
+        strncpy(body, fp, sizeof(body) - 1);
+        body[sizeof(body) - 1] = '\0';
+        bp = items;
+        exit_code = 0;
+        while (*bp) {
+          char tok[256], *tp = tok;
+          char exp[2048], *ep = exp;
+          const char *bs = body;
+          char tmpbat[] = "/tmp/kvikdos_forXXXXXX";
+          int tfd;
+          while (*bp == ' ' || *bp == '\t') ++bp;
+          if (!*bp) break;
+          while (*bp && *bp != ' ' && *bp != '\t' && tp + 1 < tok + sizeof(tok)) *tp++ = *bp++;
+          *tp = '\0';
+          while (*bs && ep + 2 < exp + sizeof(exp)) {
+            if (bs[0] == '%' && bs[1] == '%' && upper_ascii(bs[2]) == upper_ascii(for_var)) {
+              const char *tv = tok;
+              while (*tv && ep + 1 < exp + sizeof(exp)) *ep++ = *tv++;
+              bs += 3;
+            } else if (bs[0] == '%' && upper_ascii(bs[1]) == upper_ascii(for_var)) {
+              const char *tv = tok;
+              while (*tv && ep + 1 < exp + sizeof(exp)) *ep++ = *tv++;
+              bs += 2;
+            } else {
+              *ep++ = *bs++;
+            }
+          }
+          *ep++ = '\n';
+          *ep = '\0';
+          tfd = mkstemp(tmpbat);
+          if (tfd < 0) { exit_code = 1; break; }
+          (void)!write(tfd, exp, strlen(exp));
+          close(tfd);
+          exit_code = run_dos_batch(emu, tmpbat, NULL, dir_state, tty_state, emu_params, envp0, (const char* const*)batch_env, batch_env_count);
+          unlink(tmpbat);
+        }
+      } else if (0 == memcmp(p_line, "setlocal", cmd_size)) {
+        unsigned ei;
+        if (setlocal_depth >= sizeof(setlocal_env) / sizeof(setlocal_env[0])) {
+          exit_code = 1;
+        } else {
+          setlocal_env_count[setlocal_depth] = batch_env_count;
+          for (ei = 0; ei < batch_env_count; ++ei) {
+            setlocal_env[setlocal_depth][ei] = xstrdup(batch_env[ei]);
+            if (!setlocal_env[setlocal_depth][ei]) { perror("fatal: xstrdup"); exit(252); }
+          }
+          ++setlocal_depth;
+          exit_code = 0;
+        }
+      } else if (0 == memcmp(p_line, "endlocal", cmd_size)) {
+        unsigned ei;
+        if (setlocal_depth == 0) {
+          exit_code = 1;
+        } else {
+          while (batch_env_count) free(batch_env[--batch_env_count]);
+          --setlocal_depth;
+          for (ei = 0; ei < setlocal_env_count[setlocal_depth]; ++ei) {
+            batch_env[batch_env_count++] = setlocal_env[setlocal_depth][ei];
+            setlocal_env[setlocal_depth][ei] = NULL;
+          }
+          exit_code = 0;
+        }
       } else if (0 == memcmp(p_line, "ver", cmd_size)) {
         if (*r != '\0') {
           fprintf(stderr, "Too many parameters - %s\r\n", r);  /* Like: MS-DOS 6.22. */
@@ -3650,30 +5478,287 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           break;
         }
       } else if (0 == memcmp(p_line, "cd", cmd_size)) {
-        if (*r != '\0') {
-          fprintf(stderr, "fatal: changing current directory not supported: %s\n", r);
-          exit(252);  /* !! TODO(pts): Add support, change a copy of envp0. */
-        } else {
+        if (*r == '\0') {
           const char *current_dir = dir_state->current_dir[dir_state->drive - 'A'];
           fprintf(stdout, "%c:%s\r\n", dir_state->drive, *current_dir == '\0' ? "\\" : current_dir);
           fflush(stdout);
           exit_code = 0;
+        } else {
+          char tmp[DOS_PATH_SIZE];
+          char *t = tmp;
+          const char *s = arg;
+          char drive = dir_state->drive;
+          char is_root_abs = 0;
+          struct stat st;
+          if ((s[0] & ~32) - 'A' + 0U < DRIVE_COUNT && s[1] == ':') {
+            drive = s[0] & ~32;
+            s += 2;
+            if (*s == '\\' || *s == '/') { ++s; is_root_abs = 1; }
+          } else if (*s == '\\' || *s == '/') {
+            ++s;
+            is_root_abs = 1;
+          }
+          if (is_root_abs && t + 1 < tmp + sizeof(tmp)) {
+            *t++ = '\\';
+          }
+          while (*s && t + 2 < tmp + sizeof(tmp)) {
+            char c3 = *s++;
+            if (c3 == '/') c3 = '\\';
+            *t++ = (c3 - 'a' + 0U <= 'z' - 'a' + 0U) ? (c3 & ~32) : c3;
+          }
+          if (t != tmp && t[-1] != '\\') *t++ = '\\';
+          *t = '\0';
+          if (tmp[0] == '\0') strcpy(tmp, "\\");
+          {
+            char dos_abs[DOS_PATH_SIZE + 4];
+            snprintf(dos_abs, sizeof(dos_abs), "%c:%s", drive, tmp);
+            if (*get_linux_filename_r(dos_abs, dir_state, fnbuf, NULL) == '\0' || stat(fnbuf, &st) != 0 || !S_ISDIR(st.st_mode)) {
+              fprintf(stderr, "Invalid directory - %s\r\n", arg);
+              exit_code = 1;
+            } else {
+              copy_cstr0(dir_state->current_dir[drive - 'A'], sizeof(dir_state->current_dir[drive - 'A']), tmp);
+              dir_state->drive = drive;
+              exit_code = 0;
+            }
+          }
         }
       } else if (0 == memcmp(p_line, "path", cmd_size)) {
-        const char* const *envp;
         if (*r != '\0') {
-          fprintf(stderr, "fatal: changing environment variables (PATH) not supported: %s\n", r);
-          exit(252);  /* !! TODO(pts): Add support, change a copy of envp0. */
+          while (*arg == ' ' || *arg == '\t') ++arg;
+          if (*arg == '=') ++arg;
+          while (*arg == ' ' || *arg == '\t') ++arg;
+          strncpy(path_override, arg, sizeof(path_override) - 1);
+          path_override[sizeof(path_override) - 1] = '\0';
+          has_path_override = 1;
+          { /* sync PATH in batch env */
+            char pe[sizeof(path_override) + 6];
+            unsigned ei;
+            memcpy(pe, "PATH=", 5);
+            strcpy(pe + 5, path_override);
+            for (ei = 0; ei < batch_env_count; ++ei) {
+              char *eq = strchr(batch_env[ei], '=');
+              if (eq && (size_t)(eq - batch_env[ei]) == 4 &&
+                  ((batch_env[ei][0] | 32) == 'p') &&
+                  ((batch_env[ei][1] | 32) == 'a') &&
+                  ((batch_env[ei][2] | 32) == 't') &&
+                  ((batch_env[ei][3] | 32) == 'h')) {
+                free(batch_env[ei]);
+                batch_env[ei] = xstrdup(pe);
+                break;
+              }
+            }
+            if (ei == batch_env_count && batch_env_count < sizeof(batch_env) / sizeof(batch_env[0])) {
+              batch_env[batch_env_count++] = xstrdup(pe);
+            }
+            if (batch_env_count < sizeof(batch_env) / sizeof(batch_env[0])) batch_env[batch_env_count] = NULL;
+          }
+          exit_code = 0;
+          goto done_command;
         }
-        for (envp = envp0; *envp && strncmp(*envp, "PATH=", 5) != 0; ++envp) {}
-        if (*envp) {
-          fprintf(stdout, "%s\r\n", *envp);
+        if (has_path_override) {
+          fprintf(stdout, "PATH=%s\r\n", path_override);
           exit_code = 0;
         } else {
-          fprintf(stdout, "No Path\r\n\r\n");  /* MS-DOS 6.22. */
-          exit_code = 1;
+          {
+            const char *path_value = getenv_prefix_nocase0("PATH=", (const char* const*)batch_env);
+            if (path_value) {
+              fprintf(stdout, "PATH=%s\r\n", path_value);
+              exit_code = 0;
+            } else {
+              fprintf(stdout, "No Path\r\n\r\n");  /* MS-DOS 6.22. */
+              exit_code = 1;
+            }
+          }
         }
         fflush(stdout);
+      } else if (0 == memcmp(p_line, "goto", cmd_size)) {
+        const char *gl = arg;
+        while (*gl == ' ' || *gl == '\t') ++gl;
+        if (*gl == ':') ++gl;
+        if (*gl == '\0') {
+          fprintf(stderr, "Label not found - %s\r\n", arg);
+          exit_code = 1;
+        } else if (is_same_ascii_nocase(gl, "eof", 4)) {
+          break;  /* End current batch context. */
+        } else {
+          size_t gls = strlen(gl);
+          if (gls >= sizeof(goto_label)) gls = sizeof(goto_label) - 1;
+          memcpy(goto_label, gl, gls);
+          goto_label[gls] = '\0';
+          have_goto = 1;
+          lseek(batch_fd, 0, SEEK_SET);
+          p = p_line = buf;
+          rewound = 1;
+          exit_code = 0;
+        }
+      } else if (0 == memcmp(p_line, "shift", cmd_size)) {
+        for (ai = 1; ai < 9; ++ai) batch_args[ai] = batch_args[ai + 1];
+        batch_args[9] = "";
+        if (batch_argc > 0) --batch_argc;
+        exit_code = 0;
+      } else if (0 == memcmp(p_line, "call", cmd_size)) {
+        while (*arg == ' ' || *arg == '\t') ++arg;
+        if (*arg) {
+          memmove(p_line, arg, strlen(arg) + 1);
+          goto reparse_command;
+        }
+        exit_code = 0;
+      } else if (0 == memcmp(p_line, "del", cmd_size) || 0 == memcmp(p_line, "erase", cmd_size) || 0 == memcmp(p_line, "delete", cmd_size)) {
+        if (*arg == '\0') {
+          fprintf(stderr, "Required parameter missing\r\n");
+          exit_code = 1;
+        } else {
+          char *a = arg;
+          while (*a) {
+            char *b = a;
+            while (*b && *b != ' ' && *b != '\t') ++b;
+	            if (*b) *b++ = '\0';
+	            if (strchr(a, '*') || strchr(a, '?')) {
+	              const char *pat_base = get_dos_basename(a);
+	              size_t pat_dir_size = pat_base - a;
+	              char dos_dir[DOS_PATH_SIZE + 4], linux_dir[LINUX_PATH_SIZE];
+	              const char *scan_dir;
+	              DIR *dd;
+	              struct dirent *de;
+	              int removed;
+	              if (pat_dir_size >= sizeof(dos_dir)) pat_dir_size = sizeof(dos_dir) - 1;
+	              memcpy(dos_dir, a, pat_dir_size);
+	              dos_dir[pat_dir_size] = '\0';
+	              if (dos_dir[0] == '\0') strcpy(dos_dir, ".");
+	              scan_dir = linux_dir;
+	              if (*get_linux_filename_r(dos_dir, dir_state, linux_dir, NULL) == '\0' || !(dd = opendir_with_case_fallback(linux_dir, fnbuf2, sizeof(fnbuf2)))) {
+	                exit_code = 1;
+	              } else {
+	                if (fnbuf2[0] != '\0') scan_dir = fnbuf2;
+	                removed = 0;
+	                while ((de = readdir(dd)) != NULL) {
+	                  char full[LINUX_PATH_SIZE];
+	                  const char *nm = de->d_name;
+	                  struct stat st;
+	                  size_t dlen;
+	                  if (nm[0] == '.') continue;
+	                  if (!dos_wildcard_match(pat_base, nm)) continue;
+	                  dlen = strlen(scan_dir);
+	                  if (dlen + 1 + strlen(nm) + 1 >= sizeof(full)) continue;
+	                  memcpy(full, scan_dir, dlen);
+	                  if (dlen && full[dlen - 1] != '/') full[dlen++] = '/';
+	                  strcpy(full + dlen, nm);
+	                  if (stat(full, &st) == 0 && S_ISREG(st.st_mode) && unlink(full) == 0) removed = 1;
+	                }
+	                closedir(dd);
+	                if (!removed) exit_code = 1;
+	              }
+	            } else if (*get_linux_filename_r(a, dir_state, fnbuf, NULL) == '\0' || unlink(fnbuf) != 0) {
+	              exit_code = 1;
+	            }
+            while (*b == ' ' || *b == '\t') ++b;
+            a = b;
+          }
+        }
+      } else if (0 == memcmp(p_line, "mkdir", cmd_size) || 0 == memcmp(p_line, "md", cmd_size)) {
+        if (*arg == '\0') {
+          fprintf(stderr, "Required parameter missing\r\n");
+          exit_code = 1;
+        } else if (*get_linux_filename_r(arg, dir_state, fnbuf, NULL) == '\0' || mkdir(fnbuf, 0777) != 0) {
+          exit_code = 1;
+        } else {
+          exit_code = 0;
+        }
+      } else if (0 == memcmp(p_line, "copy", cmd_size)) {
+        char *a = arg, *b, *c;
+        int fd1 = -1, fd2 = -1;
+        while (*a == ' ' || *a == '\t') ++a;
+        b = a;
+        while (*b && *b != ' ' && *b != '\t') ++b;
+        if (*b) *b++ = '\0';
+        while (*b == ' ' || *b == '\t') ++b;
+        c = b;
+        while (*c && *c != ' ' && *c != '\t') ++c;
+        *c = '\0';
+        if (*a == '\0' || *b == '\0') {
+          fprintf(stderr, "Required parameter missing\r\n");
+          exit_code = 1;
+        } else {
+          if (strchr(a, '*') || strchr(a, '?')) {
+              const char *pat_base = get_dos_basename(a);
+              size_t pat_dir_size = pat_base - a;
+              char dos_dir[DOS_PATH_SIZE + 4], linux_src_dir[LINUX_PATH_SIZE];
+              const char *src_scan_dir = linux_src_dir;
+              DIR *dd = NULL;
+              struct dirent *de;
+              struct stat dst_st;
+              int copied = 0;
+            if (pat_dir_size >= sizeof(dos_dir)) pat_dir_size = sizeof(dos_dir) - 1;
+            memcpy(dos_dir, a, pat_dir_size);
+            dos_dir[pat_dir_size] = '\0';
+              if (dos_dir[0] == '\0') strcpy(dos_dir, ".");
+              if (*get_linux_filename_r(dos_dir, dir_state, linux_src_dir, NULL) == '\0' ||
+                *get_linux_filename_r(b, dir_state, fnbuf2, NULL) == '\0' ||
+                stat_with_case_fallback(fnbuf2, &dst_st, 0) != 0 || !S_ISDIR(dst_st.st_mode) ||
+                (dd = opendir_with_case_fallback(linux_src_dir, exec_fnbuf, sizeof(exec_fnbuf))) == NULL) {
+                exit_code = 1;
+              } else {
+                if (exec_fnbuf[0] != '\0') src_scan_dir = exec_fnbuf;
+                while ((de = readdir(dd)) != NULL) {
+                char src_full[LINUX_PATH_SIZE], dst_full[LINUX_PATH_SIZE];
+                const char *nm = de->d_name;
+                struct stat st;
+                size_t sdl, ddl;
+                if (nm[0] == '.') continue;
+                if (!dos_wildcard_match(pat_base, nm)) continue;
+                sdl = strlen(src_scan_dir);
+                ddl = strlen(fnbuf2);
+                if (sdl + 1 + strlen(nm) + 1 >= sizeof(src_full) || ddl + 1 + strlen(nm) + 1 >= sizeof(dst_full)) continue;
+                memcpy(src_full, src_scan_dir, sdl);
+                if (sdl && src_full[sdl - 1] != '/') src_full[sdl++] = '/';
+                strcpy(src_full + sdl, nm);
+                if (stat_with_case_fallback(src_full, &st, 0) != 0 || !S_ISREG(st.st_mode)) continue;
+                memcpy(dst_full, fnbuf2, ddl);
+                if (ddl && dst_full[ddl - 1] != '/') dst_full[ddl++] = '/';
+                strcpy(dst_full + ddl, nm);
+                fd1 = open_with_case_fallback(src_full, O_RDONLY, 0666);
+                fd2 = open_with_case_fallback(dst_full, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if (fd1 < 0 || fd2 < 0) {
+                  if (fd1 >= 0) close(fd1);
+                  if (fd2 >= 0) close(fd2);
+                  exit_code = 1;
+                  break;
+                } else {
+                  char cbuf[4096];
+                  int n;
+                  while ((n = read(fd1, cbuf, sizeof(cbuf))) > 0) {
+                    if (write(fd2, cbuf, n) != n) { exit_code = 1; break; }
+                  }
+                  if (n < 0) exit_code = 1;
+                  close(fd1);
+                  close(fd2);
+                  fd1 = fd2 = -1;
+                  if (exit_code) break;
+                  copied = 1;
+                }
+              }
+              closedir(dd);
+              if (!copied) exit_code = 1;
+            }
+          } else if (*get_linux_filename_r(a, dir_state, fnbuf, NULL) == '\0' || *get_linux_filename_r(b, dir_state, fnbuf2, NULL) == '\0') {
+            exit_code = 1;
+          } else if ((fd1 = open_with_case_fallback(fnbuf, O_RDONLY, 0666)) < 0 || (fd2 = open_with_case_fallback(fnbuf2, O_WRONLY | O_CREAT | O_TRUNC, 0666)) < 0) {
+            if (fd1 >= 0) close(fd1);
+            if (fd2 >= 0) close(fd2);
+            exit_code = 1;
+          } else {
+            char cbuf[4096];
+            int n;
+            exit_code = 0;
+            while ((n = read(fd1, cbuf, sizeof(cbuf))) > 0) {
+              if (write(fd2, cbuf, n) != n) { exit_code = 1; break; }
+            }
+            if (n < 0) exit_code = 1;
+            close(fd1);
+            close(fd2);
+            fd1 = fd2 = -1;
+          }
+        }
       } else if (0 == memcmp(p_line, "pause", cmd_size)) {
         unsigned short dummy_ax;
         /* Ignore arguments arg...endarg, like MS-DOS 6.22 does. */
@@ -3686,6 +5771,59 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
         if (c2 != '\0') {
           fprintf(stderr, "Too many parameters - %s\r\n", arg2 + 1);
           exit_code = 1;
+        } else if (*arg == '\0') {  /* Read from stdin (useful for pipelines). */
+          char fbuf[4096];
+          while ((got = read(0, fbuf, sizeof(fbuf))) > 0) (void)!write(1, fbuf, got);
+          exit_code = got < 0;
+        } else if (strchr(arg, '*') || strchr(arg, '?')) {
+          const char *pat_base = get_dos_basename(arg);
+          size_t pat_dir_size = pat_base - arg;
+          char dos_dir[DOS_PATH_SIZE + 4], linux_dir[LINUX_PATH_SIZE];
+          const char *scan_dir;
+          DIR *dd = NULL;
+          struct dirent *de;
+          int any = 0;
+          if (pat_dir_size >= sizeof(dos_dir)) pat_dir_size = sizeof(dos_dir) - 1;
+          memcpy(dos_dir, arg, pat_dir_size);
+          dos_dir[pat_dir_size] = '\0';
+          if (dos_dir[0] == '\0') strcpy(dos_dir, ".");
+          scan_dir = linux_dir;
+          if (*get_linux_filename_r(dos_dir, dir_state, linux_dir, NULL) == '\0' || (dd = opendir_with_case_fallback(linux_dir, fnbuf2, sizeof(fnbuf2))) == NULL) {
+            fprintf(stderr, "File not found - %s\r\n", arg);
+            exit_code = 1;
+          } else {
+            if (fnbuf2[0] != '\0') scan_dir = fnbuf2;
+            exit_code = 0;
+            while ((de = readdir(dd)) != NULL) {
+              char full[LINUX_PATH_SIZE];
+              struct stat st;
+              int fd;
+              size_t dlen;
+              char fbuf[4096], *ep;
+              if (de->d_name[0] == '.') continue;
+              if (!dos_wildcard_match(pat_base, de->d_name)) continue;
+              dlen = strlen(scan_dir);
+              if (dlen + 1 + strlen(de->d_name) + 1 >= sizeof(full)) continue;
+              memcpy(full, scan_dir, dlen);
+              if (dlen && full[dlen - 1] != '/') full[dlen++] = '/';
+              strcpy(full + dlen, de->d_name);
+              if (stat_with_case_fallback(full, &st, 0) != 0 || !S_ISREG(st.st_mode)) continue;
+              fd = open_with_case_fallback(full, O_RDONLY, 0666);
+              if (fd < 0) { exit_code = 1; continue; }
+              any = 1;
+              while ((got = read(fd, fbuf, sizeof(fbuf))) > 0) {
+                if ((ep = memchr(fbuf, '\x1a', got)) != NULL) { (void)!write(1, fbuf, ep - fbuf); break; }
+                (void)!write(1, fbuf, got);
+              }
+              if (got < 0) exit_code = 1;
+              close(fd);
+            }
+            closedir(dd);
+            if (!any) {
+              fprintf(stderr, "File not found - %s\r\n", arg);
+              exit_code = 1;
+            }
+          }
         } else {  /* Now filename is in arg. */
           int fd = open_dos_file(arg, dos_prog_abs, O_RDONLY, dir_state);
           if (fd < 0) {
@@ -3717,35 +5855,118 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
                  memcmp(p_line, "call", cmd_size) == 0 ||
                  memcmp(p_line, "cd", cmd_size) == 0 ||
                  memcmp(p_line, "choice", cmd_size) == 0 ||
-                 memcmp(p_line, "copy", cmd_size) == 0 ||
-                 memcmp(p_line, "del", cmd_size) == 0 ||
-                 memcmp(p_line, "delete", cmd_size) == 0 ||
-                 memcmp(p_line, "erase", cmd_size) == 0 ||
-                 memcmp(p_line, "goto", cmd_size) == 0 ||
                  memcmp(p_line, "help", cmd_size) == 0 ||
-                 memcmp(p_line, "if", cmd_size) == 0 ||
+                 0 ||
                  memcmp(p_line, "loadhigh", cmd_size) == 0 ||
                  memcmp(p_line, "lh", cmd_size) == 0 ||
-                 memcmp(p_line, "mkdir", cmd_size) == 0 ||
-                 memcmp(p_line, "md", cmd_size) == 0 ||
                  memcmp(p_line, "rmdir", cmd_size) == 0 ||
                  memcmp(p_line, "rd", cmd_size) == 0 ||
                  memcmp(p_line, "rem", cmd_size) == 0 ||
                  memcmp(p_line, "rename", cmd_size) == 0 ||
                  memcmp(p_line, "ren", cmd_size) == 0 ||
-                 memcmp(p_line, "shift", cmd_size) == 0 ||
                  memcmp(p_line, "subst", cmd_size) == 0) {
         *r = '\0';
-        fprintf(stderr, "fatal: DOS command not supported: %s\n", p_line);
-        exit(252);
+        if (emu_params->strict_mode) {
+          fprintf(stderr, "fatal: DOS command not supported: %s\n", p_line);
+          exit(252);
+        } else {
+          fprintf(stderr, "Unsupported DOS command: %s\r\n", p_line);
+          exit_code = 1;
+        }
         /**r = c;*/
+      } else if (0 == memcmp(p_line, "if", cmd_size)) {
+        char cond_ok = 0, is_not = 0;
+        char *tail = arg;
+        while (*tail == ' ' || *tail == '\t') ++tail;
+        if ((tail[0] == 'n' || tail[0] == 'N') && (tail[1] == 'o' || tail[1] == 'O') && (tail[2] == 't' || tail[2] == 'T') && (tail[3] == ' ' || tail[3] == '\t')) {
+          is_not = 1;
+          tail += 4;
+          while (*tail == ' ' || *tail == '\t') ++tail;
+        }
+        if ((tail[0] == 'e' || tail[0] == 'E') && (tail[1] == 'r' || tail[1] == 'R') && (tail[2] == 'r' || tail[2] == 'R') &&
+            (tail[3] == 'o' || tail[3] == 'O') && (tail[4] == 'r' || tail[4] == 'R') && (tail[5] == 'l' || tail[5] == 'L') &&
+            (tail[6] == 'e' || tail[6] == 'E') && (tail[7] == 'v' || tail[7] == 'V') && (tail[8] == 'e' || tail[8] == 'E') &&
+            (tail[9] == 'l' || tail[9] == 'L') && (tail[10] == ' ' || tail[10] == '\t')) {
+          unsigned n = 0;
+          char *pnum = tail + 10;
+          while (*pnum == ' ' || *pnum == '\t') ++pnum;
+          while (*pnum >= '0' && *pnum <= '9') { n = n * 10 + (*pnum++ - '0'); }
+          while (*pnum == ' ' || *pnum == '\t') ++pnum;
+          cond_ok = exit_code >= n;
+          tail = pnum;
+        } else if ((tail[0] == 'e' || tail[0] == 'E') && (tail[1] == 'x' || tail[1] == 'X') && (tail[2] == 'i' || tail[2] == 'I') && (tail[3] == 's' || tail[3] == 'S') && (tail[4] == 't' || tail[4] == 'T') && (tail[5] == ' ' || tail[5] == '\t')) {
+          char fn[260];
+          char *pf = tail + 5;
+          struct stat st;
+          size_t fi = 0;
+          while (*pf == ' ' || *pf == '\t') ++pf;
+          if (*pf == '"') {
+            ++pf;
+            while (*pf && *pf != '"' && fi + 1 < sizeof(fn)) fn[fi++] = *pf++;
+            if (*pf == '"') ++pf;
+          } else {
+            while (*pf && *pf != ' ' && *pf != '\t' && fi + 1 < sizeof(fn)) fn[fi++] = *pf++;
+          }
+          fn[fi] = '\0';
+          while (*pf == ' ' || *pf == '\t') ++pf;
+          if (fn[0] && (strchr(fn, '*') || strchr(fn, '?'))) {
+            const char *pat_base = get_dos_basename(fn);
+            size_t pat_dir_size = pat_base - fn;
+            char dos_dir[DOS_PATH_SIZE + 4], linux_dir[LINUX_PATH_SIZE];
+            DIR *dd = NULL;
+            struct dirent *de;
+            cond_ok = 0;
+            if (pat_dir_size >= sizeof(dos_dir)) pat_dir_size = sizeof(dos_dir) - 1;
+            memcpy(dos_dir, fn, pat_dir_size);
+            dos_dir[pat_dir_size] = '\0';
+            if (dos_dir[0] == '\0') strcpy(dos_dir, ".");
+            if (*get_linux_filename_r(dos_dir, dir_state, linux_dir, NULL) && (dd = opendir(linux_dir)) != NULL) {
+              while ((de = readdir(dd)) != NULL) {
+                if (de->d_name[0] == '.') continue;
+                if (dos_wildcard_match(pat_base, de->d_name)) { cond_ok = 1; break; }
+              }
+              closedir(dd);
+            }
+          } else {
+            cond_ok = fn[0] && *get_linux_filename_r(fn, dir_state, fnbuf, NULL) && stat(fnbuf, &st) == 0;
+          }
+          tail = pf;
+        } else {
+          char *eqeq = strstr(tail, "==");
+          if (eqeq) {
+            char lhs[256], rhs[256];
+            char *pc = tail;
+            size_t li = 0, ri = 0;
+            while (pc < eqeq && (*pc == ' ' || *pc == '\t')) ++pc;
+            if (*pc == '"') ++pc;
+            while (pc < eqeq && *pc != '"' && li + 1 < sizeof(lhs)) lhs[li++] = *pc++;
+            while (li > 0 && (lhs[li - 1] == ' ' || lhs[li - 1] == '\t')) --li;
+            lhs[li] = '\0';
+            pc = eqeq + 2;
+            while (*pc == ' ' || *pc == '\t') ++pc;
+            if (*pc == '"') ++pc;
+            while (*pc && *pc != '"' && *pc != ' ' && *pc != '\t' && ri + 1 < sizeof(rhs)) rhs[ri++] = *pc++;
+            while (ri > 0 && (rhs[ri - 1] == ' ' || rhs[ri - 1] == '\t')) --ri;
+            rhs[ri] = '\0';
+            if (*pc == '"') ++pc;
+            while (*pc == ' ' || *pc == '\t') ++pc;
+            cond_ok = strcmp(lhs, rhs) == 0;
+            tail = pc;
+          }
+        }
+        if (is_not) cond_ok = !cond_ok;
+        if (cond_ok && *tail) {
+          memmove(p_line, tail, strlen(tail) + 1);
+          goto reparse_command;
+        }
+        /* DOS IF does not update ERRORLEVEL by itself. */
+        goto done_command;
       } else {  /* Run .com or .exe program. */
         char *args_str = p_line, args_buf[0x80], c2;
         const char* prog_filename;
-        const char* const *envp;
         char prog_drive;
         size_t size;
-        for (; (c2 = *args_str) != '\0' && c2 != ' ' && c2 != '\t' && c2 != '=' && c2 != ',' && c2 != '/'; ++args_str) {}  /* MS-DOS 6.22. */
+        for (; (c2 = *args_str) != '\0' && c2 != ' ' && c2 != '\t' && c2 != '=' && c2 != ','; ++args_str) {}  /* MS-DOS 6.22. */
         if (args_str == p_line) {
           fprintf(stderr, "Empty DOS program name to run\r\n");
           exit_code = 1;
@@ -3755,9 +5976,11 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
         } else {
           memcpy(args_buf, args_str, size + 1);  /* Including the trailing '\0'. */
           *args_str = '\0';  /* So that p_line becomes terminated by '\0'. */
-          for (envp = envp0; *envp && strncmp(*envp, "PATH=", 5) != 0; ++envp) {}
-          dir_state->dos_prog_abs = dos_prog_abs;  /* Of the .bat file. */
-          prog_filename = find_prog_on_path(p_line, dir_state, *envp ? *envp + 5 : NULL, &prog_drive);
+          {
+            const char *path_value = has_path_override ? path_override : getenv_prefix_nocase0("PATH=", (const char* const*)batch_env);
+            dir_state->dos_prog_abs = dos_prog_abs;  /* Of the .bat file. */
+            prog_filename = find_prog_on_path(p_line, dir_state, path_value, &prog_drive);
+          }
           if (!prog_filename) {
             /* DOSBox 0.74-4 prints "Illegal command: %s.\r\n" to stdout, we print our error to stderr. */
             /* MS-DOS 6.22 prints this to stderr: "Bad command or file name\r\n". */
@@ -3772,15 +5995,109 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
               fprintf(stderr, "Error getting absolute filelename - %s\r\n", p_line);
               exit_code = 1;
             } else {
-              exit_code = run_dos_prog(emu, prog_filename, args_buf, NULL, dir_state, tty_state, emu_params, envp0);
+              const char *batch_extra_env[300];
+              unsigned batch_extra_env_count = 0;
+              char batch_path_env[1024 + 5];
+              unsigned ei;
+              if (has_path_override) {
+                memcpy(batch_path_env, "PATH=", 5);
+                strncpy(batch_path_env + 5, path_override, sizeof(batch_path_env) - 6);
+                batch_path_env[sizeof(batch_path_env) - 1] = '\0';
+                batch_extra_env[batch_extra_env_count++] = batch_path_env;
+              }
+              for (ei = 0; ei < batch_env_count && batch_extra_env_count < sizeof(batch_extra_env) / sizeof(batch_extra_env[0]); ++ei) {
+                if (has_path_override &&
+                    ((batch_env[ei][0] | 32) == 'p') &&
+                    ((batch_env[ei][1] | 32) == 'a') &&
+                    ((batch_env[ei][2] | 32) == 't') &&
+                    ((batch_env[ei][3] | 32) == 'h') &&
+                    batch_env[ei][4] == '=') continue;
+                batch_extra_env[batch_extra_env_count++] = batch_env[ei];
+              }
+              if (has_dos_ext_nocase(prog_filename, ".bat")) {
+                const char *child_args[64];
+                char *ab = args_buf, *ae;
+                unsigned ac = 0;
+                while (*ab == ' ' || *ab == '\t') ++ab;
+                while (*ab && ac + 1 < sizeof(child_args) / sizeof(child_args[0])) {
+                  ae = ab;
+                  while (*ae && *ae != ' ' && *ae != '\t') ++ae;
+                  if (*ae) *ae++ = '\0';
+                  child_args[ac++] = ab;
+                  while (*ae == ' ' || *ae == '\t') ++ae;
+                  ab = ae;
+                }
+                child_args[ac] = NULL;
+                exit_code = run_dos_batch(emu, prog_filename, child_args, dir_state, tty_state, emu_params, envp0, batch_extra_env, batch_extra_env_count);
+              } else {
+                const enum mz_subformat_t subfmt = detect_mz_subformat(prog_filename);
+                if (subfmt == MZ_SUBFMT_PE && has_wine_in_path()) {
+                  const char *child_argv[64];
+                  char *ab = args_buf, *ae;
+                  unsigned ac = 0;
+                  char dos_cwd[DOS_PATH_SIZE + 4], linux_cwd[LINUX_PATH_SIZE];
+                  const char *cdp = dir_state->current_dir[dir_state->drive - 'A'];
+                  if (!cdp || !*cdp) cdp = "\\";
+                  snprintf(dos_cwd, sizeof(dos_cwd), "%c:%s", dir_state->drive, cdp);
+                  get_linux_filename_r(dos_cwd, dir_state, linux_cwd, NULL);
+                  while (*ab == ' ' || *ab == '\t') ++ab;
+                  while (*ab && ac + 1 < sizeof(child_argv) / sizeof(child_argv[0])) {
+                    ae = ab;
+                    while (*ae && *ae != ' ' && *ae != '\t') ++ae;
+                    if (*ae) *ae++ = '\0';
+                    child_argv[ac++] = ab;
+                    while (*ae == ' ' || *ae == '\t') ++ae;
+                    ab = ae;
+                  }
+                  child_argv[ac] = NULL;
+                  exit_code = run_with_wine(prog_filename, child_argv, linux_cwd);
+                } else {
+                  exit_code = run_dos_prog(emu, prog_filename, args_buf, NULL, dir_state, tty_state, emu_params, envp0, batch_extra_env, batch_extra_env_count);
+                }
+              }
             }
           }
           dir_state->dos_prog_abs = NULL;  /* For security. */
         }
       }
-     done_command:
-      ++q;  /* Skip over the '\0', formerly '\r' or '\n'. */
-      goto next_line;
+	     done_command:
+          if (saved_stderr >= 0) { dup2(saved_stderr, 2); close(saved_stderr); }
+          if (saved_stdout >= 0) { dup2(saved_stdout, 1); close(saved_stdout); }
+          if (saved_stdin >= 0) { dup2(saved_stdin, 0); close(saved_stdin); }
+          if (pipe_stage == 1) {
+            fflush(stdout);
+            dup2(pipe_save_out, 1);
+            close(pipe_save_out); pipe_save_out = -1;
+            lseek(pipe_fd, 0, SEEK_SET);
+            pipe_save_in = dup(0);
+            dup2(pipe_fd, 0);
+            close(pipe_fd); pipe_fd = -1;
+            strncpy(cmdline, pipe_right, sizeof(cmdline) - 1);
+            cmdline[sizeof(cmdline) - 1] = '\0';
+            p_line = cmdline;
+            q = p_line + strlen(p_line);
+            pipe_stage = 2;
+            goto reparse_command;
+          } else if (pipe_stage == 2) {
+            dup2(pipe_save_in, 0);
+            close(pipe_save_in); pipe_save_in = -1;
+            pipe_stage = 0;
+          }
+          if (rewound) {
+            q = p_line = buf;
+            goto next_line;
+          }
+	      q = q_src;
+	      ++q;  /* Skip over the '\0', formerly '\r' or '\n'. */
+	      goto next_line;
+	    }
+  }
+  while (batch_env_count) free(batch_env[--batch_env_count]);
+  while (setlocal_depth) {
+    unsigned ei;
+    --setlocal_depth;
+    for (ei = 0; ei < setlocal_env_count[setlocal_depth]; ++ei) {
+      free(setlocal_env[setlocal_depth][ei]);
     }
   }
   close(batch_fd);
@@ -3793,6 +6110,15 @@ static void init_tty_state(TtyState *tty_state, int tty_in_fd) {
   tty_state->next_fake_key = fake_keys;
 }
 
+static void free_extra_env_args(ParsedCmdArgs *cmd_args) {
+  unsigned i;
+  for (i = 0; i < cmd_args->extra_env_count; ++i) {
+    free((void*)cmd_args->extra_env[i]);
+    cmd_args->extra_env[i] = NULL;
+  }
+  cmd_args->extra_env_count = 0;
+}
+
 /* --- */
 
 int main(int argc, char **argv) {
@@ -3802,6 +6128,16 @@ int main(int argc, char **argv) {
       argv, &cmd_args,
       "kvikdos: run DOS programs headless (a very fast DOS emulator)\nUsage: ", "",
       "This is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.\n");
+  g_case_fallback_mode = cmd_args.emu_params.case_fallback_mode;
+  if (cmd_args.emu_params.diag_filename) {
+    g_diag_file = fopen(cmd_args.emu_params.diag_filename, "ab");
+    if (!g_diag_file) {
+      perror("fatal: cannot open --diag-file");
+      exit(1);
+    }
+  } else {
+    g_diag_file = stderr;
+  }
   if (0) {  /* Just dump the parsed command-line. */
     /* cmd_args.dir_state.linux_prog is still NULL, use cmd_args.prog_filename instead. */
     printf("linux prog: %s\n", cmd_args.prog_filename);
@@ -3831,13 +6167,38 @@ int main(int argc, char **argv) {
       printf("end of envs\n");
     }
     printf("tty_in_fd: %d\n", cmd_args.tty_in_fd);
-    printf("mem_mb: %d\n", cmd_args.emu_params.mem_mb);
+    printf("mem_mb: %u\n", cmd_args.emu_params.mem_mb);
     printf("is_hlt_ok: %d\n", cmd_args.emu_params.is_hlt_ok);
     return 0;
   }
   if (cmd_args.dpmi_prog) {  /* pts-fast-dosbox does support it, kvikdos doesn't. */
     fprintf(stderr, "fatal: DPMI not supported: %s\n", cmd_args.dpmi_prog);
+    free_extra_env_args(&cmd_args);
     exit(1);
+  }
+  if (is_linux_native_executable(cmd_args.prog_filename)) {
+    int rc = run_native_execvp(cmd_args.prog_filename, cmd_args.args);
+    free_extra_env_args(&cmd_args);
+    return rc;
+  }
+  {
+    const enum mz_subformat_t subfmt = detect_mz_subformat(cmd_args.prog_filename);
+    if (subfmt == MZ_SUBFMT_PE ||
+        ((subfmt == MZ_SUBFMT_NE || subfmt == MZ_SUBFMT_LE || subfmt == MZ_SUBFMT_LX) &&
+         !is_probable_borland_dual_mode_ne(cmd_args.prog_filename) &&
+         is_probable_windows_message_stub(cmd_args.prog_filename))) {
+    if (!has_wine_in_path()) {
+        fprintf(stderr, "error: detected Windows executable, but 'wine' is not in PATH: %s\n", cmd_args.prog_filename);
+        free_extra_env_args(&cmd_args);
+      return 1;
+    }
+      fprintf(stderr, "info: detected Windows executable, delegating to wine: %s\n", cmd_args.prog_filename);
+      {
+        int rc = run_with_wine(cmd_args.prog_filename, cmd_args.args, NULL);
+        free_extra_env_args(&cmd_args);
+        return rc;
+      }
+    }
   }
   { int exit_code;
     const char *ext = get_linux_ext(cmd_args.prog_filename);
@@ -3846,11 +6207,12 @@ int main(int argc, char **argv) {
     init_emu(&emu);  /* This is lightweight, it doesn't initialize KVM. */
     init_tty_state(&tty_state, cmd_args.tty_in_fd);
     if (is_same_ascii_nocase(ext, "bat", 4)) {
-      exit_code = run_dos_batch(&emu, cmd_args.prog_filename, cmd_args.args, &cmd_args.dir_state, &tty_state, &cmd_args.emu_params, cmd_args.envp0);
+      exit_code = run_dos_batch(&emu, cmd_args.prog_filename, cmd_args.args, &cmd_args.dir_state, &tty_state, &cmd_args.emu_params, cmd_args.envp0, (const char* const*)cmd_args.extra_env, cmd_args.extra_env_count);
     } else {
-      exit_code = run_dos_prog(&emu, cmd_args.prog_filename, NULL, cmd_args.args, &cmd_args.dir_state, &tty_state, &cmd_args.emu_params, cmd_args.envp0);
+      exit_code = run_dos_prog(&emu, cmd_args.prog_filename, NULL, cmd_args.args, &cmd_args.dir_state, &tty_state, &cmd_args.emu_params, cmd_args.envp0, (const char* const*)cmd_args.extra_env, cmd_args.extra_env_count);
     }
     if (DEBUG) fprintf(stderr, "debug: DOS program exited with code: 0x%02x", exit_code);
+    free_extra_env_args(&cmd_args);
     return exit_code;
   }
 }
